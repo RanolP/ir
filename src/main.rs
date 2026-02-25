@@ -170,13 +170,12 @@ fn handle_search(
         .parse()
         .map_err(|e| error::Error::Other(e))?;
 
-    if !matches!(search_mode, SearchMode::Bm25) {
-        eprintln!("search --mode {mode}: not yet implemented (Phase 4/5). Using bm25.");
+    if matches!(search_mode, SearchMode::Hybrid) {
+        eprintln!("note: --mode hybrid not yet implemented (Phase 5). Using vector.");
     }
 
     let config = Config::load()?;
     let cols: Vec<_> = if collection_filter.is_empty() {
-        // Auto-detect from CWD, fall back to all collections.
         let cwd = std::env::current_dir().unwrap_or_default();
         if let Some(col) = config::detect_collection(&config.collections, &cwd) {
             vec![col]
@@ -190,19 +189,30 @@ fn handle_search(
             .collect()
     };
 
-    // Open DBs for targeted collections.
     let dbs: Vec<db::CollectionDb> = cols
         .iter()
         .map(|c| db::CollectionDb::open(&c.name, &collection_db_path(&c.name)))
         .collect::<Result<Vec<_>>>()?;
 
-    let req = search::fan_out::SearchRequest {
-        query: &query,
-        limit,
-        min_score,
+    let results = match search_mode {
+        SearchMode::Bm25 => {
+            let req = search::fan_out::SearchRequest {
+                query: &query,
+                limit,
+                min_score,
+            };
+            search::fan_out::bm25(&dbs, &req)?
+        }
+        SearchMode::Vector | SearchMode::Hybrid => {
+            let embedder = llm::embedding::Embedder::load_default()?;
+            let req = search::vector::VecSearchRequest {
+                query: &query,
+                limit,
+                min_score,
+            };
+            search::vector::search(&embedder, &dbs, &req)?
+        }
     };
-
-    let results = search::fan_out::bm25(&dbs, &req)?;
 
     let fmt = if json {
         output::Format::Json
@@ -220,7 +230,7 @@ fn handle_search(
     Ok(())
 }
 
-fn handle_embed(collection: Option<String>, _force: bool) -> Result<()> {
+fn handle_embed(collection: Option<String>, force: bool) -> Result<()> {
     let config = Config::load()?;
     let cols: Vec<_> = match &collection {
         Some(name) => {
@@ -232,8 +242,17 @@ fn handle_embed(collection: Option<String>, _force: bool) -> Result<()> {
         None => config.collections.iter().collect(),
     };
 
+    println!("loading embedding model…");
+    let embedder = llm::embedding::Embedder::load_default()?;
+
     for col in cols {
-        println!("embed: '{}' — not yet implemented (Phase 4)", col.name);
+        let db_path = collection_db_path(&col.name);
+        let db = db::CollectionDb::open(&col.name, &db_path)?;
+        println!("embedding '{}'…", col.name);
+        let opts = index::embed::EmbedOptions { force };
+        let (docs, chunks) =
+            index::embed::embed(&db, &embedder, &opts, llm::models::EMBEDDING)?;
+        println!("  {} documents, {} chunks embedded", docs, chunks);
     }
     Ok(())
 }

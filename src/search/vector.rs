@@ -1,1 +1,36 @@
-// Phase 4
+// Vector search: embed query → kNN via sqlite-vec → join documents.
+
+use crate::db::{vectors, CollectionDb};
+use crate::error::Result;
+use crate::llm::embedding::Embedder;
+use crate::types::SearchResult;
+
+pub struct VecSearchRequest<'a> {
+    pub query: &'a str,
+    pub limit: usize,
+    pub min_score: Option<f64>,
+}
+
+pub fn search(
+    embedder: &Embedder,
+    dbs: &[CollectionDb],
+    req: &VecSearchRequest,
+) -> Result<Vec<SearchResult>> {
+    let query_emb = embedder.embed_query(req.query)?;
+
+    let mut all: Vec<SearchResult> = dbs
+        .iter()
+        .flat_map(|db| {
+            vectors::search(db.conn(), &query_emb, &db.name, req.limit * 2)
+                .unwrap_or_default()
+        })
+        .collect();
+
+    if let Some(min) = req.min_score {
+        all.retain(|r| r.score >= min);
+    }
+
+    all.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    all.truncate(req.limit);
+    Ok(all)
+}
