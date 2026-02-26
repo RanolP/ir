@@ -16,8 +16,11 @@ pub struct VecSearchResult {
 /// hash_seq = "{content_hash}_{chunk_seq}"
 pub fn insert(conn: &Connection, hash_seq: &str, embedding: &[f32]) -> Result<()> {
     let blob = to_bytes(embedding);
+    // ! sqlite-vec virtual tables don't support INSERT OR REPLACE conflict resolution;
+    //   use explicit DELETE + INSERT to handle duplicate hash_seqs safely.
+    conn.execute("DELETE FROM vectors_vec WHERE hash_seq = ?1", [hash_seq])?;
     conn.execute(
-        "INSERT OR REPLACE INTO vectors_vec(hash_seq, embedding) VALUES (?1, ?2)",
+        "INSERT INTO vectors_vec(hash_seq, embedding) VALUES (?1, ?2)",
         rusqlite::params![hash_seq, blob],
     )?;
     Ok(())
@@ -130,12 +133,7 @@ mod tests {
     use rusqlite::Connection;
 
     fn open_test_db() -> Connection {
-        // Register sqlite-vec before opening.
-        unsafe {
-            rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
-                sqlite_vec::sqlite3_vec_init as *const (),
-            )));
-        }
+        crate::db::ensure_sqlite_vec();
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
             "CREATE VIRTUAL TABLE vectors_vec USING vec0(

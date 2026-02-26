@@ -4,7 +4,7 @@
 use crate::db::{vectors, CollectionDb};
 use crate::error::Result;
 use crate::index::chunker;
-use crate::llm::embedding::{Embedder, EMBEDDING_DIM};
+use crate::llm::embedding::Embedder;
 use indicatif::{ProgressBar, ProgressStyle};
 use rusqlite::Connection;
 
@@ -38,6 +38,11 @@ pub fn embed(
         return Ok((0, 0));
     }
 
+    // Content-addressed: multiple paths can share the same hash. Dedup so we don't
+    // attempt to insert the same hash_seq twice (which would violate vectors_vec PK).
+    let mut seen = std::collections::HashSet::new();
+    let pending: Vec<_> = pending.into_iter().filter(|(_, _, hash, _)| seen.insert(hash.clone())).collect();
+
     let pb = ProgressBar::new(pending.len() as u64);
     pb.set_style(
         ProgressStyle::with_template(
@@ -54,9 +59,7 @@ pub fn embed(
 
         // Force: remove existing embeddings for this hash first.
         if opts.force {
-            conn.execute("DELETE FROM content_vectors WHERE hash = ?1", [hash])?;
-            // Removing from vectors_vec requires deleting by hash_seq prefix.
-            // sqlite-vec doesn't support LIKE on primary key; collect and delete.
+            // Collect seqs before deleting content_vectors (sqlite-vec can't LIKE on PK).
             let seqs: Vec<i64> = {
                 let mut stmt =
                     conn.prepare("SELECT seq FROM content_vectors WHERE hash = ?1")?;
@@ -64,12 +67,13 @@ pub fn embed(
                     .filter_map(|r| r.ok())
                     .collect()
             };
-            for seq in seqs {
+            for seq in &seqs {
                 conn.execute(
                     "DELETE FROM vectors_vec WHERE hash_seq = ?1",
                     [format!("{hash}_{seq}")],
                 )?;
             }
+            conn.execute("DELETE FROM content_vectors WHERE hash = ?1", [hash])?;
         }
 
         let chunks = chunker::chunk_document(doc_text);
@@ -181,11 +185,7 @@ mod tests {
     use rusqlite::Connection;
 
     fn open_test_db() -> Connection {
-        unsafe {
-            rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
-                sqlite_vec::sqlite3_vec_init as *const (),
-            )));
-        }
+        crate::db::ensure_sqlite_vec();
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(include_str!("../db/schema.sql")).unwrap();
         conn
@@ -243,7 +243,6 @@ mod tests {
     #[ignore]
     fn embed_creates_vector_entries() {
         use crate::db::CollectionDb;
-        use std::path::PathBuf;
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.sqlite");
         let db = CollectionDb::open("test", &db_path).unwrap();

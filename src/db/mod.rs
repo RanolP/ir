@@ -10,6 +10,24 @@ use crate::error::Result;
 use rusqlite::ffi::sqlite3_auto_extension;
 use rusqlite::{Connection, OpenFlags};
 use std::path::Path;
+use std::sync::Once;
+
+static SQLITE_VEC_INIT: Once = Once::new();
+
+/// Register the sqlite-vec extension exactly once per process.
+/// Safe to call from multiple threads or call sites.
+pub fn ensure_sqlite_vec() {
+    SQLITE_VEC_INIT.call_once(|| {
+        // SAFETY: sqlite3_auto_extension is idempotent and the function pointer
+        // is valid for the lifetime of the process. Once is used to prevent
+        // double-registration.
+        unsafe {
+            sqlite3_auto_extension(Some(std::mem::transmute(
+                sqlite_vec::sqlite3_vec_init as *const (),
+            )));
+        }
+    });
+}
 
 pub struct CollectionDb {
     pub name: String,
@@ -23,13 +41,7 @@ impl CollectionDb {
             std::fs::create_dir_all(parent)?;
         }
 
-        // Register sqlite-vec before opening any connection.
-        // docs: https://alexgarcia.xyz/sqlite-vec/rust.html
-        unsafe {
-            sqlite3_auto_extension(Some(std::mem::transmute(
-                sqlite_vec::sqlite3_vec_init as *const (),
-            )));
-        }
+        ensure_sqlite_vec();
 
         let conn = Connection::open_with_flags(
             db_path,
