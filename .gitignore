@@ -1,2 +1,12 @@
 /target
 /test-data/
+*.pem
+*.key
+*.p12
+*.pfx
+*.asc
+*.tar.gz
+*.sha256
+.env*
+*secret*
+*credential*
