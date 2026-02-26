@@ -22,7 +22,10 @@ pub fn search(
         .iter()
         .flat_map(|db| {
             vectors::search(db.conn(), &query_emb, &db.name, req.limit * 2)
-                .unwrap_or_default()
+                .unwrap_or_else(|e| {
+                    eprintln!("warn: vector search on '{}' failed: {e}", db.name);
+                    vec![]
+                })
         })
         .collect();
 

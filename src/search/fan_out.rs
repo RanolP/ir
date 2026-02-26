@@ -31,11 +31,67 @@ pub fn bm25(dbs: &[CollectionDb], req: &SearchRequest) -> Result<Vec<SearchResul
                 collection: &db.name,
                 limit: req.limit * 2, // over-fetch to allow for merging
             };
-            fts::search(db.conn(), &q).unwrap_or_default()
+            fts::search(db.conn(), &q).unwrap_or_else(|e| {
+                eprintln!("warn: bm25 search on '{}' failed: {e}", db.name);
+                vec![]
+            })
         })
         .collect();
 
     merge_and_filter(results, req)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::SearchResult;
+
+    fn make(collection: &str, path: &str, score: f64) -> SearchResult {
+        SearchResult {
+            collection: collection.into(),
+            path: path.into(),
+            title: path.into(),
+            score,
+            snippet: None,
+            hash: "h".into(),
+            doc_id: "#h".into(),
+        }
+    }
+
+    #[test]
+    fn sorts_by_score_desc() {
+        let req = SearchRequest { query: "q", limit: 10, min_score: None };
+        let out = merge_and_filter(vec![vec![make("c", "a.md", 0.5), make("c", "b.md", 0.9)]], &req).unwrap();
+        assert_eq!(out[0].path, "b.md");
+        assert_eq!(out[1].path, "a.md");
+    }
+
+    #[test]
+    fn applies_min_score() {
+        let req = SearchRequest { query: "q", limit: 10, min_score: Some(0.6) };
+        let out = merge_and_filter(vec![vec![make("c", "a.md", 0.9), make("c", "b.md", 0.3)]], &req).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].path, "a.md");
+    }
+
+    #[test]
+    fn respects_limit() {
+        let req = SearchRequest { query: "q", limit: 3, min_score: None };
+        let docs: Vec<_> = (0..10).map(|i| make("c", &format!("{i}.md"), 0.5)).collect();
+        let out = merge_and_filter(vec![docs], &req).unwrap();
+        assert_eq!(out.len(), 3);
+    }
+
+    #[test]
+    fn merges_multiple_collections() {
+        let req = SearchRequest { query: "q", limit: 10, min_score: None };
+        let out = merge_and_filter(
+            vec![vec![make("col_a", "x.md", 0.7)], vec![make("col_b", "y.md", 0.9)]],
+            &req,
+        ).unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].collection, "col_b");
+    }
 }
 
 fn merge_and_filter(

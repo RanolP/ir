@@ -9,7 +9,7 @@ use crate::llm::{models, LlamaBackend};
 use llama_cpp_2::{
     context::params::LlamaContextParams,
     llama_batch::LlamaBatch,
-    model::{params::LlamaModelParams, AddBos, LlamaModel, Special},
+    model::{params::LlamaModelParams, AddBos, LlamaModel},
 };
 use std::num::NonZeroU32;
 use std::path::Path;
@@ -19,7 +19,7 @@ const CONTEXT_SIZE: u32 = 2048;
 const MAX_DOC_CHARS: usize = 6000;
 
 pub struct Reranker {
-    backend: LlamaBackend,
+    backend: &'static LlamaBackend,
     model: LlamaModel,
     yes_token_id: i32,
     no_token_id: i32,
@@ -59,7 +59,7 @@ impl Reranker {
     /// Score relevance of a document to a query. Returns [0, 1].
     pub fn score(&self, query: &str, doc: &str) -> Result<f64> {
         let doc_truncated = if doc.len() > MAX_DOC_CHARS {
-            &doc[..MAX_DOC_CHARS]
+            &doc[..doc.floor_char_boundary(MAX_DOC_CHARS)]
         } else {
             doc
         };
@@ -102,8 +102,16 @@ impl Reranker {
             .map_err(|e| Error::Other(format!("decode: {e}")))?;
 
         let logits = ctx.get_logits_ith((n - 1) as i32);
-        let yes_logit = logits[self.yes_token_id as usize];
-        let no_logit = logits[self.no_token_id as usize];
+        let yes_idx = self.yes_token_id as usize;
+        let no_idx = self.no_token_id as usize;
+        if yes_idx >= logits.len() || no_idx >= logits.len() {
+            return Err(Error::Other(format!(
+                "token id out of range: yes={yes_idx}, no={no_idx}, vocab={}",
+                logits.len()
+            )));
+        }
+        let yes_logit = logits[yes_idx];
+        let no_logit = logits[no_idx];
 
         // Softmax over just Yes/No to get P(Yes)
         let max_logit = yes_logit.max(no_logit);
@@ -114,27 +122,15 @@ impl Reranker {
         Ok(score)
     }
 
-    /// Score a batch of (doc_text, current_rrf_score) pairs.
-    /// Returns final scores: RRF×0.4 + rerank×0.6
-    pub fn rerank_with_rrf(&self, query: &str, candidates: &[(String, f64)]) -> Result<Vec<f64>> {
-        candidates
-            .iter()
-            .map(|(doc, rrf_score)| {
-                let rerank_score = self.score(query, doc)?;
-                Ok(rrf_score * 0.4 + rerank_score * 0.6)
-            })
-            .collect()
-    }
-}
-
-/// Compute cache key for a (query, doc_hash) pair.
-pub fn cache_key(query: &str, doc_hash: &str) -> String {
-    crate::index::hasher::hash_str(&format!("{query}\0{doc_hash}"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cache_key(query: &str, doc_hash: &str) -> String {
+        crate::index::hasher::hash_str(&format!("{query}\0{doc_hash}"))
+    }
 
     #[test]
     fn cache_key_deterministic() {

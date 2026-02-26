@@ -48,25 +48,23 @@ pub fn update(db: &CollectionDb, collection: &Collection, opts: &UpdateOptions) 
         .progress_chars("=>-"),
     );
 
-    // 3. Hash scanned files: {rel_path → hash}
-    let mut scanned: HashMap<String, String> = HashMap::with_capacity(scanned_files.len());
+    // 3. Hash scanned files: {rel_path → (hash, content_bytes)}
+    let mut scanned: HashMap<String, (String, Vec<u8>)> = HashMap::with_capacity(scanned_files.len());
     for f in &scanned_files {
         let content = std::fs::read(&f.abs_path)?;
         let hash = hasher::hash_bytes(&content);
-        scanned.insert(f.rel_path.clone(), hash);
+        scanned.insert(f.rel_path.clone(), (hash, content));
     }
 
-    // 4. Compute diff
-    let d = diff::compute(&scanned, &stored);
+    // 4. Compute diff — pass hash-only view
+    let hash_only: HashMap<String, String> = scanned
+        .iter()
+        .map(|(path, (hash, _))| (path.clone(), hash.clone()))
+        .collect();
+    let d = diff::compute(&hash_only, &stored);
     let (n_add, n_update, n_deactivate) = (d.to_add.len(), d.to_update.len(), d.to_deactivate.len());
 
     pb.set_length((n_add + n_update + n_deactivate) as u64);
-
-    // Build a rel_path → abs_path lookup
-    let path_lookup: HashMap<String, _> = scanned_files
-        .iter()
-        .map(|f| (f.rel_path.clone(), &f.abs_path))
-        .collect();
 
     // 5. Deactivate removed files
     for rel_path in &d.to_deactivate {
@@ -80,10 +78,11 @@ pub fn update(db: &CollectionDb, collection: &Collection, opts: &UpdateOptions) 
 
     // 6. Add new files
     for rel_path in &d.to_add {
-        let abs_path = path_lookup[rel_path];
-        let content = std::fs::read(abs_path)?;
-        let text = String::from_utf8_lossy(&content).into_owned();
-        let hash = &scanned[rel_path];
+        let (hash, content) = scanned
+            .get(rel_path)
+            .ok_or_else(|| crate::error::Error::Other(format!("missing scan entry: {rel_path}")))?;
+        let raw_text = String::from_utf8_lossy(content).into_owned();
+        let text = raw_text.replace("\r\n", "\n");
         let title = chunker::extract_title(&text, rel_path);
         let now = Utc::now().to_rfc3339();
 
@@ -94,10 +93,11 @@ pub fn update(db: &CollectionDb, collection: &Collection, opts: &UpdateOptions) 
 
     // 7. Update changed files
     for rel_path in &d.to_update {
-        let abs_path = path_lookup[rel_path];
-        let content = std::fs::read(abs_path)?;
-        let text = String::from_utf8_lossy(&content).into_owned();
-        let hash = &scanned[rel_path];
+        let (hash, content) = scanned
+            .get(rel_path)
+            .ok_or_else(|| crate::error::Error::Other(format!("missing scan entry: {rel_path}")))?;
+        let raw_text = String::from_utf8_lossy(content).into_owned();
+        let text = raw_text.replace("\r\n", "\n");
         let title = chunker::extract_title(&text, rel_path);
         let now = Utc::now().to_rfc3339();
         let created_at: String = conn

@@ -168,7 +168,7 @@ fn handle_search(
 ) -> Result<()> {
     let search_mode: SearchMode = mode
         .parse()
-        .map_err(|e| error::Error::Other(e))?;
+        .map_err(error::Error::Other)?;
 
     let config = Config::load()?;
     let cols: Vec<_> = if collection_filter.is_empty() {
@@ -203,14 +203,12 @@ fn handle_search(
         SearchMode::Hybrid => {
             let embedder = llm::embedding::Embedder::load_default()?;
             // Expander and reranker are optional: degrade gracefully if models missing.
-            let expander = llm::expander::Expander::load_default().ok();
-            let reranker = llm::reranker::Reranker::load_default().ok();
-            if expander.is_none() {
-                eprintln!("note: expander model not found — using query as-is");
-            }
-            if reranker.is_none() {
-                eprintln!("note: reranker model not found — skipping reranking");
-            }
+            let expander = llm::expander::Expander::load_default()
+                .map_err(|e| eprintln!("note: expander unavailable: {e}"))
+                .ok();
+            let reranker = llm::reranker::Reranker::load_default()
+                .map_err(|e| eprintln!("note: reranker unavailable: {e}"))
+                .ok();
             let hs = search::hybrid::HybridSearch { embedder, expander, reranker };
             let req = search::hybrid::HybridRequest { query: &query, limit, min_score };
             hs.search(&dbs, &req)?

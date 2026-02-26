@@ -41,7 +41,6 @@ pub fn chunk_document(doc: &str) -> Vec<Chunk> {
     let break_points = precompute_break_points(doc);
     let mut chunks = Vec::new();
     let mut start = 0usize;
-    let bytes = doc.as_bytes();
 
     while start < doc.len() {
         let target_end = (start + CHUNK_SIZE_CHARS).min(doc.len());
@@ -49,7 +48,7 @@ pub fn chunk_document(doc: &str) -> Vec<Chunk> {
         let end = if target_end == doc.len() {
             doc.len()
         } else {
-            best_break(doc, bytes, &break_points, start, target_end)
+            best_break(doc, &break_points, start, target_end)
         };
 
         let text = doc[start..end].to_string();
@@ -142,7 +141,6 @@ fn line_break_score(line: &str) -> f64 {
 /// Falls back to a char boundary at target_end if no break points found.
 fn best_break(
     doc: &str,
-    _bytes: &[u8],
     break_points: &[(usize, f64)],
     start: usize,
     target_end: usize,

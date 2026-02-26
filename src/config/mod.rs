@@ -41,6 +41,7 @@ impl Config {
     }
 
     pub fn add_collection(&mut self, collection: Collection) -> Result<()> {
+        validate_collection_name(&collection.name)?;
         if self.get_collection(&collection.name).is_some() {
             return Err(Error::CollectionExists(collection.name));
         }
@@ -59,6 +60,7 @@ impl Config {
     }
 
     pub fn rename_collection(&mut self, old: &str, new: &str) -> Result<()> {
+        validate_collection_name(new)?;
         if self.get_collection(new).is_some() {
             return Err(Error::CollectionExists(new.to_string()));
         }
@@ -88,4 +90,67 @@ pub fn data_dir() -> PathBuf {
 
 pub fn collection_db_path(name: &str) -> PathBuf {
     data_dir().join(format!("{name}.sqlite"))
+}
+
+fn validate_collection_name(name: &str) -> Result<()> {
+    if name.is_empty() || name.contains('/') || name.contains('\0') || name.contains("..") {
+        return Err(Error::Other(format!("invalid collection name: {name:?}")));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::Collection;
+
+    fn col(name: &str) -> Collection {
+        Collection {
+            name: name.to_string(),
+            path: "/tmp".into(),
+            globs: vec![],
+            excludes: vec![],
+            description: None,
+        }
+    }
+
+    #[test]
+    fn rejects_empty_name() {
+        let mut cfg = Config::default();
+        assert!(cfg.add_collection(col("")).is_err());
+    }
+
+    #[test]
+    fn rejects_slash_in_name() {
+        let mut cfg = Config::default();
+        assert!(cfg.add_collection(col("a/b")).is_err());
+    }
+
+    #[test]
+    fn rejects_dotdot_in_name() {
+        let mut cfg = Config::default();
+        assert!(cfg.add_collection(col("..")).is_err());
+        assert!(cfg.add_collection(col("a..b")).is_err());
+    }
+
+    #[test]
+    fn rejects_null_byte() {
+        let mut cfg = Config::default();
+        assert!(cfg.add_collection(col("a\0b")).is_err());
+    }
+
+    #[test]
+    fn accepts_valid_names() {
+        let mut cfg = Config::default();
+        assert!(cfg.add_collection(col("knowledge")).is_ok());
+        assert!(cfg.add_collection(col("my-notes_2024")).is_ok());
+    }
+
+    #[test]
+    fn rename_validates_new_name() {
+        let mut cfg = Config::default();
+        cfg.add_collection(col("notes")).unwrap();
+        assert!(cfg.rename_collection("notes", "a/b").is_err());
+        assert!(cfg.rename_collection("notes", "ok-name").is_ok());
+    }
 }
