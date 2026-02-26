@@ -8,11 +8,11 @@
 // docs: https://github.com/ggerganov/llama.cpp/blob/master/grammars/README.md
 
 use crate::error::{Error, Result};
-use crate::llm::{models, LlamaBackend};
+use crate::llm::{LlamaBackend, gpu_layers, models};
 use llama_cpp_2::{
     context::params::LlamaContextParams,
     llama_batch::LlamaBatch,
-    model::{params::LlamaModelParams, AddBos, LlamaModel},
+    model::{AddBos, LlamaModel, params::LlamaModelParams},
     sampling::LlamaSampler,
 };
 // Note: grammar-constrained sampling (GBNF) is intentionally not used here.
@@ -46,18 +46,17 @@ pub struct Expander {
 impl Expander {
     pub fn load(model_path: &Path) -> Result<Self> {
         let backend = crate::llm::init_backend()?;
-        let model = LlamaModel::load_from_file(&backend, model_path, &LlamaModelParams::default())
-            .map_err(|e| Error::Other(format!("load expander model: {e}")))?;
+        let model = LlamaModel::load_from_file(
+            &backend,
+            model_path,
+            &LlamaModelParams::default().with_n_gpu_layers(gpu_layers()),
+        )
+        .map_err(|e| Error::Other(format!("load expander model: {e}")))?;
         Ok(Self { backend, model })
     }
 
     pub fn load_default() -> Result<Self> {
-        let path = crate::llm::find_model(models::EXPANDER).ok_or_else(|| {
-            Error::Other(format!(
-                "expansion model '{}' not found. Add to ~/local-models/",
-                models::EXPANDER
-            ))
-        })?;
+        let path = crate::llm::download::ensure_model(models::EXPANDER)?;
         Self::load(&path)
     }
 
@@ -172,11 +171,20 @@ pub fn parse_output(raw: &str) -> Vec<SubQuery> {
         .filter_map(|line| {
             let line = line.trim();
             if let Some(text) = line.strip_prefix("lex:") {
-                Some(SubQuery { kind: SubQueryKind::Lex, text: text.trim().to_string() })
+                Some(SubQuery {
+                    kind: SubQueryKind::Lex,
+                    text: text.trim().to_string(),
+                })
             } else if let Some(text) = line.strip_prefix("vec:") {
-                Some(SubQuery { kind: SubQueryKind::Vec, text: text.trim().to_string() })
+                Some(SubQuery {
+                    kind: SubQueryKind::Vec,
+                    text: text.trim().to_string(),
+                })
             } else if let Some(text) = line.strip_prefix("hyde:") {
-                Some(SubQuery { kind: SubQueryKind::Hyde, text: text.trim().to_string() })
+                Some(SubQuery {
+                    kind: SubQueryKind::Hyde,
+                    text: text.trim().to_string(),
+                })
             } else {
                 None
             }
@@ -188,8 +196,14 @@ pub fn parse_output(raw: &str) -> Vec<SubQuery> {
 /// Safe fallback when model output fails validation.
 pub fn fallback(query: &str) -> Vec<SubQuery> {
     vec![
-        SubQuery { kind: SubQueryKind::Lex, text: query.to_string() },
-        SubQuery { kind: SubQueryKind::Vec, text: query.to_string() },
+        SubQuery {
+            kind: SubQueryKind::Lex,
+            text: query.to_string(),
+        },
+        SubQuery {
+            kind: SubQueryKind::Vec,
+            text: query.to_string(),
+        },
         SubQuery {
             kind: SubQueryKind::Hyde,
             text: format!("Information about {query}"),

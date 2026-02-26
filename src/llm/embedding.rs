@@ -5,11 +5,11 @@
 //   doc:   "title: {title} | text: {text}"
 
 use crate::error::{Error, Result};
-use crate::llm::{l2_normalize, models, LlamaBackend};
+use crate::llm::{LlamaBackend, gpu_layers, l2_normalize, models};
 use llama_cpp_2::{
     context::params::LlamaContextParams,
     llama_batch::LlamaBatch,
-    model::{params::LlamaModelParams, AddBos, LlamaModel},
+    model::{AddBos, LlamaModel, params::LlamaModelParams},
 };
 use std::num::NonZeroU32;
 use std::path::Path;
@@ -25,18 +25,17 @@ pub struct Embedder {
 impl Embedder {
     pub fn load(model_path: &Path) -> Result<Self> {
         let backend = crate::llm::init_backend()?;
-        let model = LlamaModel::load_from_file(&backend, model_path, &LlamaModelParams::default())
-            .map_err(|e| Error::Other(format!("load embedding model: {e}")))?;
+        let model = LlamaModel::load_from_file(
+            &backend,
+            model_path,
+            &LlamaModelParams::default().with_n_gpu_layers(gpu_layers()),
+        )
+        .map_err(|e| Error::Other(format!("load embedding model: {e}")))?;
         Ok(Self { backend, model })
     }
 
     pub fn load_default() -> Result<Self> {
-        let path = crate::llm::find_model(models::EMBEDDING).ok_or_else(|| {
-            Error::Other(format!(
-                "embedding model '{}' not found.\nAdd to ~/local-models/ or run: ir embed --download",
-                models::EMBEDDING
-            ))
-        })?;
+        let path = crate::llm::download::ensure_model(models::EMBEDDING)?;
         Self::load(&path)
     }
 

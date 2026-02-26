@@ -2,10 +2,14 @@
 // docs: https://docs.rs/llama-cpp-2/latest/llama_cpp_2/
 //
 // Model search order:
-//   1. ~/local-models/        (central, managed by /local-model skill)
-//   2. ~/.cache/ir/models/    (ir-specific cache)
-//   3. ~/.cache/qmd/models/   (reuse qmd downloads)
+//   1. Per-model env override (IR_*_MODEL, QMD_*_MODEL aliases)
+//   2. Directories from env (IR_MODEL_DIRS / QMD_MODEL_DIRS)
+//   3. Built-in defaults:
+//      - ~/local-models/
+//      - ~/.cache/ir/models/
+//      - ~/.cache/qmd/models/
 
+pub mod download;
 pub mod embedding;
 pub mod expander;
 pub mod reranker;
@@ -25,8 +29,81 @@ pub mod models {
     pub const EXPANDER: &str = "qmd-query-expansion-1.7B-q4_k_m.gguf";
 }
 
+/// HuggingFace repo + filename for each known model.
+/// Tuple: (repo_id, filename_on_hf)
+pub mod hf_repos {
+    pub const EMBEDDING: (&str, &str) = (
+        "ggml-org/embeddinggemma-300M-GGUF",
+        "embeddinggemma-300M-Q8_0.gguf",
+    );
+    pub const RERANKER: (&str, &str) = (
+        "ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF",
+        "qwen3-reranker-0.6b-q8_0.gguf",
+    );
+    pub const EXPANDER: (&str, &str) = (
+        "tobil/qmd-query-expansion-1.7B",
+        // ! uppercase on HF; local name uses lowercase q4_k_m
+        "qmd-query-expansion-1.7B-Q4_K_M.gguf",
+    );
+
+    /// Returns `(repo_id, hf_filename)` for a local model filename, or `None`.
+    pub fn for_filename(filename: &str) -> Option<(&'static str, &'static str)> {
+        match filename {
+            super::models::EMBEDDING => Some(EMBEDDING),
+            super::models::RERANKER => Some(RERANKER),
+            super::models::EXPANDER => Some(EXPANDER),
+            _ => None,
+        }
+    }
+}
+
+/// Number of layers to offload to GPU.
+/// Override with `IR_GPU_LAYERS=N`; defaults to 99 (all) on macOS.
+pub fn gpu_layers() -> u32 {
+    std::env::var("IR_GPU_LAYERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(if cfg!(target_os = "macos") { 99 } else { 0 })
+}
+
+/// Environment variables for model resolution.
+pub mod env {
+    pub const MODEL_DIRS: &str = "IR_MODEL_DIRS";
+    pub const MODEL_DIRS_QMD: &str = "QMD_MODEL_DIRS";
+
+    pub const EMBEDDING_MODEL: &[&str] = &[
+        "IR_EMBEDDING_MODEL",
+        "QMD_EMBEDDING_MODEL",
+        "QMD_EMBED_MODEL",
+    ];
+    pub const RERANKER_MODEL: &[&str] = &[
+        "IR_RERANKER_MODEL",
+        "QMD_RERANKER_MODEL",
+        "QMD_RERANK_MODEL",
+    ];
+    pub const EXPANDER_MODEL: &[&str] = &[
+        "IR_EXPANDER_MODEL",
+        "QMD_EXPANDER_MODEL",
+        "QMD_EXPAND_MODEL",
+    ];
+}
+
+/// Env vars that can override the full path for a known model filename.
+pub fn model_override_env_vars(filename: &str) -> &'static [&'static str] {
+    match filename {
+        models::EMBEDDING => env::EMBEDDING_MODEL,
+        models::RERANKER => env::RERANKER_MODEL,
+        models::EXPANDER => env::EXPANDER_MODEL,
+        _ => &[],
+    }
+}
+
 /// Search for a model file across the standard locations.
 pub fn find_model(filename: &str) -> Option<PathBuf> {
+    if let Some(p) = resolve_model_override(filename) {
+        return Some(p);
+    }
+
     model_search_paths()
         .into_iter()
         .map(|dir| dir.join(filename))
@@ -36,14 +113,54 @@ pub fn find_model(filename: &str) -> Option<PathBuf> {
 /// Model search directories in priority order.
 pub fn model_search_paths() -> Vec<PathBuf> {
     let mut paths = Vec::new();
+
+    append_env_dirs(&mut paths, env::MODEL_DIRS);
+    append_env_dirs(&mut paths, env::MODEL_DIRS_QMD);
+
     if let Some(home) = dirs::home_dir() {
-        paths.push(home.join("local-models"));
+        push_unique(&mut paths, home.join("local-models"));
     }
     if let Some(cache) = dirs::cache_dir() {
-        paths.push(cache.join("ir").join("models"));
-        paths.push(cache.join("qmd").join("models"));
+        push_unique(&mut paths, cache.join("ir").join("models"));
+        push_unique(&mut paths, cache.join("qmd").join("models"));
     }
     paths
+}
+
+fn resolve_model_override(filename: &str) -> Option<PathBuf> {
+    for key in model_override_env_vars(filename) {
+        let Some(raw) = std::env::var_os(key) else {
+            continue;
+        };
+        let path = PathBuf::from(raw);
+        if path.is_file() {
+            return Some(path);
+        }
+        if path.is_dir() {
+            let candidate = path.join(filename);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+fn append_env_dirs(paths: &mut Vec<PathBuf>, key: &str) {
+    let Some(raw) = std::env::var_os(key) else {
+        return;
+    };
+    for dir in std::env::split_paths(&raw) {
+        if !dir.as_os_str().is_empty() {
+            push_unique(paths, dir);
+        }
+    }
+}
+
+fn push_unique(paths: &mut Vec<PathBuf>, candidate: PathBuf) {
+    if !paths.iter().any(|p| p == &candidate) {
+        paths.push(candidate);
+    }
 }
 
 /// Initialize the process-global llama.cpp backend. Safe to call from multiple models.
@@ -53,9 +170,8 @@ pub fn init_backend() -> crate::error::Result<&'static LlamaBackend> {
     if let Some(b) = BACKEND.get() {
         return Ok(b);
     }
-    let b = LlamaBackend::init().map_err(|e: llama_cpp_2::LlamaCppError| {
-        crate::error::Error::Other(e.to_string())
-    })?;
+    let b = LlamaBackend::init()
+        .map_err(|e: llama_cpp_2::LlamaCppError| crate::error::Error::Other(e.to_string()))?;
     Ok(BACKEND.get_or_init(|| b))
 }
 
@@ -72,24 +188,25 @@ pub fn to_bytes(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|f| f.to_le_bytes()).collect()
 }
 
-/// Deserialize little-endian bytes to f32 vec.
-#[allow(dead_code)]
-pub fn from_bytes(b: &[u8]) -> Vec<f32> {
-    b.chunks_exact(4)
-        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn from_bytes(b: &[u8]) -> Vec<f32> {
+        b.chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect()
+    }
 
     #[test]
     fn l2_normalize_unit_vector() {
         let mut v = vec![3.0f32, 4.0];
         l2_normalize(&mut v);
         let mag: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-        assert!((mag - 1.0).abs() < 1e-6, "magnitude should be 1.0, got {mag}");
+        assert!(
+            (mag - 1.0).abs() < 1e-6,
+            "magnitude should be 1.0, got {mag}"
+        );
     }
 
     #[test]
@@ -110,5 +227,21 @@ mod tests {
     #[test]
     fn find_model_returns_none_for_unknown() {
         assert!(find_model("nonexistent-model-xyz.gguf").is_none());
+    }
+
+    #[test]
+    fn model_override_env_mapping_is_defined_for_known_models() {
+        assert_eq!(
+            model_override_env_vars(models::EMBEDDING),
+            env::EMBEDDING_MODEL
+        );
+        assert_eq!(
+            model_override_env_vars(models::RERANKER),
+            env::RERANKER_MODEL
+        );
+        assert_eq!(
+            model_override_env_vars(models::EXPANDER),
+            env::EXPANDER_MODEL
+        );
     }
 }

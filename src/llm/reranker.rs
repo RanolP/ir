@@ -5,11 +5,11 @@
 // Cache key: sha256(query + "\0" + doc_hash) → cached f64 score
 
 use crate::error::{Error, Result};
-use crate::llm::{models, LlamaBackend};
+use crate::llm::{LlamaBackend, gpu_layers, models};
 use llama_cpp_2::{
     context::params::LlamaContextParams,
     llama_batch::LlamaBatch,
-    model::{params::LlamaModelParams, AddBos, LlamaModel},
+    model::{AddBos, LlamaModel, params::LlamaModelParams},
 };
 use std::num::NonZeroU32;
 use std::path::Path;
@@ -28,8 +28,12 @@ pub struct Reranker {
 impl Reranker {
     pub fn load(model_path: &Path) -> Result<Self> {
         let backend = crate::llm::init_backend()?;
-        let model = LlamaModel::load_from_file(&backend, model_path, &LlamaModelParams::default())
-            .map_err(|e| Error::Other(format!("load reranker: {e}")))?;
+        let model = LlamaModel::load_from_file(
+            &backend,
+            model_path,
+            &LlamaModelParams::default().with_n_gpu_layers(gpu_layers()),
+        )
+        .map_err(|e| Error::Other(format!("load reranker: {e}")))?;
 
         // Resolve "Yes" and "No" token IDs from the model vocabulary.
         let yes_tokens = model
@@ -43,16 +47,16 @@ impl Reranker {
         let yes_id = yes_tokens.last().map(|t| t.0).unwrap_or(0);
         let no_id = no_tokens.last().map(|t| t.0).unwrap_or(1);
 
-        Ok(Self { backend, model, yes_token_id: yes_id, no_token_id: no_id })
+        Ok(Self {
+            backend,
+            model,
+            yes_token_id: yes_id,
+            no_token_id: no_id,
+        })
     }
 
     pub fn load_default() -> Result<Self> {
-        let path = crate::llm::find_model(models::RERANKER).ok_or_else(|| {
-            Error::Other(format!(
-                "reranker model '{}' not found. Add to ~/local-models/",
-                models::RERANKER
-            ))
-        })?;
+        let path = crate::llm::download::ensure_model(models::RERANKER)?;
         Self::load(&path)
     }
 
@@ -121,7 +125,6 @@ impl Reranker {
 
         Ok(score)
     }
-
 }
 
 #[cfg(test)]
@@ -129,7 +132,7 @@ mod tests {
     use super::*;
 
     fn cache_key(query: &str, doc_hash: &str) -> String {
-        crate::index::hasher::hash_str(&format!("{query}\0{doc_hash}"))
+        crate::index::hasher::hash_bytes(format!("{query}\0{doc_hash}").as_bytes())
     }
 
     #[test]
@@ -151,10 +154,16 @@ mod tests {
     fn score_relevant_doc_higher() {
         let r = Reranker::load_default().expect("load reranker");
         let relevant = r
-            .score("rust memory management", "Rust uses ownership and borrowing to manage memory without a garbage collector")
+            .score(
+                "rust memory management",
+                "Rust uses ownership and borrowing to manage memory without a garbage collector",
+            )
             .expect("score");
         let irrelevant = r
-            .score("rust memory management", "Python uses a garbage collector. JavaScript also has automatic memory management.")
+            .score(
+                "rust memory management",
+                "Python uses a garbage collector. JavaScript also has automatic memory management.",
+            )
             .expect("score");
         assert!(
             relevant > irrelevant,
