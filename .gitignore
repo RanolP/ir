@@ -10,3 +10,6 @@
 .env*
 *secret*
 *credential*
+ir-0.1.0-darwin-arm64.tar.gz.asc
+ir-0.1.0-darwin-arm64.tar.gz
+ir-0.1.0-darwin-arm64.tar.gz.sha256
