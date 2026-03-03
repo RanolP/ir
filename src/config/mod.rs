@@ -74,18 +74,25 @@ impl Config {
     }
 }
 
-pub fn config_path() -> PathBuf {
-    dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from("~/.config"))
+/// Base directory for all ir state: $XDG_CONFIG_HOME/ir or ~/.config/ir.
+/// Consistent across platforms; avoids platform-specific paths like ~/Library.
+fn ir_dir() -> PathBuf {
+    std::env::var("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("~"))
+                .join(".config")
+        })
         .join("ir")
-        .join("config.yml")
+}
+
+pub fn config_path() -> PathBuf {
+    ir_dir().join("config.yml")
 }
 
 pub fn data_dir() -> PathBuf {
-    dirs::data_local_dir()
-        .unwrap_or_else(|| PathBuf::from("~/.local/share"))
-        .join("ir")
-        .join("collections")
+    ir_dir().join("collections")
 }
 
 pub fn collection_db_path(name: &str) -> PathBuf {
