@@ -1,5 +1,15 @@
 /target
 /test-data/
+
+# Research artifacts — generated data, optimizer outputs, downloaded datasets
+research/artifacts/
+research/__pycache__/
+*.jsonl
+*.json.bak
+/beir-data/
+*.pyc
+.venv/
+__pycache__/
 *.pem
 *.key
 *.p12

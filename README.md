@@ -28,15 +28,18 @@ Models are downloaded automatically from HuggingFace Hub on first use and cached
 | Model | HF Repo | Required for |
 |---|---|---|
 | [EmbeddingGemma 300M](https://huggingface.co/ggml-org/embeddinggemma-300M-GGUF) | `ggml-org/embeddinggemma-300M-GGUF` | `ir embed`, vector search, hybrid |
-| [Qwen3-Reranker 0.6B](https://huggingface.co/ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF) | `ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF` | hybrid reranking (optional) |
-| [qmd-query-expansion 1.7B](https://huggingface.co/tobil/qmd-query-expansion-1.7B) | `tobil/qmd-query-expansion-1.7B` | hybrid query expansion (optional) |
+| [Qwen3.5-0.8B](https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF) | `unsloth/Qwen3.5-0.8B-GGUF` | unified expand + rerank (optional) |
+| [Qwen3.5-2B](https://huggingface.co/unsloth/Qwen3.5-2B-GGUF) | `unsloth/Qwen3.5-2B-GGUF` | unified expand + rerank (optional) |
+| [Qwen3-Reranker 0.6B](https://huggingface.co/ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF) | `ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF` | reranking only (optional) |
+| [qmd-query-expansion 1.7B](https://huggingface.co/tobil/qmd-query-expansion-1.7B) | `tobil/qmd-query-expansion-1.7B` | expansion only (optional) |
 
-BM25 search works without any models.
+BM25 search works without any models. When `IR_QWEN_MODEL` is set (or a Qwen3.5 GGUF is found in `~/local-models/`), it is used for both expansion and reranking, replacing the two separate models.
 
-To use local models instead, point to a directory or individual files:
+To use local models, point to a directory or individual files:
 
 ```bash
 export IR_MODEL_DIRS="$HOME/my-models"          # ':'-separated list
+export IR_QWEN_MODEL="$HOME/local-models/Qwen3.5-2B-Q4_K_M.gguf"   # unified
 export IR_EMBEDDING_MODEL="$HOME/my-models/embeddinggemma-300M-Q8_0.gguf"
 export IR_RERANKER_MODEL="$HOME/my-models/qwen3-reranker-0.6b-q8_0.gguf"
 export IR_EXPANDER_MODEL="$HOME/my-models/qmd-query-expansion-1.7B-q4_k_m.gguf"
@@ -105,38 +108,23 @@ Query
   │
   ├─ BM25 probe ──► score ≥ 0.85 AND gap ≥ 0.15? ──► return immediately
   │
-  ├─ With expander model:
-  │    expand → lex/vec/hyde sub-queries
-  │    retrieve BM25 + vector per sub-query
-  │    RRF fusion  (lex=1.0, vec=1.5, hyde=1.0)
+  ├─ With Qwen3.5 (unified):  expand → lex/vec/hyde → RRF → rerank
+  ├─ With separate models:    expand → lex/vec/hyde → RRF → rerank
+  ├─ Without expander:        BM25 + vector → score fusion 0.80·vec + 0.20·bm25
   │
-  ├─ Without expander model:
-  │    BM25 list + vector list
-  │    score fusion: 0.80·vec + 0.20·bm25  ← tuned on NFCorpus
-  │
-  └─ Reranker (optional): final = 0.40·fused + 0.60·P(relevant)
+  └─ Reranker: final = 0.40·fused + 0.60·P(relevant)
 ```
 
 ## Benchmark: BEIR/NFCorpus
 
-3,633 medical documents · 323 test queries · graded relevance
-
-| Mode | nDCG@10 | Recall@10 |
+| Mode | nDCG@10 | Notes |
 |---|---|---|
-| BM25 | 0.2037 | 0.0932 |
-| Vector | 0.3866 | 0.1926 |
-| **Hybrid (score-fusion α=0.80)** | **0.3924** | **0.1952** |
+| BM25 | 0.2037 | no model |
+| Vector | 0.3866 | EmbeddingGemma 300M |
+| Hybrid (score-fusion α=0.80) | 0.3924 | +1.5% vs vector |
+| **Hybrid + reranker** | **0.4032** | **+2.8% vs score-fusion** |
 
-Hybrid beats vector by +1.5% and BM25 by +92.7% on nDCG@10. The α=0.70–0.95 range forms a flat plateau; 0.80 is the robust midpoint. The old pure-RRF approach scored 0.372.
-
-Reproduce:
-```bash
-# Download dataset (~100MB)
-curl -L https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/nfcorpus.zip -o /tmp/nfcorpus.zip
-unzip /tmp/nfcorpus.zip -d test-data/
-
-cargo run --release --bin eval -- --data test-data/nfcorpus --mode all
-```
+See [research/experiment.md](research/experiment.md) for full results, reproduction steps, and the ongoing Qwen3.5 unification experiment.
 
 ## vs qmd
 

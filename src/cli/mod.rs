@@ -6,7 +6,7 @@ pub mod output;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser, Debug)]
-#[command(name = "ir", about = "Local markdown search engine")]
+#[command(name = "ir", about = "Local markdown search engine", version)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,

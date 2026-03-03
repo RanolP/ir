@@ -1,0 +1,111 @@
+# ir — Research & Experiments
+
+Ongoing benchmark results and model experiments.
+Baseline system: EmbeddingGemma 308M + Qwen3-Reranker 0.6B + qmd-expansion 1.7B.
+
+## Benchmark Setup
+
+**Dataset**: BEIR/NFCorpus — 3,633 medical documents · 323 test queries · graded relevance.
+**Metric**: nDCG@10 (primary), Recall@10 (secondary).
+
+```bash
+# Download dataset (~100MB)
+curl -L https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/nfcorpus.zip \
+  -o /tmp/nfcorpus.zip && unzip /tmp/nfcorpus.zip -d test-data/
+
+cargo run --release --bin eval -- --data test-data/nfcorpus --mode all
+```
+
+## Baseline Results (NFCorpus)
+
+| Mode | nDCG@10 | Recall@10 | Notes |
+|------|---------|-----------|-------|
+| BM25 | 0.2037 | 0.0932 | no model |
+| Vector | 0.3866 | 0.1926 | EmbeddingGemma 300M |
+| **Hybrid (score-fusion α=0.80)** | **0.3924** | **0.1952** | +1.5% vs vector |
+| Hybrid + reranker | 0.4032 | — | +2.8% vs score-fusion |
+
+α=0.70–0.95 forms a flat plateau; 0.80 is the robust midpoint.
+Old pure-RRF scored 0.372 — score-fusion is +5.5% better.
+
+---
+
+## Experiment: Unified Qwen3.5 (ongoing)
+
+**Hypothesis**: Replace both the reranker (0.6B) and expander (1.7B) with a single
+Qwen3.5 model. Use DSPy MIPROv2 to optimize prompts offline against NFCorpus/SciFact,
+then hardcode winning prompts in `src/llm/qwen.rs`.
+
+### Model Comparison
+
+| | Qwen3.5-0.8B | Qwen3.5-2B | Current combined |
+|---|---|---|---|
+| Params | 0.8B | 2B | 0.6B + 1.7B = 2.3B |
+| GGUF (local) | Q8_0 812MB | Q4_K_M 1.3GB | ~1.6GB combined |
+| Models to load | 1 | 1 | 2 |
+| Architecture | Gated DeltaNet, 262K ctx | Gated DeltaNet, 262K ctx | Qwen3 transformer |
+
+### Phase Status
+
+| Phase | Status | Notes |
+|-------|--------|-------|
+| 1a: commit dirty tree | ✅ | 95b2ab1 |
+| 1b: llama-cpp-2 → 0.1.137 | ✅ | Gated DeltaNet support |
+| 1c: smoke tests | ✅ | both models load, generate, tokenize |
+| 1c: functional tests | ✅ | expand + score_relevance pass |
+| 2: DSPy prompt optimization | ⬜ | see below |
+| 3: Rust integration | ✅ | `src/llm/qwen.rs` wired into pipeline |
+| 4: benchmark runs | ⬜ | pending Phase 2 |
+
+### Phase 2: DSPy Optimization
+
+```bash
+pip install dspy ollama
+ollama pull qwen3.5:0.8b
+ollama pull qwen3.5:2b
+
+python research/export_eval_data.py        # exports NFCorpus/SciFact → artifacts/
+python research/dspy_optimize.py           # MIPROv2 + BootstrapFewShot; saves artifacts/
+```
+
+Outputs: `research/artifacts/{model}_expander.json`, `{model}_reranker.json`, `{model}_prompts.txt`.
+Paste winning prompts into `src/llm/qwen.rs` constants (marked `// ! DSPy-optimized prompt`).
+
+### Benchmark Runs (planned)
+
+| Run | Expander | Reranker | GGUF total | Target |
+|-----|----------|----------|------------|--------|
+| A (baseline) | qmd-1.7B | Qwen3-Reranker-0.6B | ~1.6GB | 0.4032 |
+| B | Qwen3.5-0.8B | Qwen3.5-0.8B | ~812MB | ≥ 0.4032 |
+| C | Qwen3.5-2B | Qwen3.5-2B | ~1.3GB | ≥ 0.4032 |
+| D (ablation) | Qwen3.5-2B | Qwen3-Reranker-0.6B | ~1.9GB | — |
+| E (ablation) | qmd-1.7B | Qwen3.5-2B | ~2.3GB | — |
+
+```bash
+# Run B
+IR_QWEN_MODEL=~/local-models/Qwen3.5-0.8B-Q8_0.gguf \
+  cargo run --release --bin eval -- --data test-data/nfcorpus --mode all
+
+# Run C
+IR_QWEN_MODEL=~/local-models/Qwen3.5-2B-Q4_K_M.gguf \
+  cargo run --release --bin eval -- --data test-data/nfcorpus --mode all
+```
+
+### Decision Matrix
+
+| Outcome | Action |
+|---------|--------|
+| 0.8B matches baseline nDCG | Ship 0.8B — 812MB for both roles |
+| 2B matches, 0.8B doesn't | Ship 2B — still smaller than current 1.6GB |
+| Neither matches | Keep current models; DSPy prompts still applicable |
+| DSPy prompts improve fine-tuned models | Apply optimization to existing models too |
+
+### Results
+
+_To be filled after Phase 2 + benchmark runs._
+
+| Run | nDCG@10 | vs baseline | Notes |
+|-----|---------|-------------|-------|
+| A (baseline) | 0.4032 | — | |
+| B (0.8B) | — | — | |
+| C (2B) | — | — | |
