@@ -12,6 +12,7 @@
 pub mod download;
 pub mod embedding;
 pub mod expander;
+pub mod qwen;
 pub mod reranker;
 
 pub use llama_cpp_2::llama_backend::LlamaBackend;
@@ -30,6 +31,8 @@ pub mod models {
     pub const EMBEDDING: &str = "embeddinggemma-300M-Q8_0.gguf";
     pub const RERANKER: &str = "qwen3-reranker-0.6b-q8_0.gguf";
     pub const EXPANDER: &str = "qmd-query-expansion-1.7B-q4_k_m.gguf";
+    pub const QWEN35_0_8B: &str = "Qwen3.5-0.8B-Q8_0.gguf";
+    pub const QWEN35_2B: &str = "Qwen3.5-2B-Q4_K_M.gguf";
 }
 
 /// HuggingFace repo + filename for each known model.
@@ -48,6 +51,14 @@ pub mod hf_repos {
         // ! uppercase on HF; local name uses lowercase q4_k_m
         "qmd-query-expansion-1.7B-Q4_K_M.gguf",
     );
+    pub const QWEN35_0_8B: (&str, &str) = (
+        "unsloth/Qwen3.5-0.8B-GGUF",
+        "Qwen3.5-0.8B-Q8_0.gguf",
+    );
+    pub const QWEN35_2B: (&str, &str) = (
+        "unsloth/Qwen3.5-2B-GGUF",
+        "Qwen3.5-2B-Q4_K_M.gguf",
+    );
 
     /// Returns `(repo_id, hf_filename)` for a local model filename, or `None`.
     pub fn for_filename(filename: &str) -> Option<(&'static str, &'static str)> {
@@ -55,6 +66,8 @@ pub mod hf_repos {
             super::models::EMBEDDING => Some(EMBEDDING),
             super::models::RERANKER => Some(RERANKER),
             super::models::EXPANDER => Some(EXPANDER),
+            super::models::QWEN35_0_8B => Some(QWEN35_0_8B),
+            super::models::QWEN35_2B => Some(QWEN35_2B),
             _ => None,
         }
     }
@@ -129,6 +142,8 @@ pub mod env {
         "QMD_EXPANDER_MODEL",
         "QMD_EXPAND_MODEL",
     ];
+    /// Unified Qwen3.5 model (reranker + expander). Takes priority over separate models.
+    pub const QWEN_MODEL: &str = "IR_QWEN_MODEL";
 }
 
 /// Env vars that can override the full path for a known model filename.
@@ -137,6 +152,7 @@ pub fn model_override_env_vars(filename: &str) -> &'static [&'static str] {
         models::EMBEDDING => env::EMBEDDING_MODEL,
         models::RERANKER => env::RERANKER_MODEL,
         models::EXPANDER => env::EXPANDER_MODEL,
+        models::QWEN35_0_8B | models::QWEN35_2B => std::slice::from_ref(&env::QWEN_MODEL),
         _ => &[],
     }
 }

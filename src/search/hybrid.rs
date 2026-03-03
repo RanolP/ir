@@ -13,6 +13,7 @@ use crate::error::Result;
 use crate::llm::{
     embedding::Embedder,
     expander::{Expander, SubQueryKind},
+    qwen::Qwen35,
     reranker::Reranker,
 };
 use crate::search::rrf::{self, RankedList};
@@ -28,6 +29,9 @@ pub struct HybridRequest<'a> {
 
 pub struct HybridSearch {
     pub embedder: Embedder,
+    /// Unified model: used for both expansion and reranking when present.
+    /// Takes priority over separate expander + reranker.
+    pub qwen: Option<Qwen35>,
     pub expander: Option<Expander>,
     pub reranker: Option<Reranker>,
 }
@@ -45,9 +49,10 @@ impl HybridSearch {
             return Ok(apply_min_score(probe_results, req.min_score, req.limit));
         }
 
-        // 2. Fuse results: use multi-subquery RRF when expander is present,
-        //    otherwise use score-based linear fusion (empirically better on BEIR).
-        let fused = if let Some(exp) = &self.expander {
+        // 2. Fuse: qwen expander > separate expander > score-fusion.
+        let fused = if let Some(q) = &self.qwen {
+            rrf_with_qwen(dbs, &self.embedder, q, req, probe_results)?
+        } else if let Some(exp) = &self.expander {
             rrf_with_expander(dbs, &self.embedder, exp, req, probe_results)?
         } else {
             score_fusion_two_list(dbs, &self.embedder, req)?
@@ -57,10 +62,13 @@ impl HybridSearch {
             return Ok(vec![]);
         }
 
-        // 3. Rerank top-20 if reranker available.
-        let final_results = match &self.reranker {
-            Some(reranker) => rerank(reranker, req.query, fused, dbs, req.limit)?,
-            None => fused,
+        // 3. Rerank top-20: qwen reranker > separate reranker.
+        let final_results = if let Some(q) = &self.qwen {
+            rerank_qwen(q, req.query, fused, dbs, req.limit)?
+        } else if let Some(reranker) = &self.reranker {
+            rerank(reranker, req.query, fused, dbs, req.limit)?
+        } else {
+            fused
         };
 
         Ok(apply_min_score(final_results, req.min_score, req.limit))
@@ -110,6 +118,20 @@ fn score_fusion_two_list(
     Ok(merged)
 }
 
+/// Multi-subquery RRF fusion using unified Qwen3.5 model for expansion.
+fn rrf_with_qwen(
+    dbs: &[CollectionDb],
+    embedder: &Embedder,
+    qwen: &Qwen35,
+    req: &HybridRequest,
+    probe_results: Vec<SearchResult>,
+) -> Result<Vec<SearchResult>> {
+    let sub_queries = qwen
+        .expand(req.query)
+        .unwrap_or_else(|_| crate::llm::expander::fallback(req.query));
+    rrf_from_subqueries(dbs, embedder, &sub_queries, req, probe_results)
+}
+
 /// Multi-subquery RRF fusion for use with the query expander.
 /// Weights: lex=1.0, vec=1.5, hyde=1.0 — vector weighted higher.
 /// Probe BM25 results are NOT added again if a lex sub-query already covers the same query.
@@ -123,10 +145,19 @@ fn rrf_with_expander(
     let sub_queries = expander
         .expand(req.query)
         .unwrap_or_else(|_| crate::llm::expander::fallback(req.query));
+    rrf_from_subqueries(dbs, embedder, &sub_queries, req, probe_results)
+}
 
+fn rrf_from_subqueries(
+    dbs: &[CollectionDb],
+    embedder: &Embedder,
+    sub_queries: &[crate::llm::expander::SubQuery],
+    req: &HybridRequest,
+    probe_results: Vec<SearchResult>,
+) -> Result<Vec<SearchResult>> {
     let mut ranked_lists: Vec<RankedList> = Vec::new();
 
-    for sub in &sub_queries {
+    for sub in sub_queries {
         let weight = match sub.kind {
             SubQueryKind::Lex => 1.0,
             SubQueryKind::Vec => 1.5,
@@ -219,6 +250,36 @@ fn apply_min_score(
     }
     results.truncate(limit);
     results
+}
+
+/// Rerank top-20 using Qwen3.5 unified model, blend with fusion scores.
+fn rerank_qwen(
+    qwen: &Qwen35,
+    query: &str,
+    mut candidates: Vec<SearchResult>,
+    dbs: &[CollectionDb],
+    limit: usize,
+) -> Result<Vec<SearchResult>> {
+    let top_n = candidates.len().min(20);
+    let (to_rerank, rest) = candidates.split_at_mut(top_n);
+
+    for result in to_rerank.iter_mut() {
+        if let Some(text) = fetch_doc_text(dbs, &result.hash, &result.collection) {
+            let fusion_score = result.score;
+            if let Ok(rerank_score) = qwen.score_relevance(query, &text) {
+                result.score = fusion_score * 0.4 + rerank_score * 0.6;
+            }
+        }
+    }
+
+    let mut all: Vec<SearchResult> = to_rerank
+        .iter()
+        .cloned()
+        .chain(rest.iter().cloned())
+        .collect();
+    SearchResult::sort_desc(&mut all);
+    all.truncate(limit);
+    Ok(all)
 }
 
 /// Rerank top-20 using LLM cross-encoder, blend with fusion scores.

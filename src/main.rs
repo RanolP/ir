@@ -215,15 +215,24 @@ fn handle_search(
         }
         SearchMode::Hybrid => {
             let embedder = llm::embedding::Embedder::load_default()?;
-            // Expander and reranker are optional: degrade gracefully if models missing.
-            let expander = llm::expander::Expander::load_default()
-                .map_err(|e| eprintln!("note: expander unavailable: {e}"))
+            // Unified Qwen3.5 takes priority; falls back to separate models if unavailable.
+            let qwen = llm::qwen::Qwen35::load_default()
+                .map_err(|e| eprintln!("note: qwen3.5 unavailable: {e}"))
                 .ok();
-            let reranker = llm::reranker::Reranker::load_default()
-                .map_err(|e| eprintln!("note: reranker unavailable: {e}"))
-                .ok();
+            let (expander, reranker) = if qwen.is_some() {
+                (None, None)
+            } else {
+                let exp = llm::expander::Expander::load_default()
+                    .map_err(|e| eprintln!("note: expander unavailable: {e}"))
+                    .ok();
+                let rer = llm::reranker::Reranker::load_default()
+                    .map_err(|e| eprintln!("note: reranker unavailable: {e}"))
+                    .ok();
+                (exp, rer)
+            };
             let hs = search::hybrid::HybridSearch {
                 embedder,
+                qwen,
                 expander,
                 reranker,
             };
