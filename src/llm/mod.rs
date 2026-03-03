@@ -16,7 +16,7 @@ pub mod qwen;
 pub mod reranker;
 
 pub use llama_cpp_2::llama_backend::LlamaBackend;
-use llama_cpp_2::model::params::LlamaModelParams;
+pub use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::{LlamaBackendDeviceType, list_llama_ggml_backend_devices};
 
 use std::path::PathBuf;
@@ -80,6 +80,24 @@ pub fn gpu_layers() -> u32 {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(if cfg!(target_os = "macos") { 99 } else { 0 })
+}
+
+/// CPU-pinned model params: no GPU layers, device list restricted to CPU backends.
+pub fn model_load_cpu_params() -> LlamaModelParams {
+    let cpu_devices: Vec<usize> = list_llama_ggml_backend_devices()
+        .into_iter()
+        .filter(|d| d.device_type == LlamaBackendDeviceType::Cpu)
+        .map(|d| d.index)
+        .collect();
+
+    let base = LlamaModelParams::default().with_n_gpu_layers(0);
+    if cpu_devices.is_empty() {
+        return base;
+    }
+    match base.with_devices(&cpu_devices) {
+        Ok(pinned) => pinned,
+        Err(_) => LlamaModelParams::default().with_n_gpu_layers(0),
+    }
 }
 
 /// Build model-load params with runtime defaults.

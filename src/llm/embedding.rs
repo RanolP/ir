@@ -9,7 +9,7 @@
 //   pooling: cls
 
 use crate::error::{Error, Result};
-use crate::llm::{LlamaBackend, l2_normalize, model_load_params, models};
+use crate::llm::{LlamaBackend, l2_normalize, model_load_cpu_params, model_load_params, models};
 use llama_cpp_2::{
     context::LlamaContext,
     context::params::{LlamaContextParams, LlamaPoolingType},
@@ -76,8 +76,36 @@ pub struct Embedder {
 
 impl Embedder {
     pub fn load(model_path: &Path) -> Result<Self> {
+        Self::load_with_gpu_layers(model_path, crate::llm::gpu_layers())
+    }
+
+    pub fn load_default() -> Result<Self> {
+        let path = crate::llm::download::ensure_model(models::EMBEDDING)?;
+        let gpu_layers = crate::llm::gpu_layers();
+        let embedder = Self::load_with_gpu_layers(&path, gpu_layers)?;
+
+        // ! Probe context creation: Metal may be unavailable (e.g. sandbox). If so, reload on CPU.
+        if gpu_layers > 0 {
+            let n_threads = std::thread::available_parallelism()
+                .map(|n| n.get() as i32)
+                .unwrap_or(4);
+            if embedder.new_context(n_threads).is_err() {
+                eprintln!("note: GPU context unavailable, falling back to CPU");
+                return Self::load_with_gpu_layers(&path, 0);
+            }
+        }
+
+        Ok(embedder)
+    }
+
+    fn load_with_gpu_layers(model_path: &Path, gpu_layers: u32) -> Result<Self> {
         let backend = crate::llm::init_backend()?;
-        let model = LlamaModel::load_from_file(&backend, model_path, &model_load_params())
+        let params = if gpu_layers == 0 {
+            model_load_cpu_params()
+        } else {
+            model_load_params()
+        };
+        let model = LlamaModel::load_from_file(&backend, model_path, &params)
             .map_err(|e| Error::Other(format!("load embedding model: {e}")))?;
         let profile = profile_for_model_path(model_path);
         Ok(Self {
@@ -86,11 +114,6 @@ impl Embedder {
             profile,
             pooling_override: None,
         })
-    }
-
-    pub fn load_default() -> Result<Self> {
-        let path = crate::llm::download::ensure_model(models::EMBEDDING)?;
-        Self::load(&path)
     }
 
     pub fn embedding_dim(&self) -> usize {
