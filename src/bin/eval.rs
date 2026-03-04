@@ -15,7 +15,7 @@
 //
 // Primary metric: nDCG@10 (graded relevance, log-discounted cumulative gain)
 
-use rusqlite::Connection;
+use rusqlite::{Connection, params};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
@@ -428,6 +428,61 @@ fn load_qrels(path: &Path) -> Result<Qrels> {
 
 // ── Indexing ──────────────────────────────────────────────────────────────────
 
+// ── Eval cache ────────────────────────────────────────────────────────────────
+
+fn ensure_eval_cache_schema(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS eval_query_embeddings (
+            query_id TEXT NOT NULL,
+            model    TEXT NOT NULL,
+            embedding BLOB NOT NULL,
+            PRIMARY KEY (query_id, model)
+        );
+        CREATE TABLE IF NOT EXISTS eval_run_results (
+            run_key  TEXT NOT NULL,
+            query_id TEXT NOT NULL,
+            mode     TEXT NOT NULL,
+            ndcg     REAL NOT NULL,
+            recall   REAL NOT NULL,
+            PRIMARY KEY (run_key, query_id, mode)
+        );",
+    )?;
+    Ok(())
+}
+
+/// Fingerprint of the config parameters that affect eval results for a given mode.
+/// Different model paths, alpha, chunk size → different run_key → separate cache entries.
+fn eval_run_key(args: &Args) -> String {
+    let embed_model = std::env::var("IR_EMBEDDING_MODEL")
+        .or_else(|_| std::env::var("QMD_EMBEDDING_MODEL"))
+        .unwrap_or_else(|_| models::EMBEDDING.to_string());
+    let expander_model = std::env::var("IR_EXPANDER_MODEL")
+        .or_else(|_| std::env::var("QMD_EXPANDER_MODEL"))
+        .unwrap_or_default();
+    let reranker_model = std::env::var("IR_RERANKER_MODEL")
+        .or_else(|_| std::env::var("QMD_RERANKER_MODEL"))
+        .unwrap_or_default();
+    let qwen_model = std::env::var("IR_QWEN_MODEL").unwrap_or_default();
+    format!(
+        "embed={embed_model}|expander={expander_model}|reranker={reranker_model}|qwen={qwen_model}|\
+         alpha={:.4}|chunk={:?}|rerank={},w={:.3},n={}|expander_on={}|prf={}|alpha_norm={:.3}|\
+         rrf_k={:.1},lex={:.2},vec={:.2},hyde={:.2}|title_w={:.2}",
+        args.alpha,
+        args.chunk_size_tokens,
+        args.use_rerank,
+        args.rerank_weight,
+        args.rerank_top_n,
+        args.use_expander,
+        args.use_prf,
+        args.alpha_normalizer,
+        args.rrf_k,
+        args.rrf_lex_weight,
+        args.rrf_vec_weight,
+        args.rrf_hyde_weight,
+        args.title_weight,
+    )
+}
+
 fn index_corpus(conn: &Connection, docs: &[CorpusDoc]) -> Result<()> {
     let now = "2024-01-01T00:00:00Z";
 
@@ -562,21 +617,68 @@ fn embed_corpus(conn: &Connection, docs: &[CorpusDoc], embedder: &Embedder) -> R
     Ok(())
 }
 
-fn embed_queries(embedder: &Embedder, queries: &[Query]) -> Result<HashMap<String, Vec<f32>>> {
-    let inputs: Vec<String> = queries.iter().map(|q| q.text.clone()).collect();
-    let embeddings = embedder.embed_query_batch(&inputs)?;
-    if embeddings.len() != queries.len() {
-        return Err(Error::Other(format!(
-            "query embedding count mismatch: got {}, expected {}",
-            embeddings.len(),
-            queries.len()
-        )));
+fn embed_queries(
+    conn: &Connection,
+    embedder: &Embedder,
+    queries: &[Query],
+    model_key: &str,
+) -> Result<HashMap<String, Vec<f32>>> {
+    // Load cached embeddings.
+    let mut cached: HashMap<String, Vec<f32>> = HashMap::new();
+    for q in queries {
+        let blob: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT embedding FROM eval_query_embeddings WHERE query_id = ?1 AND model = ?2",
+                params![q.id, model_key],
+                |r| r.get(0),
+            )
+            .ok();
+        if let Some(bytes) = blob {
+            let floats: Vec<f32> = bytes
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .collect();
+            cached.insert(q.id.clone(), floats);
+        }
     }
-    Ok(queries
-        .iter()
-        .zip(embeddings)
-        .map(|(q, emb)| (q.id.clone(), emb))
-        .collect())
+
+    let pending: Vec<&Query> = queries.iter().filter(|q| !cached.contains_key(&q.id)).collect();
+    let n_cached = cached.len();
+    let n_pending = pending.len();
+    let total = queries.len();
+
+    if n_pending == 0 {
+        println!("  all query embeddings cached ({total})");
+        return Ok(cached);
+    }
+
+    if n_cached > 0 {
+        println!("  {n_cached}/{total} query embeddings cached, embedding {n_pending} new...");
+    } else {
+        println!("  embedding {n_pending} queries...");
+    }
+
+    let inputs: Vec<String> = pending.iter().map(|q| q.text.clone()).collect();
+    let mut stdout = std::io::stdout();
+    let new_embeddings = embedder.embed_query_batch_progress(&inputs, |done, _total_batch| {
+        let overall = n_cached + done;
+        eprint!("\r  {overall}/{total}");
+        let _ = stdout.flush();
+    })?;
+    eprintln!(); // newline after progress
+
+    // Persist new embeddings.
+    for (q, emb) in pending.iter().zip(new_embeddings.iter()) {
+        let bytes: Vec<u8> = emb.iter().flat_map(|f| f.to_le_bytes()).collect();
+        conn.execute(
+            "INSERT OR REPLACE INTO eval_query_embeddings (query_id, model, embedding)
+             VALUES (?1, ?2, ?3)",
+            params![q.id, model_key, bytes],
+        )?;
+        cached.insert(q.id.clone(), emb.clone());
+    }
+
+    Ok(cached)
 }
 
 fn doc_text(doc: &CorpusDoc) -> String {
@@ -1241,17 +1343,74 @@ struct EvalResult {
     n_queries: usize,
 }
 
-fn evaluate_bm25(conn: &Connection, queries: &[Query], qrels: &Qrels, k: usize) -> EvalResult {
+fn load_cached_results(
+    conn: &Connection,
+    run_key: &str,
+    mode: &str,
+) -> HashMap<String, (f64, f64)> {
+    let mut map = HashMap::new();
+    let mut stmt = match conn.prepare_cached(
+        "SELECT query_id, ndcg, recall FROM eval_run_results WHERE run_key = ?1 AND mode = ?2",
+    ) {
+        Ok(s) => s,
+        Err(_) => return map,
+    };
+    let rows = stmt.query_map(params![run_key, mode], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?, r.get::<_, f64>(2)?))
+    });
+    if let Ok(rows) = rows {
+        for row in rows.flatten() {
+            map.insert(row.0, (row.1, row.2));
+        }
+    }
+    map
+}
+
+fn save_query_result(conn: &Connection, run_key: &str, query_id: &str, mode: &str, ndcg: f64, recall: f64) {
+    if let Err(e) = conn.execute(
+        "INSERT OR REPLACE INTO eval_run_results (run_key, query_id, mode, ndcg, recall)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![run_key, query_id, mode, ndcg, recall],
+    ) {
+        eprintln!("warn: failed to cache eval result ({mode} {query_id}): {e}");
+    }
+}
+
+fn evaluate_bm25(
+    conn: &Connection,
+    queries: &[Query],
+    qrels: &Qrels,
+    k: usize,
+    run_key: &str,
+) -> EvalResult {
+    let cached = load_cached_results(conn, run_key, "bm25");
+    let n_cached = cached.len();
     let (mut total_ndcg, mut total_recall, mut n) = (0.0f64, 0.0f64, 0usize);
-    for (i, q) in queries.iter().enumerate() {
-        maybe_log_query_progress("bm25", i, queries.len());
-        let Some(relevant) = qrels.get(&q.id) else {
-            continue;
-        };
+
+    // Include cached results in totals.
+    for (ndcg, recall) in cached.values() {
+        total_ndcg += ndcg;
+        total_recall += recall;
+        n += 1;
+    }
+
+    let pending: Vec<&Query> = queries.iter().filter(|q| !cached.contains_key(&q.id)).collect();
+    if n_cached > 0 && pending.is_empty() {
+        println!("  all bm25 results cached ({n_cached})");
+    } else if n_cached > 0 {
+        println!("  {n_cached}/{} bm25 results cached, computing {} new...", queries.len(), pending.len());
+    }
+
+    for (i, q) in pending.iter().enumerate() {
+        maybe_log_query_progress("bm25", i + n_cached, queries.len());
+        let Some(relevant) = qrels.get(&q.id) else { continue; };
         let results = bm25_search(conn, &q.text, k, 1.0);
         let ranked: Vec<String> = results.iter().map(|r| r.path.clone()).collect();
-        total_ndcg += ndcg_at_k(&ranked, relevant, k);
-        total_recall += recall_at_k(&ranked, relevant, k);
+        let ndcg = ndcg_at_k(&ranked, relevant, k);
+        let recall = recall_at_k(&ranked, relevant, k);
+        save_query_result(conn, run_key, &q.id, "bm25", ndcg, recall);
+        total_ndcg += ndcg;
+        total_recall += recall;
         n += 1;
     }
     EvalResult {
@@ -1268,20 +1427,36 @@ fn evaluate_vector(
     qrels: &Qrels,
     k: usize,
     query_embeddings: &HashMap<String, Vec<f32>>,
+    run_key: &str,
 ) -> EvalResult {
+    let cached = load_cached_results(conn, run_key, "vector");
+    let n_cached = cached.len();
     let (mut total_ndcg, mut total_recall, mut n) = (0.0f64, 0.0f64, 0usize);
-    for (i, q) in queries.iter().enumerate() {
-        maybe_log_query_progress("vector", i, queries.len());
-        let Some(relevant) = qrels.get(&q.id) else {
-            continue;
-        };
-        let Some(embedding) = query_embeddings.get(&q.id) else {
-            continue;
-        };
+
+    for (ndcg, recall) in cached.values() {
+        total_ndcg += ndcg;
+        total_recall += recall;
+        n += 1;
+    }
+
+    let pending: Vec<&Query> = queries.iter().filter(|q| !cached.contains_key(&q.id)).collect();
+    if n_cached > 0 && pending.is_empty() {
+        println!("  all vector results cached ({n_cached})");
+    } else if n_cached > 0 {
+        println!("  {n_cached}/{} vector results cached, computing {} new...", queries.len(), pending.len());
+    }
+
+    for (i, q) in pending.iter().enumerate() {
+        maybe_log_query_progress("vector", i + n_cached, queries.len());
+        let Some(relevant) = qrels.get(&q.id) else { continue; };
+        let Some(embedding) = query_embeddings.get(&q.id) else { continue; };
         let results = vector_search_from_embedding(conn, embedding, k);
         let ranked: Vec<String> = results.iter().map(|r| r.path.clone()).collect();
-        total_ndcg += ndcg_at_k(&ranked, relevant, k);
-        total_recall += recall_at_k(&ranked, relevant, k);
+        let ndcg = ndcg_at_k(&ranked, relevant, k);
+        let recall = recall_at_k(&ranked, relevant, k);
+        save_query_result(conn, run_key, &q.id, "vector", ndcg, recall);
+        total_ndcg += ndcg;
+        total_recall += recall;
         n += 1;
     }
     EvalResult {
@@ -1307,17 +1482,30 @@ fn evaluate_hybrid(
     rerank_top_n: usize,
     doc_texts: &HashMap<String, String>,
     mode_name: &'static str,
+    run_key: &str,
 ) -> EvalResult {
+    let cached = load_cached_results(conn, run_key, mode_name);
+    let n_cached = cached.len();
     let (mut total_ndcg, mut total_recall, mut n) = (0.0f64, 0.0f64, 0usize);
+
+    for (ndcg, recall) in cached.values() {
+        total_ndcg += ndcg;
+        total_recall += recall;
+        n += 1;
+    }
+
+    let pending: Vec<&Query> = queries.iter().filter(|q| !cached.contains_key(&q.id)).collect();
+    if n_cached > 0 && pending.is_empty() {
+        println!("  all {mode_name} results cached ({n_cached})");
+    } else if n_cached > 0 {
+        println!("  {n_cached}/{} {mode_name} results cached, computing {} new...", queries.len(), pending.len());
+    }
+
     let mut rerank_cache: HashMap<(String, String), f64> = HashMap::new();
-    for (i, q) in queries.iter().enumerate() {
-        maybe_log_query_progress(mode_name, i, queries.len());
-        let Some(relevant) = qrels.get(&q.id) else {
-            continue;
-        };
-        let Some(embedding) = query_embeddings.get(&q.id) else {
-            continue;
-        };
+    for (i, q) in pending.iter().enumerate() {
+        maybe_log_query_progress(mode_name, i + n_cached, queries.len());
+        let Some(relevant) = qrels.get(&q.id) else { continue; };
+        let Some(embedding) = query_embeddings.get(&q.id) else { continue; };
         let fusion_limit = if reranker.is_some() {
             (k * 2).max(rerank_top_n)
         } else {
@@ -1361,8 +1549,11 @@ fn evaluate_hybrid(
         }
         results.truncate(k);
         let ranked: Vec<String> = results.iter().map(|r| r.path.clone()).collect();
-        total_ndcg += ndcg_at_k(&ranked, relevant, k);
-        total_recall += recall_at_k(&ranked, relevant, k);
+        let ndcg = ndcg_at_k(&ranked, relevant, k);
+        let recall = recall_at_k(&ranked, relevant, k);
+        save_query_result(conn, run_key, &q.id, mode_name, ndcg, recall);
+        total_ndcg += ndcg;
+        total_recall += recall;
         n += 1;
     }
     EvalResult {
@@ -1400,6 +1591,7 @@ fn tune_score_fusion(
         let mut cfg = *base_cfg;
         cfg.alpha = alpha;
         cfg.adaptive_alpha = false;
+        let tune_key = format!("tune-alpha-{alpha:.2}");
         let r = evaluate_hybrid(
             conn,
             queries,
@@ -1415,6 +1607,7 @@ fn tune_score_fusion(
             rerank_top_n,
             doc_texts,
             "hybrid",
+            &tune_key,
         );
         let ndcg = r.ndcg;
         let recall = r.recall;
@@ -1457,6 +1650,7 @@ fn tune_rerank_blend(
     let mut best = (0.0f64, 0.0f64, 0.0f64);
 
     for &rerank_weight in &rerank_weights {
+        let tune_key = format!("tune-rerank-{rerank_weight:.2}");
         let r = evaluate_hybrid(
             conn,
             queries,
@@ -1472,6 +1666,7 @@ fn tune_rerank_blend(
             rerank_top_n,
             doc_texts,
             "hybrid-rerank",
+            &tune_key,
         );
         println!(
             "{:<14}  {:>10.4}  {:>12.4}",
@@ -1638,6 +1833,7 @@ fn main() -> Result<()> {
          PRAGMA foreign_keys = ON;",
     )?;
     schema::init(&conn, &corpus_name)?;
+    ensure_eval_cache_schema(&conn)?;
     index_corpus(&conn, &corpus)?;
     println!("  done\n");
 
@@ -1678,10 +1874,14 @@ fn main() -> Result<()> {
         None
     };
 
+    let embed_model_key = std::env::var("IR_EMBEDDING_MODEL")
+        .or_else(|_| std::env::var("QMD_EMBEDDING_MODEL"))
+        .unwrap_or_else(|_| models::EMBEDDING.to_string());
+
     let query_embeddings_opt: Option<HashMap<String, Vec<f32>>> =
         if let Some(ref emb) = embedder_opt {
             println!("embedding queries ({} queries)...", queries.len());
-            let q = embed_queries(emb, &queries)?;
+            let q = embed_queries(&conn, emb, &queries, &embed_model_key)?;
             println!("  done\n");
             Some(q)
         } else {
@@ -1754,13 +1954,14 @@ fn main() -> Result<()> {
         title_weight: args.title_weight,
     };
 
+    let run_key = eval_run_key(&args);
     let k = args.limit;
     let mut results: Vec<EvalResult> = Vec::new();
 
     if matches!(args.mode, EvalMode::Bm25 | EvalMode::All) {
         print!("evaluating bm25 ({} queries)... ", queries.len());
         let _ = std::io::stdout().flush();
-        results.push(evaluate_bm25(&conn, &queries, &qrels, k));
+        results.push(evaluate_bm25(&conn, &queries, &qrels, k, &run_key));
         println!("done");
     }
 
@@ -1778,6 +1979,7 @@ fn main() -> Result<()> {
                 &qrels,
                 k,
                 query_embeddings,
+                &run_key,
             ));
             println!("done");
         }
@@ -1810,6 +2012,7 @@ fn main() -> Result<()> {
                 args.rerank_top_n,
                 &doc_texts,
                 mode_name,
+                &run_key,
             ));
             println!("done");
 

@@ -129,6 +129,14 @@ impl Embedder {
     }
 
     pub fn embed_query_batch(&self, queries: &[String]) -> Result<Vec<Vec<f32>>> {
+        self.embed_query_batch_progress(queries, |_, _| {})
+    }
+
+    pub fn embed_query_batch_progress(
+        &self,
+        queries: &[String],
+        mut on_progress: impl FnMut(usize, usize),
+    ) -> Result<Vec<Vec<f32>>> {
         if queries.is_empty() {
             return Ok(Vec::new());
         }
@@ -138,11 +146,15 @@ impl Embedder {
             .unwrap_or(4);
         let mut ctx = self.new_context(n_threads)?;
 
+        let total = queries.len();
         queries
             .iter()
-            .map(|q| {
+            .enumerate()
+            .map(|(i, q)| {
                 let formatted = self.format_query(q);
-                self.embed_with_context(&mut ctx, &formatted)
+                let result = self.embed_with_context(&mut ctx, &formatted);
+                on_progress(i + 1, total);
+                result
             })
             .collect()
     }
