@@ -99,6 +99,14 @@ pub fn collection_db_path(name: &str) -> PathBuf {
     data_dir().join(format!("{name}.sqlite"))
 }
 
+pub fn daemon_socket_path() -> PathBuf {
+    ir_dir().join("daemon.sock")
+}
+
+pub fn daemon_pid_path() -> PathBuf {
+    ir_dir().join("daemon.pid")
+}
+
 fn validate_collection_name(name: &str) -> Result<()> {
     if name.is_empty() || name.contains('/') || name.contains('\0') || name.contains("..") {
         return Err(Error::Other(format!("invalid collection name: {name:?}")));

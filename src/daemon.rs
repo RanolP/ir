@@ -1,0 +1,373 @@
+// ir daemon — keeps models warm in a background process; accepts search queries
+// over a Unix socket, eliminating per-invocation model load time (~3-7s → ~0ms).
+//
+// Default model stack: EmbeddingGemma-300M + qmd-expander-1.7B + Qwen3-Reranker-0.6B
+// (the trio, nDCG@10=0.4032 on NFCorpus — best measured configuration).
+// Metal is used by default on macOS (IR_GPU_LAYERS=99).
+//
+// Protocol: newline-delimited JSON over Unix socket.
+//   request:  {"query":"...","collections":["name"],"limit":10,"min_score":0.2,"mode":"hybrid"}
+//   response: {"ok":true,"results":[{"path":"...","score":0.9,"title":"...","snippet":"..."}]}
+//   response: {"ok":false,"error":"..."}
+
+use crate::config::{self, collection_db_path};
+use crate::db::CollectionDb;
+use crate::error::{Error, Result};
+use crate::search;
+use crate::types::SearchMode;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+// ── Protocol types ────────────────────────────────────────────────────────────
+
+#[derive(Serialize, Deserialize)]
+pub struct DaemonRequest {
+    pub query: String,
+    pub collections: Vec<String>,
+    #[serde(default = "default_limit")]
+    pub limit: usize,
+    pub min_score: Option<f64>,
+    #[serde(default = "default_mode")]
+    pub mode: String,
+}
+
+fn default_limit() -> usize { 10 }
+fn default_mode() -> String { "hybrid".into() }
+
+#[derive(Serialize)]
+struct DaemonResponse {
+    ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    results: Option<Vec<DaemonResult>>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct DaemonResult {
+    pub path: String,
+    pub score: f64,
+    pub title: String,
+    pub snippet: String,
+}
+
+// ── Client ────────────────────────────────────────────────────────────────────
+
+/// Returns true if the daemon socket is reachable.
+pub fn is_running() -> bool {
+    UnixStream::connect(config::daemon_socket_path()).is_ok()
+}
+
+/// Spawn `ir daemon start` as a detached background process.
+/// Stderr is redirected to `~/.config/ir/daemon.log`.
+pub fn start_in_background() -> Result<()> {
+    let exe = std::env::current_exe().map_err(Error::Io)?;
+    let log_path = config::daemon_socket_path()
+        .parent()
+        .unwrap_or(std::path::Path::new("/tmp"))
+        .join("daemon.log");
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .map_err(Error::Io)?;
+    std::process::Command::new(exe)
+        .args(["daemon", "start"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(log_file)
+        .spawn()
+        .map_err(|e| Error::Other(format!("spawn daemon: {e}")))?;
+    Ok(())
+}
+
+/// Poll the daemon socket until it accepts connections or `timeout_ms` elapses.
+/// Returns true if ready.
+pub fn wait_ready(timeout_ms: u64) -> bool {
+    let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms);
+    while std::time::Instant::now() < deadline {
+        if is_running() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    false
+}
+
+/// Send a search request to the daemon and return parsed results.
+pub fn query(req: &DaemonRequest) -> Result<Vec<DaemonResult>> {
+    let sock = config::daemon_socket_path();
+    let stream = UnixStream::connect(&sock)
+        .map_err(|e| Error::Other(format!("daemon connect: {e}")))?;
+
+    let mut writer = stream.try_clone().map_err(Error::Io)?;
+    let reader = BufReader::new(stream);
+
+    let payload = serde_json::to_string(req)
+        .map_err(|e| Error::Other(format!("serialize: {e}")))?;
+    writer.write_all(payload.as_bytes()).map_err(Error::Io)?;
+    writer.write_all(b"\n").map_err(Error::Io)?;
+
+    let line = reader.lines()
+        .next()
+        .ok_or_else(|| Error::Other("daemon closed connection".into()))?
+        .map_err(Error::Io)?;
+
+    let resp: serde_json::Value = serde_json::from_str(&line)
+        .map_err(|e| Error::Other(format!("parse response: {e}")))?;
+
+    if resp["ok"].as_bool().unwrap_or(false) {
+        let results: Vec<DaemonResult> = serde_json::from_value(
+            resp["results"].clone()
+        ).map_err(|e| Error::Other(format!("parse results: {e}")))?;
+        Ok(results)
+    } else {
+        Err(Error::Other(
+            resp["error"].as_str().unwrap_or("daemon error").to_string()
+        ))
+    }
+}
+
+// ── Server ────────────────────────────────────────────────────────────────────
+
+/// Config snapshot loaded once at daemon startup; avoids YAML disk reads per query.
+struct DaemonState {
+    collection_paths: HashMap<String, PathBuf>,
+}
+
+impl DaemonState {
+    fn load() -> Result<Self> {
+        let cfg = config::Config::load()?;
+        let collection_paths = cfg.collections.iter()
+            .map(|c| (c.name.clone(), collection_db_path(&c.name)))
+            .collect();
+        Ok(Self { collection_paths })
+    }
+}
+
+pub fn start_server(timeout_secs: u64) -> Result<()> {
+    let sock_path = config::daemon_socket_path();
+    let pid_path = config::daemon_pid_path();
+
+    if let Some(parent) = sock_path.parent() {
+        std::fs::create_dir_all(parent).map_err(Error::Io)?;
+    }
+
+    // Remove stale socket; next start will always replace it.
+    if sock_path.exists() {
+        std::fs::remove_file(&sock_path).map_err(Error::Io)?;
+    }
+    std::fs::write(&pid_path, std::process::id().to_string()).map_err(Error::Io)?;
+
+    let gpu_on = crate::llm::gpu_layers() > 0;
+    eprintln!("loading models (Metal: {})...", if gpu_on { "on" } else { "off" });
+
+    // Load the trio: embedder + expander + reranker (best nDCG@10=0.4032).
+    let embedder = crate::llm::embedding::Embedder::load_default()
+        .map_err(|e| Error::Other(format!("load embedder: {e}")))?;
+    eprintln!("  embedder ready");
+
+    let expander = crate::llm::expander::Expander::load_default()
+        .map_err(|e| { eprintln!("  note: expander unavailable ({e})"); e })
+        .ok();
+    if expander.is_some() { eprintln!("  expander ready"); }
+
+    let reranker = crate::llm::reranker::Reranker::load_default()
+        .map_err(|e| { eprintln!("  note: reranker unavailable ({e})"); e })
+        .ok();
+    if reranker.is_some() { eprintln!("  reranker ready"); }
+
+    let hybrid = search::hybrid::HybridSearch {
+        embedder,
+        qwen: None,
+        expander,
+        reranker,
+    };
+
+    let state = DaemonState::load()?;
+
+    let listener = UnixListener::bind(&sock_path)
+        .map_err(|e| Error::Other(format!("bind {}: {e}", sock_path.display())))?;
+
+    // Inactivity watchdog: exit after `timeout_secs` of no queries.
+    let last_activity = Arc::new(AtomicU64::new(unix_now()));
+    if timeout_secs > 0 {
+        let last = Arc::clone(&last_activity);
+        let sock = sock_path.clone();
+        let pid = pid_path.clone();
+        std::thread::spawn(move || {
+            let check_every = (timeout_secs / 10).clamp(1, 30);
+            loop {
+                std::thread::sleep(Duration::from_secs(check_every));
+                let idle = unix_now().saturating_sub(last.load(Ordering::Relaxed));
+                if idle >= timeout_secs {
+                    eprintln!("daemon: idle for {idle}s, shutting down");
+                    let _ = std::fs::remove_file(&sock);
+                    let _ = std::fs::remove_file(&pid);
+                    std::process::exit(0);
+                }
+            }
+        });
+    }
+
+    let timeout_msg = if timeout_secs > 0 {
+        format!("  timeout={}s", timeout_secs)
+    } else {
+        "  timeout=never".into()
+    };
+    eprintln!("daemon ready  socket={}{}", sock_path.display(), timeout_msg);
+
+    for stream in listener.incoming() {
+        match stream {
+            Ok(s) => {
+                last_activity.store(unix_now(), Ordering::Relaxed);
+                if let Err(e) = handle_connection(s, &hybrid, &state) {
+                    eprintln!("connection error: {e}");
+                }
+            }
+            Err(e) => eprintln!("accept error: {e}"),
+        }
+    }
+
+    let _ = std::fs::remove_file(&sock_path);
+    let _ = std::fs::remove_file(&pid_path);
+    Ok(())
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn handle_connection(
+    stream: UnixStream,
+    hybrid: &search::hybrid::HybridSearch,
+    state: &DaemonState,
+) -> Result<()> {
+    let mut writer = stream.try_clone().map_err(Error::Io)?;
+    let mut reader = BufReader::new(stream);
+
+    // One request per connection — read one line, write one line, done.
+    let mut line = String::new();
+    if reader.read_line(&mut line).map_err(Error::Io)? == 0 || line.trim().is_empty() {
+        return Ok(());
+    }
+
+    let resp = match handle_request(line.trim_end(), hybrid, state) {
+        Ok(results) => DaemonResponse { ok: true, error: None, results: Some(results) },
+        Err(e) => DaemonResponse { ok: false, error: Some(e.to_string()), results: None },
+    };
+
+    let json = serde_json::to_string(&resp)
+        .map_err(|e| Error::Other(format!("serialize: {e}")))?;
+    writer.write_all(json.as_bytes()).map_err(Error::Io)?;
+    writer.write_all(b"\n").map_err(Error::Io)?;
+    writer.flush().map_err(Error::Io)?;
+    Ok(())
+}
+
+fn handle_request(
+    line: &str,
+    hybrid: &search::hybrid::HybridSearch,
+    state: &DaemonState,
+) -> Result<Vec<DaemonResult>> {
+    let req: DaemonRequest = serde_json::from_str(line)
+        .map_err(|e| Error::Other(format!("parse request: {e}")))?;
+
+    let mode: SearchMode = req.mode.parse().map_err(Error::Other)?;
+
+    let selected: Vec<(&String, &PathBuf)> = req.collections.iter()
+        .filter_map(|name| state.collection_paths.get(name).map(|p| (name, p)))
+        .collect();
+
+    if selected.is_empty() {
+        return Err(Error::Other(format!(
+            "no matching collections for {:?}", req.collections
+        )));
+    }
+
+    // Fresh WAL read-only connections per query — sees live index updates.
+    let dbs: Vec<CollectionDb> = selected.iter()
+        .map(|(name, path)| CollectionDb::open_wal_readonly(name.as_str(), path))
+        .collect::<Result<Vec<_>>>()?;
+
+    let results = match mode {
+        SearchMode::Hybrid => {
+            let r = search::hybrid::HybridRequest {
+                query: &req.query,
+                limit: req.limit,
+                min_score: req.min_score,
+            };
+            hybrid.search(&dbs, &r)?
+        }
+        SearchMode::Vector => {
+            let r = search::vector::VecSearchRequest {
+                query: &req.query,
+                limit: req.limit,
+                min_score: req.min_score,
+            };
+            search::vector::search(&hybrid.embedder, &dbs, &r)?
+        }
+        SearchMode::Bm25 => {
+            let r = search::fan_out::SearchRequest {
+                query: &req.query,
+                limit: req.limit,
+                min_score: req.min_score,
+            };
+            search::fan_out::bm25(&dbs, &r)?
+        }
+    };
+
+    Ok(results.into_iter().map(|r| DaemonResult {
+        path: r.path,
+        score: r.score,
+        title: r.title,
+        snippet: r.snippet.unwrap_or_default(),
+    }).collect())
+}
+
+// ── Stop / status ─────────────────────────────────────────────────────────────
+
+pub fn stop() -> Result<()> {
+    let pid_path = config::daemon_pid_path();
+    let sock_path = config::daemon_socket_path();
+
+    if !pid_path.exists() {
+        eprintln!("daemon not running (no pid file)");
+        return Ok(());
+    }
+
+    let pid_str = std::fs::read_to_string(&pid_path).map_err(Error::Io)?;
+    let pid: i32 = pid_str.trim().parse()
+        .map_err(|_| Error::Other(format!("invalid pid file: {pid_str:?}")))?;
+
+    unsafe extern "C" { fn kill(pid: i32, sig: i32) -> i32; }
+    let rc = unsafe { kill(pid, 15) }; // SIGTERM
+    if rc != 0 {
+        eprintln!("warning: kill({pid}) failed — process may already be gone");
+    }
+
+    let _ = std::fs::remove_file(&pid_path);
+    let _ = std::fs::remove_file(&sock_path);
+    eprintln!("daemon stopped (pid {pid})");
+    Ok(())
+}
+
+pub fn status() -> Result<()> {
+    if is_running() {
+        let pid = std::fs::read_to_string(config::daemon_pid_path())
+            .unwrap_or_else(|_| "?".into());
+        println!("running  pid={}", pid.trim());
+    } else {
+        println!("not running");
+    }
+    Ok(())
+}

@@ -1,5 +1,6 @@
 mod cli;
 mod config;
+mod daemon;
 mod db;
 mod error;
 mod index;
@@ -8,7 +9,7 @@ mod search;
 mod types;
 
 use clap::Parser;
-use cli::{Cli, CollectionCmd, Command, output};
+use cli::{Cli, CollectionCmd, Command, DaemonCmd, output};
 use config::{Config, collection_db_path};
 use error::Result;
 use types::{Collection, SearchMode};
@@ -55,6 +56,11 @@ fn run() -> Result<()> {
             eprintln!("not yet implemented");
             Ok(())
         }
+        Command::Daemon { cmd } => match cmd {
+            DaemonCmd::Start { timeout } => daemon::start_server(timeout),
+            DaemonCmd::Stop => daemon::stop(),
+            DaemonCmd::Status => daemon::status(),
+        },
     }
 }
 
@@ -173,22 +179,68 @@ fn handle_search(
     md: bool,
     files: bool,
 ) -> Result<()> {
+    let fmt = if json {
+        output::Format::Json
+    } else if csv {
+        output::Format::Csv
+    } else if md {
+        output::Format::Markdown
+    } else if files {
+        output::Format::Files
+    } else {
+        output::Format::Pretty
+    };
+
+    // Load config once; used by both daemon and direct paths.
+    let config = Config::load()?;
+    let collection_names = resolve_collections(&config, &collection_filter);
+
+    // Route through daemon — start it if not running, fall back to direct on failure.
+    {
+        let req = daemon::DaemonRequest {
+            query: query.clone(),
+            collections: collection_names.clone(),
+            limit,
+            min_score,
+            mode: mode.clone(),
+        };
+
+        let ready = if daemon::is_running() {
+            true
+        } else {
+            match daemon::start_in_background() {
+                Ok(()) => daemon::wait_ready(10_000),
+                Err(e) => { eprintln!("note: could not start daemon ({e}), running direct"); false }
+            }
+        };
+
+        if ready {
+            match daemon::query(&req) {
+                Ok(daemon_results) => {
+                    let results: Vec<types::SearchResult> = daemon_results.into_iter()
+                        .map(|r| types::SearchResult {
+                            collection: String::new(),
+                            doc_id: String::new(),
+                            hash: String::new(),
+                            path: r.path,
+                            title: r.title,
+                            score: r.score,
+                            snippet: if r.snippet.is_empty() { None } else { Some(r.snippet) },
+                        })
+                        .collect();
+                    output::print_results(&results, fmt, full);
+                    return Ok(());
+                }
+                Err(e) => eprintln!("daemon error, falling back to direct: {e}"),
+            }
+        }
+    }
+
     let search_mode: SearchMode = mode.parse().map_err(error::Error::Other)?;
 
-    let config = Config::load()?;
-    let cols: Vec<_> = if collection_filter.is_empty() {
-        let cwd = std::env::current_dir().unwrap_or_default();
-        if let Some(col) = config::detect_collection(&config.collections, &cwd) {
-            vec![col]
-        } else {
-            config.collections.iter().collect()
-        }
-    } else {
-        collection_filter
-            .iter()
-            .filter_map(|name| config.get_collection(name))
-            .collect()
-    };
+    let cols: Vec<_> = collection_names.iter()
+        .filter_map(|name| config.get_collection(name))
+        .collect();
 
     let dbs: Vec<db::CollectionDb> = cols
         .iter()
@@ -215,10 +267,12 @@ fn handle_search(
         }
         SearchMode::Hybrid => {
             let embedder = llm::embedding::Embedder::load_default()?;
-            // Unified Qwen3.5 takes priority; falls back to separate models if unavailable.
-            let qwen = llm::qwen::Qwen35::load_default()
-                .map_err(|e| eprintln!("note: qwen3.5 unavailable: {e}"))
-                .ok();
+            // Trio is the default (nDCG@10=0.4032). Qwen3.5 only if IR_QWEN_MODEL is set.
+            let qwen = std::env::var_os("IR_QWEN_MODEL")
+                .map(|_| llm::qwen::Qwen35::load_default()
+                    .map_err(|e| eprintln!("note: qwen3.5 unavailable: {e}"))
+                    .ok())
+                .flatten();
             let (expander, reranker) = if qwen.is_some() {
                 (None, None)
             } else {
@@ -245,20 +299,24 @@ fn handle_search(
         }
     };
 
-    let fmt = if json {
-        output::Format::Json
-    } else if csv {
-        output::Format::Csv
-    } else if md {
-        output::Format::Markdown
-    } else if files {
-        output::Format::Files
-    } else {
-        output::Format::Pretty
-    };
-
     output::print_results(&results, fmt, full);
     Ok(())
+}
+
+fn resolve_collections<'a>(config: &'a Config, filter: &[String]) -> Vec<String> {
+    if filter.is_empty() {
+        let cwd = std::env::current_dir().unwrap_or_default();
+        if let Some(col) = config::detect_collection(&config.collections, &cwd) {
+            vec![col.name.clone()]
+        } else {
+            config.collections.iter().map(|c| c.name.clone()).collect()
+        }
+    } else {
+        filter.iter()
+            .filter(|name| config.get_collection(name).is_some())
+            .cloned()
+            .collect()
+    }
 }
 
 fn handle_embed(collection: Option<String>, force: bool) -> Result<()> {

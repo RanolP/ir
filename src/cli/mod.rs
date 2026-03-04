@@ -79,6 +79,25 @@ pub enum Command {
     },
     /// Show index health
     Status,
+    /// Manage the search daemon (keeps models warm between queries)
+    Daemon {
+        #[command(subcommand)]
+        cmd: DaemonCmd,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum DaemonCmd {
+    /// Start the daemon in the foreground
+    Start {
+        /// Seconds of inactivity before auto-shutdown (0 = never)
+        #[arg(long, default_value = "3600")]
+        timeout: u64,
+    },
+    /// Stop the running daemon
+    Stop,
+    /// Show daemon status
+    Status,
 }
 
 #[derive(Subcommand, Debug)]
