@@ -43,6 +43,7 @@ pub fn update(
             "DELETE FROM documents;
              DELETE FROM content;
              DELETE FROM content_vectors;
+             DELETE FROM vectors_vec;
              DELETE FROM llm_cache;",
         )?;
     }
@@ -51,8 +52,7 @@ pub fn update(
         stmt.query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?
-        .filter_map(|r| r.ok())
-        .collect()
+        .collect::<std::result::Result<HashMap<_, _>, _>>()?
     };
 
     // 2. Scan filesystem
@@ -79,52 +79,65 @@ pub fn update(
 
     pb.set_length((n_add + n_update + n_deactivate) as u64);
 
-    // 5. Deactivate removed files
-    for rel_path in &d.to_deactivate {
-        conn.execute(
-            "UPDATE documents SET active = 0 WHERE path = ?1",
-            [rel_path],
-        )?;
-        pb.inc(1);
-        pb.set_message(format!("deactivate {rel_path}"));
-    }
-
-    // 6. Add new files
-    for rel_path in &d.to_add {
-        let (hash, content) = scanned
-            .get(rel_path)
-            .ok_or_else(|| crate::error::Error::Other(format!("missing scan entry: {rel_path}")))?;
-        let raw_text = String::from_utf8_lossy(content).into_owned();
-        let text = raw_text.replace("\r\n", "\n");
-        let title = chunker::extract_title(&text, rel_path);
-        let now = Utc::now().to_rfc3339();
-
-        store_document(conn, rel_path, &title, hash, &text, &now, &now)?;
-        pb.inc(1);
-        pb.set_message(format!("add {rel_path}"));
-    }
-
-    // 7. Update changed files
-    for rel_path in &d.to_update {
-        let (hash, content) = scanned
-            .get(rel_path)
-            .ok_or_else(|| crate::error::Error::Other(format!("missing scan entry: {rel_path}")))?;
-        let raw_text = String::from_utf8_lossy(content).into_owned();
-        let text = raw_text.replace("\r\n", "\n");
-        let title = chunker::extract_title(&text, rel_path);
-        let now = Utc::now().to_rfc3339();
-        let created_at: String = conn
-            .query_row(
-                "SELECT created_at FROM documents WHERE path = ?1",
+    // 5–7. Apply diff atomically so a crash leaves the DB consistent.
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let apply = || -> Result<()> {
+        // 5. Deactivate removed files
+        for rel_path in &d.to_deactivate {
+            conn.execute(
+                "UPDATE documents SET active = 0 WHERE path = ?1",
                 [rel_path],
-                |row| row.get(0),
-            )
-            .unwrap_or_else(|_| now.clone());
+            )?;
+            pb.inc(1);
+            pb.set_message(format!("deactivate {rel_path}"));
+        }
 
-        conn.execute("DELETE FROM documents WHERE path = ?1", [rel_path])?;
-        store_document(conn, rel_path, &title, hash, &text, &created_at, &now)?;
-        pb.inc(1);
-        pb.set_message(format!("update {rel_path}"));
+        // 6. Add new files
+        for rel_path in &d.to_add {
+            let (hash, content) = scanned
+                .get(rel_path)
+                .ok_or_else(|| crate::error::Error::Other(format!("missing scan entry: {rel_path}")))?;
+            let raw_text = String::from_utf8_lossy(content).into_owned();
+            let text = raw_text.replace("\r\n", "\n");
+            let title = chunker::extract_title(&text, rel_path);
+            let now = Utc::now().to_rfc3339();
+
+            store_document(conn, rel_path, &title, hash, &text, &now, &now)?;
+            pb.inc(1);
+            pb.set_message(format!("add {rel_path}"));
+        }
+
+        // 7. Update changed files
+        for rel_path in &d.to_update {
+            let (hash, content) = scanned
+                .get(rel_path)
+                .ok_or_else(|| crate::error::Error::Other(format!("missing scan entry: {rel_path}")))?;
+            let raw_text = String::from_utf8_lossy(content).into_owned();
+            let text = raw_text.replace("\r\n", "\n");
+            let title = chunker::extract_title(&text, rel_path);
+            let now = Utc::now().to_rfc3339();
+            let created_at: String = conn
+                .query_row(
+                    "SELECT created_at FROM documents WHERE path = ?1",
+                    [rel_path],
+                    |row| row.get(0),
+                )
+                .unwrap_or_else(|_| now.clone());
+
+            conn.execute("DELETE FROM documents WHERE path = ?1", [rel_path])?;
+            store_document(conn, rel_path, &title, hash, &text, &created_at, &now)?;
+            pb.inc(1);
+            pb.set_message(format!("update {rel_path}"));
+        }
+
+        Ok(())
+    };
+    match apply() {
+        Ok(()) => conn.execute_batch("COMMIT")?,
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            return Err(e);
+        }
     }
 
     pb.finish_with_message("done");

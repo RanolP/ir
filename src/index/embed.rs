@@ -52,38 +52,56 @@ pub fn embed(
     for (path, title, hash, doc_text) in &pending {
         pb.set_message(path.clone());
 
-        // Force: remove existing embeddings for this hash first.
-        if opts.force {
-            // Collect seqs before deleting content_vectors (sqlite-vec can't LIKE on PK).
-            let seqs: Vec<i64> = {
-                let mut stmt = conn.prepare("SELECT seq FROM content_vectors WHERE hash = ?1")?;
-                stmt.query_map([hash], |r| r.get(0))?
-                    .filter_map(|r| r.ok())
-                    .collect()
-            };
-            if !seqs.is_empty() {
-                let hash_seqs: Vec<String> = seqs.iter().map(|s| format!("{hash}_{s}")).collect();
-                let ph = hash_seqs.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-                conn.execute(
-                    &format!("DELETE FROM vectors_vec WHERE hash_seq IN ({ph})"),
-                    rusqlite::params_from_iter(hash_seqs.iter().map(|s| s.as_str())),
-                )?;
-            }
-            conn.execute("DELETE FROM content_vectors WHERE hash = ?1", [hash])?;
-        }
-
+        // Compute embeddings before touching the DB.
         let chunks = chunker::chunk_document(doc_text);
         let inputs: Vec<(String, String)> = chunks
             .iter()
             .map(|c| (title.clone(), c.text.clone()))
             .collect();
-
         let embeddings = embedder.embed_doc_batch(&inputs)?;
 
-        for (chunk, emb) in chunks.iter().zip(embeddings.iter()) {
-            let hash_seq = format!("{hash}_{}", chunk.seq);
-            vectors::insert(conn, &hash_seq, emb)?;
-            vectors::mark_embedded(conn, hash, chunk.seq as i64, chunk.pos as i64, model_name)?;
+        // Write atomically: a crash mid-insert would leave no partial state.
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        let write = || -> Result<()> {
+            if opts.force {
+                // Collect seqs before deleting content_vectors (sqlite-vec can't LIKE on PK).
+                let seqs: Vec<i64> = {
+                    let mut stmt =
+                        conn.prepare("SELECT seq FROM content_vectors WHERE hash = ?1")?;
+                    stmt.query_map([hash], |r| r.get(0))?
+                        .filter_map(|r| r.ok())
+                        .collect()
+                };
+                if !seqs.is_empty() {
+                    let hash_seqs: Vec<String> =
+                        seqs.iter().map(|s| format!("{hash}_{s}")).collect();
+                    let ph = hash_seqs.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+                    conn.execute(
+                        &format!("DELETE FROM vectors_vec WHERE hash_seq IN ({ph})"),
+                        rusqlite::params_from_iter(hash_seqs.iter().map(|s| s.as_str())),
+                    )?;
+                }
+                conn.execute("DELETE FROM content_vectors WHERE hash = ?1", [hash])?;
+            }
+            for (chunk, emb) in chunks.iter().zip(embeddings.iter()) {
+                let hash_seq = format!("{hash}_{}", chunk.seq);
+                vectors::insert(conn, &hash_seq, emb)?;
+                vectors::mark_embedded(
+                    conn,
+                    hash,
+                    chunk.seq as i64,
+                    chunk.pos as i64,
+                    model_name,
+                )?;
+            }
+            Ok(())
+        };
+        match write() {
+            Ok(()) => conn.execute_batch("COMMIT")?,
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                return Err(e);
+            }
         }
 
         total_chunks += chunks.len();
