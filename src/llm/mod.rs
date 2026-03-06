@@ -12,8 +12,10 @@
 pub mod download;
 pub mod embedding;
 pub mod expander;
+pub mod generate;
 pub mod qwen;
 pub mod reranker;
+pub mod scoring;
 
 pub use llama_cpp_2::llama_backend::LlamaBackend;
 pub use llama_cpp_2::model::params::LlamaModelParams;

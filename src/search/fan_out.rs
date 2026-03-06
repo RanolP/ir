@@ -32,12 +32,9 @@ pub fn bm25(dbs: &[CollectionDb], req: &SearchRequest) -> Result<Vec<SearchResul
                 limit: req.limit * 2, // over-fetch to allow for merging
                 title_weight: None,
             };
-            fts::search(db.conn(), &q).unwrap_or_else(|e| {
-                eprintln!("warn: bm25 search on '{}' failed: {e}", db.name);
-                vec![]
-            })
+            fts::search(db.conn(), &q)
         })
-        .collect();
+        .collect::<crate::error::Result<Vec<_>>>()?;
 
     merge_and_filter(results, req)
 }

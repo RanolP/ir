@@ -75,6 +75,7 @@ pub struct Embedder {
 }
 
 impl Embedder {
+    #[allow(dead_code)] // used by eval binary
     pub fn load(model_path: &Path) -> Result<Self> {
         Self::load_with_gpu_layers(model_path, crate::llm::gpu_layers())
     }
@@ -120,6 +121,7 @@ impl Embedder {
         usize::try_from(self.model.n_embd()).unwrap_or(0)
     }
 
+    #[allow(dead_code)] // used by eval binary
     pub fn set_pooling_override(&mut self, pooling: Option<EmbeddingPooling>) {
         self.pooling_override = pooling;
     }
@@ -132,6 +134,7 @@ impl Embedder {
         self.embed_query_batch_progress(queries, |_, _| {})
     }
 
+    #[allow(dead_code)] // used by eval binary
     pub fn embed_query_batch_progress(
         &self,
         queries: &[String],
@@ -159,6 +162,7 @@ impl Embedder {
             .collect()
     }
 
+    #[allow(dead_code)] // used by eval binary
     pub fn embed_doc(&self, title: &str, text: &str) -> Result<Vec<f32>> {
         self.embed_single(&self.format_doc(title, text))
     }

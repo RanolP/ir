@@ -109,8 +109,7 @@ pub fn search(
                 (row.get::<_, String>(1)?, row.get::<_, String>(2)?),
             ))
         })?
-        .filter_map(|r| r.ok())
-        .collect();
+        .collect::<std::result::Result<HashMap<_, _>, _>>()?;
 
     // Build result list, deduplicating by path with O(1) lookup.
     let mut results: Vec<SearchResult> = Vec::new();

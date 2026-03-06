@@ -21,6 +21,7 @@ const CHUNK_OVERLAP_PERCENT: usize = 15;
 const BREAK_WINDOW_CHARS: usize = 800;
 static CHUNK_SIZE_OVERRIDE_TOKENS: AtomicUsize = AtomicUsize::new(0);
 
+#[allow(dead_code)] // used by eval binary
 pub fn set_chunk_size_tokens_override(tokens: Option<usize>) {
     CHUNK_SIZE_OVERRIDE_TOKENS.store(tokens.unwrap_or(0), Ordering::Relaxed);
 }

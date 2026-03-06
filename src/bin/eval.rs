@@ -1283,11 +1283,11 @@ fn rerank_with_blend(
             continue;
         };
 
-        let key = (query.to_string(), result.path.clone());
+        let key = (query.to_string(), result.hash.clone());
         let rerank_score = if let Some(cached) = cache.get(&key) {
             *cached
         } else {
-            let cache_hash = hasher::hash_bytes(format!("{}\0{}", query, result.path).as_bytes());
+            let cache_hash = hasher::hash_bytes(format!("{}\0{}", query, result.hash).as_bytes());
             let cached_db: Option<f64> = conn
                 .query_row(
                     "SELECT result FROM llm_cache WHERE hash = ?1",

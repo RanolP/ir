@@ -203,7 +203,7 @@ fn collect_search_rows(
     let mut results = Vec::new();
     for row in rows {
         let (path, title, raw_score, hash, snippet) = row?;
-        let doc_id = format!("#{}", &hash[..6]);
+        let doc_id = format!("#{}", &hash[..6.min(hash.len())]);
         results.push(SearchResult {
             collection: q.collection.to_string(),
             path,

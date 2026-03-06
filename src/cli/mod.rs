@@ -46,7 +46,7 @@ pub enum Command {
         /// Restrict to collection(s)
         #[arg(short = 'c', long = "collection")]
         collections: Vec<String>,
-        /// Return all results (up to 100k)
+        /// Return all results (up to sqlite-vec kNN limit of 4096)
         #[arg(long)]
         all: bool,
         /// Show full document content
