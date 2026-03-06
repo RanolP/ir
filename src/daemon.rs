@@ -17,7 +17,8 @@ use crate::search;
 use crate::types::SearchMode;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -51,10 +52,13 @@ struct DaemonResponse {
 
 #[derive(Serialize, Deserialize)]
 pub struct DaemonResult {
+    pub collection: String,
     pub path: String,
-    pub score: f64,
     pub title: String,
+    pub score: f64,
     pub snippet: String,
+    pub hash: String,
+    pub doc_id: String,
 }
 
 // ── Client ────────────────────────────────────────────────────────────────────
@@ -157,43 +161,66 @@ pub fn start_server(timeout_secs: u64) -> Result<()> {
 
     if let Some(parent) = sock_path.parent() {
         std::fs::create_dir_all(parent).map_err(Error::Io)?;
+        // Restrict to owner-only so other local users cannot reach the socket.
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+            .map_err(Error::Io)?;
     }
 
     // Remove stale socket; next start will always replace it.
     if sock_path.exists() {
         std::fs::remove_file(&sock_path).map_err(Error::Io)?;
     }
-    std::fs::write(&pid_path, std::process::id().to_string()).map_err(Error::Io)?;
 
     let gpu_on = crate::llm::gpu_layers() > 0;
     eprintln!("loading models (Metal: {})...", if gpu_on { "on" } else { "off" });
 
-    // Load the trio: embedder + expander + reranker (best nDCG@10=0.4032).
+    // Model stack: try Qwen3.5 unified first, fall back to trio (expander + reranker).
     let embedder = crate::llm::embedding::Embedder::load_default()
         .map_err(|e| Error::Other(format!("load embedder: {e}")))?;
     eprintln!("  embedder ready");
 
-    let expander = crate::llm::expander::Expander::load_default()
-        .map_err(|e| { eprintln!("  note: expander unavailable ({e})"); e })
-        .ok();
-    if expander.is_some() { eprintln!("  expander ready"); }
+    let qwen = std::env::var_os("IR_QWEN_MODEL")
+        .map(|_| crate::llm::qwen::Qwen35::load_default()
+            .map_err(|e| { eprintln!("  note: qwen unavailable ({e})"); e })
+            .ok())
+        .flatten()
+        .map(std::sync::Arc::new);
 
-    let reranker = crate::llm::reranker::Reranker::load_default()
-        .map_err(|e| { eprintln!("  note: reranker unavailable ({e})"); e })
+    let (expander, scorer): (Option<Box<dyn crate::llm::expander::QueryExpander>>, Option<Box<dyn crate::llm::scoring::Scorer>>) = if let Some(q) = qwen {
+        eprintln!("  qwen ready");
+        (Some(Box::new(q.clone())), Some(Box::new(q)))
+    } else {
+        let exp = crate::llm::expander::Expander::load_default()
+            .map_err(|e| eprintln!("  note: expander unavailable ({e})"))
+            .ok()
+            .map(|e| { eprintln!("  expander ready"); Box::new(e) as Box<dyn crate::llm::expander::QueryExpander> });
+        let rer = crate::llm::reranker::Reranker::load_default()
+            .map_err(|e| eprintln!("  note: reranker unavailable ({e})"))
+            .ok()
+            .map(|r| { eprintln!("  reranker ready"); Box::new(r) as Box<dyn crate::llm::scoring::Scorer> });
+        (exp, rer)
+    };
+
+    let expander_cache = crate::db::expander_cache::ExpanderCache::open()
+        .map_err(|e| eprintln!("  note: expander cache unavailable ({e})"))
         .ok();
-    if reranker.is_some() { eprintln!("  reranker ready"); }
 
     let hybrid = search::hybrid::HybridSearch {
         embedder,
-        qwen: None,
         expander,
-        reranker,
+        scorer,
+        expander_cache,
     };
 
     let state = DaemonState::load()?;
 
     let listener = UnixListener::bind(&sock_path)
         .map_err(|e| Error::Other(format!("bind {}: {e}", sock_path.display())))?;
+    // Restrict socket access to owner-only.
+    std::fs::set_permissions(&sock_path, std::fs::Permissions::from_mode(0o600))
+        .map_err(Error::Io)?;
+    // Write PID only after bind+model init so stop() never targets a half-started process.
+    std::fs::write(&pid_path, std::process::id().to_string()).map_err(Error::Io)?;
 
     // Inactivity watchdog: exit after `timeout_secs` of no queries.
     let last_activity = Arc::new(AtomicU64::new(unix_now()));
@@ -252,13 +279,17 @@ fn handle_connection(
     hybrid: &search::hybrid::HybridSearch,
     state: &DaemonState,
 ) -> Result<()> {
+    const MAX_REQUEST_BYTES: u64 = 64 * 1024;
     let mut writer = stream.try_clone().map_err(Error::Io)?;
-    let mut reader = BufReader::new(stream);
+    let mut reader = BufReader::new(stream.take(MAX_REQUEST_BYTES));
 
     // One request per connection — read one line, write one line, done.
     let mut line = String::new();
     if reader.read_line(&mut line).map_err(Error::Io)? == 0 || line.trim().is_empty() {
         return Ok(());
+    }
+    if line.len() as u64 >= MAX_REQUEST_BYTES {
+        return Err(Error::Other("request exceeds 64KiB limit".into()));
     }
 
     let resp = match handle_request(line.trim_end(), hybrid, state) {
@@ -294,9 +325,9 @@ fn handle_request(
         )));
     }
 
-    // Fresh WAL read-only connections per query — sees live index updates.
+    // Fresh RW connections per query — sees live index updates, enables cache writes.
     let dbs: Vec<CollectionDb> = selected.iter()
-        .map(|(name, path)| CollectionDb::open_wal_readonly(name.as_str(), path))
+        .map(|(name, path)| CollectionDb::open_rw(name.as_str(), path))
         .collect::<Result<Vec<_>>>()?;
 
     let results = match mode {
@@ -327,10 +358,13 @@ fn handle_request(
     };
 
     Ok(results.into_iter().map(|r| DaemonResult {
+        collection: r.collection,
         path: r.path,
-        score: r.score,
         title: r.title,
+        score: r.score,
         snippet: r.snippet.unwrap_or_default(),
+        hash: r.hash,
+        doc_id: r.doc_id,
     }).collect())
 }
 
@@ -350,6 +384,12 @@ pub fn stop() -> Result<()> {
         .map_err(|_| Error::Other(format!("invalid pid file: {pid_str:?}")))?;
 
     unsafe extern "C" { fn kill(pid: i32, sig: i32) -> i32; }
+    // Probe first (sig=0): verifies the process exists without sending a signal.
+    if unsafe { kill(pid, 0) } != 0 {
+        eprintln!("warning: pid {pid} not found — removing stale pid file");
+        let _ = std::fs::remove_file(&pid_path);
+        return Ok(());
+    }
     let rc = unsafe { kill(pid, 15) }; // SIGTERM
     if rc != 0 {
         eprintln!("warning: kill({pid}) failed — process may already be gone");

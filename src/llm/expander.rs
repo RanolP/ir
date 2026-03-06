@@ -9,33 +9,43 @@
 
 use crate::error::{Error, Result};
 use crate::llm::{LlamaBackend, model_load_params, models};
-use llama_cpp_2::{
-    context::params::LlamaContextParams,
-    llama_batch::LlamaBatch,
-    model::{AddBos, LlamaModel},
-    sampling::LlamaSampler,
-};
+use llama_cpp_2::model::{AddBos, LlamaModel};
 // Note: grammar-constrained sampling (GBNF) is intentionally not used here.
 // llama_grammar_reject_candidates has an assertion failure with this llama.cpp version
 // when applied to the qmd-query-expansion model. Free-form sampling + parse + fallback
 // is equivalent since the model is fine-tuned to produce the correct format.
-use std::num::NonZeroU32;
+use serde::{Deserialize, Serialize};
 use std::path::Path;
+use std::sync::Arc;
 
 const MAX_OUTPUT_TOKENS: usize = 300;
 const CONTEXT_SIZE: u32 = 2048;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubQuery {
     pub kind: SubQueryKind,
     pub text: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SubQueryKind {
     Lex,  // keyword / BM25
     Vec,  // semantic / vector
     Hyde, // hypothetical document
+}
+
+pub trait QueryExpander: Send + Sync {
+    fn expand_query(&self, query: &str) -> Result<Vec<SubQuery>>;
+    fn model_id(&self) -> &str;
+}
+
+impl<T: QueryExpander> QueryExpander for Arc<T> {
+    fn expand_query(&self, query: &str) -> Result<Vec<SubQuery>> {
+        (**self).expand_query(query)
+    }
+    fn model_id(&self) -> &str {
+        (**self).model_id()
+    }
 }
 
 pub struct Expander {
@@ -59,7 +69,20 @@ impl Expander {
     /// Expand a query into typed sub-queries. Falls back to defaults on parse failure.
     pub fn expand(&self, query: &str) -> Result<Vec<SubQuery>> {
         let prompt = build_prompt(query);
-        let raw = self.generate(&prompt)?;
+        let raw = crate::llm::generate::generate(
+            &self.model,
+            self.backend,
+            &prompt,
+            &crate::llm::generate::GenerateParams {
+                ctx_size: CONTEXT_SIZE,
+                max_tokens: MAX_OUTPUT_TOKENS,
+                add_bos: AddBos::Always,
+                temp: 0.7,
+                top_k: 20,
+                top_p: 0.8,
+                seed: 42,
+            },
+        )?;
         let parsed = parse_output(&raw);
 
         // Validate: at least one sub-query must contain a term from the original query.
@@ -76,82 +99,14 @@ impl Expander {
             Ok(parsed)
         }
     }
+}
 
-    fn generate(&self, prompt: &str) -> Result<String> {
-        let n_threads = std::thread::available_parallelism()
-            .map(|n| n.get() as i32)
-            .unwrap_or(4);
-
-        let ctx_params = LlamaContextParams::default()
-            .with_n_ctx(NonZeroU32::new(CONTEXT_SIZE))
-            .with_offload_kqv(false)
-            .with_n_threads(n_threads)
-            .with_n_threads_batch(n_threads);
-
-        let mut ctx = self
-            .model
-            .new_context(&self.backend, ctx_params)
-            .map_err(|e| Error::Other(format!("expander context: {e}")))?;
-
-        // Tokenize prompt.
-        let prompt_tokens = self
-            .model
-            .str_to_token(prompt, AddBos::Always)
-            .map_err(|e| Error::Other(format!("tokenize: {e}")))?;
-
-        let n_prompt = prompt_tokens.len();
-        if n_prompt == 0 {
-            return Ok(String::new());
-        }
-
-        // Initial decode: all prompt tokens, logits only on last.
-        let mut batch = LlamaBatch::new(n_prompt, 1);
-        for (i, &tok) in prompt_tokens.iter().enumerate() {
-            let logits = i == n_prompt - 1;
-            batch
-                .add(tok, i as i32, &[0], logits)
-                .map_err(|e| Error::Other(format!("batch add: {e}")))?;
-        }
-        ctx.decode(&mut batch)
-            .map_err(|e| Error::Other(format!("decode prompt: {e}")))?;
-
-        // Free-form sampler: temperature 0.7, top_k 20, top_p 0.8.
-        // Grammar constraint omitted — see module note above.
-        let mut sampler = LlamaSampler::chain_simple([
-            LlamaSampler::temp(0.7),
-            LlamaSampler::top_k(20),
-            LlamaSampler::top_p(0.8, 1),
-            LlamaSampler::dist(42),
-        ]);
-
-        let mut output = String::new();
-        let mut n_cur = n_prompt as i32;
-
-        for _ in 0..MAX_OUTPUT_TOKENS {
-            let token = sampler.sample(&ctx, -1);
-            sampler.accept(token);
-
-            if self.model.is_eog_token(token) {
-                break;
-            }
-
-            // token_to_piece_bytes: special=true, no lstrip
-            let bytes = self
-                .model
-                .token_to_piece_bytes(token, 32, true, None)
-                .map_err(|e| Error::Other(format!("token_to_piece_bytes: {e}")))?;
-            output.push_str(&String::from_utf8_lossy(&bytes));
-
-            // Prepare next token batch.
-            let mut next = LlamaBatch::new(1, 1);
-            next.add(token, n_cur, &[0], true)
-                .map_err(|e| Error::Other(format!("batch next: {e}")))?;
-            ctx.decode(&mut next)
-                .map_err(|e| Error::Other(format!("decode next: {e}")))?;
-            n_cur += 1;
-        }
-
-        Ok(output)
+impl QueryExpander for Expander {
+    fn expand_query(&self, query: &str) -> Result<Vec<SubQuery>> {
+        self.expand(query)
+    }
+    fn model_id(&self) -> &str {
+        models::EXPANDER
     }
 }
 

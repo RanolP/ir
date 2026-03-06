@@ -193,7 +193,7 @@ fn handle_search(
 
     // Load config once; used by both daemon and direct paths.
     let config = Config::load()?;
-    let collection_names = resolve_collections(&config, &collection_filter);
+    let collection_names = resolve_collections(&config, &collection_filter)?;
 
     // Route through daemon — start it if not running, fall back to direct on failure.
     {
@@ -209,7 +209,12 @@ fn handle_search(
             true
         } else {
             match daemon::start_in_background() {
-                Ok(()) => daemon::wait_ready(10_000),
+                Ok(()) => {
+                    eprint!("daemon is starting...");
+                    let ready = daemon::wait_ready(10_000);
+                    eprintln!();
+                    ready
+                }
                 Err(e) => { eprintln!("note: could not start daemon ({e}), running direct"); false }
             }
         };
@@ -219,13 +224,13 @@ fn handle_search(
                 Ok(daemon_results) => {
                     let results: Vec<types::SearchResult> = daemon_results.into_iter()
                         .map(|r| types::SearchResult {
-                            collection: String::new(),
-                            doc_id: String::new(),
-                            hash: String::new(),
+                            collection: r.collection,
                             path: r.path,
                             title: r.title,
                             score: r.score,
                             snippet: if r.snippet.is_empty() { None } else { Some(r.snippet) },
+                            hash: r.hash,
+                            doc_id: r.doc_id,
                         })
                         .collect();
                     output::print_results(&results, fmt, full);
@@ -244,7 +249,7 @@ fn handle_search(
 
     let dbs: Vec<db::CollectionDb> = cols
         .iter()
-        .map(|c| db::CollectionDb::open_readonly(&c.name, &collection_db_path(&c.name)))
+        .map(|c| db::CollectionDb::open_rw(&c.name, &collection_db_path(&c.name)))
         .collect::<Result<Vec<_>>>()?;
 
     let results = match search_mode {
@@ -272,23 +277,29 @@ fn handle_search(
                 .map(|_| llm::qwen::Qwen35::load_default()
                     .map_err(|e| eprintln!("note: qwen3.5 unavailable: {e}"))
                     .ok())
-                .flatten();
-            let (expander, reranker) = if qwen.is_some() {
-                (None, None)
+                .flatten()
+                .map(std::sync::Arc::new);
+            let (expander, scorer) = if let Some(q) = qwen {
+                (
+                    Some(Box::new(q.clone()) as Box<dyn llm::expander::QueryExpander>),
+                    Some(Box::new(q) as Box<dyn llm::scoring::Scorer>),
+                )
             } else {
                 let exp = llm::expander::Expander::load_default()
                     .map_err(|e| eprintln!("note: expander unavailable: {e}"))
-                    .ok();
+                    .ok()
+                    .map(|e| Box::new(e) as Box<dyn llm::expander::QueryExpander>);
                 let rer = llm::reranker::Reranker::load_default()
                     .map_err(|e| eprintln!("note: reranker unavailable: {e}"))
-                    .ok();
+                    .ok()
+                    .map(|r| Box::new(r) as Box<dyn llm::scoring::Scorer>);
                 (exp, rer)
             };
             let hs = search::hybrid::HybridSearch {
                 embedder,
-                qwen,
                 expander,
-                reranker,
+                scorer,
+                expander_cache: db::expander_cache::ExpanderCache::open().ok(),
             };
             let req = search::hybrid::HybridRequest {
                 query: &query,
@@ -303,19 +314,27 @@ fn handle_search(
     Ok(())
 }
 
-fn resolve_collections<'a>(config: &'a Config, filter: &[String]) -> Vec<String> {
+fn resolve_collections(config: &Config, filter: &[String]) -> Result<Vec<String>> {
     if filter.is_empty() {
         let cwd = std::env::current_dir().unwrap_or_default();
         if let Some(col) = config::detect_collection(&config.collections, &cwd) {
-            vec![col.name.clone()]
+            Ok(vec![col.name.clone()])
         } else {
-            config.collections.iter().map(|c| c.name.clone()).collect()
+            Ok(config.collections.iter().map(|c| c.name.clone()).collect())
         }
     } else {
-        filter.iter()
-            .filter(|name| config.get_collection(name).is_some())
-            .cloned()
-            .collect()
+        let unknown: Vec<&str> = filter
+            .iter()
+            .filter(|name| config.get_collection(name).is_none())
+            .map(|s| s.as_str())
+            .collect();
+        if !unknown.is_empty() {
+            return Err(error::Error::Other(format!(
+                "unknown collection(s): {}",
+                unknown.join(", ")
+            )));
+        }
+        Ok(filter.to_vec())
     }
 }
 

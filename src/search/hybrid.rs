@@ -8,18 +8,39 @@
 // Score-fusion α=0.80 (mid-range of 0.70–0.95 plateau) selected on BEIR/NFCorpus.
 // See src/bin/eval.rs for the evaluation harness.
 
-use crate::db::{CollectionDb, fts, vectors};
+use crate::db::{self, CollectionDb, expander_cache::ExpanderCache, fts, vectors};
 use crate::error::Result;
+use crate::index::hasher;
 use crate::llm::{
     embedding::Embedder,
-    expander::{Expander, SubQueryKind},
-    qwen::Qwen35,
-    reranker::Reranker,
+    expander::{QueryExpander, SubQuery, SubQueryKind, fallback},
+    scoring::Scorer,
 };
 use crate::search::rrf::{self, RankedList};
 use crate::types::SearchResult;
 use rusqlite::Connection;
 use std::collections::HashMap;
+use std::sync::OnceLock;
+use std::time::Instant;
+
+fn timing_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("IR_TIMING")
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+                .as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+fn emit_timing(stage: &str, duration: std::time::Duration) {
+    if timing_enabled() {
+        eprintln!("[timing] {:<14} {}ms", stage, duration.as_millis());
+    }
+}
 
 pub struct HybridRequest<'a> {
     pub query: &'a str,
@@ -29,11 +50,9 @@ pub struct HybridRequest<'a> {
 
 pub struct HybridSearch {
     pub embedder: Embedder,
-    /// Unified model: used for both expansion and reranking when present.
-    /// Takes priority over separate expander + reranker.
-    pub qwen: Option<Qwen35>,
-    pub expander: Option<Expander>,
-    pub reranker: Option<Reranker>,
+    pub expander: Option<Box<dyn QueryExpander>>,
+    pub scorer: Option<Box<dyn Scorer>>,
+    pub expander_cache: Option<ExpanderCache>,
 }
 
 /// Weight for vector in score-fusion: 0.80·vec + 0.20·bm25.
@@ -43,34 +62,69 @@ const SCORE_FUSION_VEC_ALPHA: f64 = 0.80;
 
 impl HybridSearch {
     pub fn search(&self, dbs: &[CollectionDb], req: &HybridRequest) -> Result<Vec<SearchResult>> {
+        let t_total = Instant::now();
+
         // 1. BM25 probe for strong-signal shortcut.
-        let probe_results = bm25_across(dbs, req.query, req.limit);
+        let t0 = Instant::now();
+        let probe_results = bm25_across(dbs, req.query, req.limit)?;
+        emit_timing("bm25_probe", t0.elapsed());
+
         if is_strong_signal(&probe_results) {
+            let top = probe_results.first().map(|r| r.score).unwrap_or(0.0);
+            eprintln!("Strong BM25 signal ({top:.2}) — skipping expansion");
+            emit_timing("total", t_total.elapsed());
             return Ok(apply_min_score(probe_results, req.min_score, req.limit));
         }
 
-        // 2. Fuse: qwen expander > separate expander > score-fusion.
-        let fused = if let Some(q) = &self.qwen {
-            rrf_with_qwen(dbs, &self.embedder, q, req, probe_results)?
-        } else if let Some(exp) = &self.expander {
-            rrf_with_expander(dbs, &self.embedder, exp, req, probe_results)?
+        // 2. Fuse: expander → RRF; else score-fusion.
+        let fused = if let Some(exp) = &self.expander {
+            let t0 = Instant::now();
+            let cached = self.expander_cache.as_ref()
+                .and_then(|c| c.get(exp.model_id(), req.query));
+            let subs = if let Some(subs) = cached {
+                eprintln!("Expanding query (cached)...");
+                emit_timing("expand", t0.elapsed());
+                subs
+            } else {
+                eprintln!("Expanding query...");
+                let subs = exp
+                    .expand_query(req.query)
+                    .unwrap_or_else(|_| fallback(req.query));
+                emit_timing("expand", t0.elapsed());
+                if let Some(cache) = &self.expander_cache {
+                    cache.put(exp.model_id(), req.query, &subs);
+                }
+                subs
+            };
+
+            let n_vec = subs.iter().filter(|s| matches!(s.kind, SubQueryKind::Vec | SubQueryKind::Hyde)).count();
+            let n_lex = subs.iter().filter(|s| s.kind == SubQueryKind::Lex).count();
+            eprintln!("Searching {} sub-queries ({} lex, {} vec/hyde)...", subs.len(), n_lex, n_vec);
+
+            rrf_from_subqueries(dbs, &self.embedder, &subs, req, probe_results)?
         } else {
+            eprintln!("Score fusion (no expander)...");
             score_fusion_two_list(dbs, &self.embedder, req)?
         };
 
         if fused.is_empty() {
+            emit_timing("total", t_total.elapsed());
             return Ok(vec![]);
         }
 
-        // 3. Rerank top-20: qwen reranker > separate reranker.
-        let final_results = if let Some(q) = &self.qwen {
-            rerank_qwen(q, req.query, fused, dbs, req.limit)?
-        } else if let Some(reranker) = &self.reranker {
-            rerank(reranker, req.query, fused, dbs, req.limit)?
+        // 3. Rerank top-20 if scorer available.
+        let final_results = if let Some(scorer) = &self.scorer {
+            let n = fused.len().min(20);
+            eprintln!("Reranking {n} chunks...");
+            let t0 = Instant::now();
+            let result = rerank(scorer.as_ref(), req.query, fused, dbs, req.limit)?;
+            emit_timing("rerank", t0.elapsed());
+            result
         } else {
             fused
         };
 
+        emit_timing("total", t_total.elapsed());
         Ok(apply_min_score(final_results, req.min_score, req.limit))
     }
 }
@@ -85,9 +139,13 @@ fn score_fusion_two_list(
     req: &HybridRequest,
 ) -> Result<Vec<SearchResult>> {
     let fetch_n = req.limit * 3;
-    let bm25_list = bm25_across(dbs, req.query, fetch_n);
+    let bm25_list = bm25_across(dbs, req.query, fetch_n)?;
+    let t0 = Instant::now();
     let emb = embedder.embed_query(req.query)?;
-    let vec_list = vec_across(dbs, &emb, fetch_n);
+    emit_timing("embed", t0.elapsed());
+    let t0 = Instant::now();
+    let vec_list = vec_across(dbs, &emb, fetch_n)?;
+    emit_timing("knn", t0.elapsed());
 
     // Union of both lists keyed by (collection, path).
     let mut scores: HashMap<(String, String), (f64, f64, SearchResult)> = HashMap::new();
@@ -104,6 +162,7 @@ fn score_fusion_two_list(
         entry.1 = r.score;
     }
 
+    let t0 = Instant::now();
     let alpha = SCORE_FUSION_VEC_ALPHA;
     let mut merged: Vec<SearchResult> = scores
         .into_values()
@@ -115,71 +174,67 @@ fn score_fusion_two_list(
 
     SearchResult::sort_desc(&mut merged);
     merged.truncate(req.limit * 2);
+    emit_timing("fusion", t0.elapsed());
     Ok(merged)
 }
 
-/// Multi-subquery RRF fusion using unified Qwen3.5 model for expansion.
-fn rrf_with_qwen(
-    dbs: &[CollectionDb],
-    embedder: &Embedder,
-    qwen: &Qwen35,
-    req: &HybridRequest,
-    probe_results: Vec<SearchResult>,
-) -> Result<Vec<SearchResult>> {
-    let sub_queries = qwen
-        .expand(req.query)
-        .unwrap_or_else(|_| crate::llm::expander::fallback(req.query));
-    rrf_from_subqueries(dbs, embedder, &sub_queries, req, probe_results)
-}
-
-/// Multi-subquery RRF fusion for use with the query expander.
+/// Multi-subquery RRF fusion.
 /// Weights: lex=1.0, vec=1.5, hyde=1.0 — vector weighted higher.
 /// Probe BM25 results are NOT added again if a lex sub-query already covers the same query.
-fn rrf_with_expander(
-    dbs: &[CollectionDb],
-    embedder: &Embedder,
-    expander: &Expander,
-    req: &HybridRequest,
-    probe_results: Vec<SearchResult>,
-) -> Result<Vec<SearchResult>> {
-    let sub_queries = expander
-        .expand(req.query)
-        .unwrap_or_else(|_| crate::llm::expander::fallback(req.query));
-    rrf_from_subqueries(dbs, embedder, &sub_queries, req, probe_results)
-}
-
 fn rrf_from_subqueries(
     dbs: &[CollectionDb],
     embedder: &Embedder,
-    sub_queries: &[crate::llm::expander::SubQuery],
+    sub_queries: &[SubQuery],
     req: &HybridRequest,
     probe_results: Vec<SearchResult>,
 ) -> Result<Vec<SearchResult>> {
     let mut ranked_lists: Vec<RankedList> = Vec::new();
 
-    for sub in sub_queries {
-        let weight = match sub.kind {
-            SubQueryKind::Lex => 1.0,
-            SubQueryKind::Vec => 1.5,
-            SubQueryKind::Hyde => 1.0,
-        };
+    // Partition sub-queries: lex vs vec/hyde
+    let vec_subs: Vec<(usize, f64)> = sub_queries
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| matches!(s.kind, SubQueryKind::Vec | SubQueryKind::Hyde))
+        .map(|(i, s)| {
+            let weight = match s.kind {
+                SubQueryKind::Vec => 1.5,
+                SubQueryKind::Hyde => 1.0,
+                SubQueryKind::Lex => unreachable!(),
+            };
+            (i, weight)
+        })
+        .collect();
 
-        match sub.kind {
-            SubQueryKind::Lex => {
-                let results = bm25_across(dbs, &sub.text, req.limit * 2);
-                if !results.is_empty() {
-                    ranked_lists.push(RankedList { results, weight });
-                }
-            }
-            SubQueryKind::Vec | SubQueryKind::Hyde => {
-                if let Ok(emb) = embedder.embed_query(&sub.text) {
-                    let results = vec_across(dbs, &emb, req.limit * 2);
-                    if !results.is_empty() {
-                        ranked_lists.push(RankedList { results, weight });
-                    }
-                }
+    // BM25 for lex sub-queries
+    for sub in sub_queries.iter().filter(|s| s.kind == SubQueryKind::Lex) {
+        let results = bm25_across(dbs, &sub.text, req.limit * 2)?;
+        if !results.is_empty() {
+            ranked_lists.push(RankedList {
+                results,
+                weight: 1.0,
+            });
+        }
+    }
+
+    // Batch-embed all vec/hyde texts at once
+    if !vec_subs.is_empty() {
+        let texts: Vec<String> = vec_subs
+            .iter()
+            .map(|&(i, _)| sub_queries[i].text.clone())
+            .collect();
+
+        let t0 = Instant::now();
+        let embeddings = embedder.embed_query_batch(&texts)?;
+        emit_timing("embed", t0.elapsed());
+
+        let t0 = Instant::now();
+        for (emb, &(_, weight)) in embeddings.iter().zip(&vec_subs) {
+            let results = vec_across(dbs, emb, req.limit * 2)?;
+            if !results.is_empty() {
+                ranked_lists.push(RankedList { results, weight });
             }
         }
+        emit_timing("knn", t0.elapsed());
     }
 
     // Include probe only if no lex sub-query was generated (guards against double-counting).
@@ -195,41 +250,38 @@ fn rrf_from_subqueries(
         return Ok(vec![]);
     }
 
-    Ok(rrf::fuse(&ranked_lists, req.limit * 2))
+    let t0 = Instant::now();
+    let result = rrf::fuse(&ranked_lists, req.limit * 2);
+    emit_timing("fusion", t0.elapsed());
+    Ok(result)
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
-fn bm25_across(dbs: &[CollectionDb], query: &str, limit: usize) -> Vec<SearchResult> {
+fn bm25_across(dbs: &[CollectionDb], query: &str, limit: usize) -> Result<Vec<SearchResult>> {
     let fts_query = fts::build_query(query);
     if fts_query.is_empty() {
-        return vec![];
+        return Ok(vec![]);
     }
     dbs.iter()
-        .flat_map(|db| {
+        .map(|db| {
             let q = fts::BM25Query {
                 fts_query: fts_query.clone(),
                 collection: &db.name,
                 limit,
                 title_weight: None,
             };
-            fts::search(db.conn(), &q).unwrap_or_else(|e| {
-                eprintln!("warn: bm25 search on '{}' failed: {e}", db.name);
-                vec![]
-            })
+            fts::search(db.conn(), &q)
         })
-        .collect()
+        .collect::<Result<Vec<Vec<_>>>>()
+        .map(|vv| vv.into_iter().flatten().collect())
 }
 
-fn vec_across(dbs: &[CollectionDb], embedding: &[f32], limit: usize) -> Vec<SearchResult> {
+fn vec_across(dbs: &[CollectionDb], embedding: &[f32], limit: usize) -> Result<Vec<SearchResult>> {
     dbs.iter()
-        .flat_map(|db| {
-            vectors::search(db.conn(), embedding, &db.name, limit).unwrap_or_else(|e| {
-                eprintln!("warn: vector search on '{}' failed: {e}", db.name);
-                vec![]
-            })
-        })
-        .collect()
+        .map(|db| vectors::search(db.conn(), embedding, &db.name, limit))
+        .collect::<Result<Vec<Vec<_>>>>()
+        .map(|vv| vv.into_iter().flatten().collect())
 }
 
 /// Strong-signal shortcut: top BM25 score ≥ 0.85 AND gap to second ≥ 0.15.
@@ -252,9 +304,10 @@ fn apply_min_score(
     results
 }
 
-/// Rerank top-20 using Qwen3.5 unified model, blend with fusion scores.
-fn rerank_qwen(
-    qwen: &Qwen35,
+/// Rerank top-20 using LLM scorer; blend with fusion scores (fused×0.4 + rerank×0.6).
+/// Checks llm_cache before inference and writes new scores back.
+fn rerank(
+    scorer: &dyn Scorer,
     query: &str,
     mut candidates: Vec<SearchResult>,
     dbs: &[CollectionDb],
@@ -263,46 +316,83 @@ fn rerank_qwen(
     let top_n = candidates.len().min(20);
     let (to_rerank, rest) = candidates.split_at_mut(top_n);
 
-    for result in to_rerank.iter_mut() {
-        if let Some(text) = fetch_doc_text(dbs, &result.hash, &result.collection) {
-            let fusion_score = result.score;
-            if let Ok(rerank_score) = qwen.score_relevance(query, &text) {
-                result.score = fusion_score * 0.4 + rerank_score * 0.6;
+    // Build cache keys: sha256(model_id + "\0" + query + "\0" + content_hash)
+    let mid = scorer.model_id();
+    let cache_keys: Vec<String> = to_rerank
+        .iter()
+        .map(|r| hasher::hash_bytes(format!("{}\0{}\0{}", mid, query, r.hash).as_bytes()))
+        .collect();
+
+    // Batch-lookup cached scores (one query per collection DB)
+    let mut cached_scores: HashMap<String, f64> = HashMap::new();
+    for db in dbs {
+        let keys_for_db: Vec<String> = to_rerank
+            .iter()
+            .zip(&cache_keys)
+            .filter(|(r, _)| r.collection == db.name)
+            .map(|(_, k)| k.clone())
+            .collect();
+        if !keys_for_db.is_empty() {
+            cached_scores.extend(db::get_rerank_scores(db.conn(), &keys_for_db));
+        }
+    }
+
+    // Split into cached hits and uncached misses
+    let mut uncached_indices: Vec<usize> = Vec::new();
+    let mut rerank_scores: Vec<Option<f64>> = vec![None; top_n];
+
+    for (i, key) in cache_keys.iter().enumerate() {
+        if let Some(&score) = cached_scores.get(key) {
+            rerank_scores[i] = Some(score);
+        } else {
+            uncached_indices.push(i);
+        }
+    }
+
+    let n_cached = top_n - uncached_indices.len();
+    if n_cached > 0 && timing_enabled() {
+        eprintln!("[timing] rerank_cached  {n_cached}/{top_n} hits");
+    }
+
+    // Score only uncached candidates
+    if !uncached_indices.is_empty() {
+        let texts: Vec<Option<String>> = uncached_indices
+            .iter()
+            .map(|&i| fetch_doc_text(dbs, &to_rerank[i].hash, &to_rerank[i].collection))
+            .collect();
+        let doc_refs: Vec<&str> = texts
+            .iter()
+            .map(|t| t.as_deref().unwrap_or(""))
+            .collect();
+        let scores = scorer.score_batch(query, &doc_refs).unwrap_or_default();
+
+        // Collect new entries to write to cache, grouped by collection
+        let mut new_entries: HashMap<&str, Vec<(String, f64)>> = HashMap::new();
+
+        for (j, &i) in uncached_indices.iter().enumerate() {
+            if texts[j].is_some() {
+                if let Some(&score) = scores.get(j) {
+                    rerank_scores[i] = Some(score);
+                    new_entries
+                        .entry(to_rerank[i].collection.as_str())
+                        .or_default()
+                        .push((cache_keys[i].clone(), score));
+                }
+            }
+        }
+
+        // Write new scores to cache
+        for db in dbs {
+            if let Some(entries) = new_entries.get(db.name.as_str()) {
+                db::put_rerank_scores(db.conn(), entries);
             }
         }
     }
 
-    let mut all: Vec<SearchResult> = to_rerank
-        .iter()
-        .cloned()
-        .chain(rest.iter().cloned())
-        .collect();
-    SearchResult::sort_desc(&mut all);
-    all.truncate(limit);
-    Ok(all)
-}
-
-/// Rerank top-20 using LLM cross-encoder, blend with fusion scores.
-fn rerank(
-    reranker: &Reranker,
-    query: &str,
-    mut candidates: Vec<SearchResult>,
-    dbs: &[CollectionDb],
-    limit: usize,
-) -> Result<Vec<SearchResult>> {
-    let top_n = candidates.len().min(20);
-    let (to_rerank, rest) = candidates.split_at_mut(top_n);
-
-    for result in to_rerank.iter_mut() {
-        let doc_text = fetch_doc_text(dbs, &result.hash, &result.collection);
-        if let Some(text) = doc_text {
-            let fusion_score = result.score;
-            match reranker.score(query, &text) {
-                Ok(rerank_score) => {
-                    result.score = fusion_score * 0.4 + rerank_score * 0.6;
-                }
-                Err(_) => {} // keep fusion score on error
-            }
+    // Blend scores
+    for (i, result) in to_rerank.iter_mut().enumerate() {
+        if let Some(rerank_score) = rerank_scores[i] {
+            result.score = result.score * 0.4 + rerank_score * 0.6;
         }
     }
 

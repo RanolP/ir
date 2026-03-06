@@ -1,12 +1,20 @@
 # ir
 
-Local semantic search engine for markdown knowledge bases. Rust port of [qmd](https://github.com/tobi/qmd) with a per-collection SQLite architecture and a hybrid search pipeline benchmarked on BEIR/NFCorpus.
+Local semantic search engine for markdown knowledge bases. Rust port of [qmd](https://github.com/tobi/qmd) with three key differences:
+
+- **Per-collection SQLite** — each collection is an independent file; no shared global index
+- **Persistent daemon** — models stay loaded between queries; first search auto-starts it
+- **Dual LLM cache** — expander outputs and reranker scores are persisted; repeated queries are instant
+
+Search quality is benchmarked on BEIR/NFCorpus (nDCG@10 = 0.4032 with reranking).
 
 ## Features
 
 - **Hybrid search** — BM25 probe → score fusion (0.80·vec + 0.20·bm25) → LLM reranking
 - **Query expansion** — typed sub-queries (lex/vec/hyde) when expander model is present
 - **Strong-signal shortcut** — skips expansion when top BM25 score ≥ 0.85 with gap ≥ 0.15
+- **Daemon mode** — keeps models warm between queries; auto-starts on first search, eliminates per-call model load overhead
+- **Dual LLM cache** — expander outputs cached globally (`~/.config/ir/expander_cache.sqlite`); reranker scores cached per-collection; repeated queries skip all inference
 - **Per-collection SQLite** — independent WAL journals, isolated backup, zero cross-collection contention
 - **Content-addressed storage** — identical files deduplicated by SHA-256 within a collection
 - **FTS5 injection-safe** — all user input escaped before FTS5 query construction
@@ -92,11 +100,20 @@ ir search "ownership" --md
 ir search "ownership" --files   # paths only
 ```
 
+### Daemon
+
+```bash
+ir daemon start              # start background daemon (auto-started on first search)
+ir daemon stop
+ir daemon status
+```
+
+The daemon keeps models warm in memory. The first query auto-starts it. Subsequent queries over the Unix socket skip model loading entirely.
+
 ### Other
 
 ```bash
 ir status                    # index health per collection
-ir get path/to/doc.md        # fetch document by path
 ir collection ls             # list collections
 ir collection rm notes       # remove collection
 ```
@@ -108,12 +125,13 @@ Query
   │
   ├─ BM25 probe ──► score ≥ 0.85 AND gap ≥ 0.15? ──► return immediately
   │
-  ├─ With Qwen3.5 (unified):  expand → lex/vec/hyde → RRF → rerank
-  ├─ With separate models:    expand → lex/vec/hyde → RRF → rerank
-  ├─ Without expander:        BM25 + vector → score fusion 0.80·vec + 0.20·bm25
+  ├─ With expander:    expand → lex/vec/hyde sub-queries → RRF fusion
+  ├─ Without expander: BM25 + vector → score fusion (0.80·vec + 0.20·bm25)
   │
   └─ Reranker: final = 0.40·fused + 0.60·P(relevant)
 ```
+
+Expander and reranker outputs are cached (SQLite). Repeated queries skip LLM inference entirely.
 
 ## Benchmark: BEIR/NFCorpus
 
@@ -128,39 +146,25 @@ See [research/experiment.md](research/experiment.md) for full results, reproduct
 
 ## vs qmd
 
-ir implements the same architecture as [qmd](https://github.com/tobi/qmd) with the following differences:
-
-### Database
+ir is a Rust port of [qmd](https://github.com/tobi/qmd) with a different storage model and a persistent daemon.
 
 | | qmd | ir |
 |---|---|---|
-| Storage | Single `~/.cache/qmd/index.sqlite` for all collections | Per-collection `~/.local/share/ir/collections/<name>.sqlite` |
-| Collection isolation | `collection` column + `UNIQUE(collection, path)` | Filesystem-level — the DB file *is* the collection |
-| Concurrent writes | All collections share one WAL journal | Independent WAL per collection, no contention |
-| Delete a collection | `DELETE WHERE collection = ?` (file stays) | `rm name.sqlite` — complete, portable |
-| FTS5 scope | Index spans all collections, filtered per query | Index scoped to one collection — smaller, faster |
+| Storage | Single SQLite for all collections | Per-collection SQLite — `rm name.sqlite` to delete |
+| Concurrent writes | Shared WAL journal | Independent WAL per collection |
 | sqlite-vec | Dynamically loaded `.so` | Statically compiled in |
-| Deduplication | Content-addressed across all collections | Content-addressed within each collection |
+| Process model | Spawns per query | Daemon keeps models warm |
+| LLM cache | Reranker scores (per-collection) | Reranker scores + expander outputs (global) |
+| Quality (NFCorpus nDCG@10) | No published numbers | 0.4032 |
 
-### Search
+### Performance (macOS M4 Max, same models and query)
 
-| | qmd | ir |
-|---|---|---|
-| Strong-signal threshold | ≥ 0.85, gap ≥ 0.15 | same |
-| Fusion (no expander) | RRF (bm25=1.0, vec=1.2) | Score fusion 0.80·vec + 0.20·bm25 |
-| Fusion (with expander) | RRF (bm25=1.0, vec=1.2, reranker=2.5) | RRF (lex=1.0, vec=1.5, hyde=1.0) |
-| Reranker blend | Position-based (75/25 top, 60/40 mid, 40/60 low) | Fixed: 0.40·fusion + 0.60·reranker |
-| BM25 normalization | Sigmoid `1/(1+exp(-(abs-5)/3))` | `(-raw)/(1+(-raw))` |
-| Benchmarked | No published numbers | NFCorpus nDCG@10 = 0.393 |
+| | ir | qmd | Ratio |
+|---|---:|---:|---|
+| **Cold** (no cache) | 3.0s | 9.5s | **3×** |
+| **Warm** (daemon + caches hot) | 30ms | 840ms | **28×** |
 
-### Performance (macOS M4 Max)
-
-| Mode | ir | qmd (Bun) | Ratio |
-|---|---|---|---|
-| BM25 (no model) | 341 ms | 381 ms | 1.1× |
-| Vector search | **570 ms** | 3,901 ms | **6.8×** |
-
-BM25 is close because Bun is fast and SQLite does the work. Vector search is 6.8× faster because ir links llama.cpp natively at compile time — no FFI startup overhead per invocation. For repeated searches in a session (10 vector queries): ir ~5.7s vs qmd ~39s.
+Same GGUF models (`qmd-query-expansion-1.7B` + `qwen3-reranker-0.6b`) — LLM inference time is identical. Cold difference: ir caps reranking at 20 candidates vs qmd's 40. Warm difference: qmd pays ~800ms process spawn + JS runtime per invocation; ir's daemon round-trip is 30ms (embed + kNN only).
 
 ## Development
 
@@ -174,7 +178,7 @@ cargo run --bin eval -- --data test-data/nfcorpus --mode all
 
 ## Schema
 
-Each collection database has 8 objects:
+Each collection database (`~/.config/ir/collections/<name>.sqlite`):
 
 ```
 content          — hash → full text (content-addressed)
@@ -182,8 +186,14 @@ documents        — path, title, hash, active flag
 documents_fts    — FTS5 virtual table (porter tokenizer)
 vectors_vec      — sqlite-vec kNN (768d cosine, EmbeddingGemma format)
 content_vectors  — chunk metadata (hash, seq, pos, model)
-llm_cache        — reranker score cache (query+doc hash → score)
+llm_cache        — reranker score cache (sha256(model+query+doc) → score)
 meta             — collection metadata (name, schema version)
+```
+
+Global cache (`~/.config/ir/expander_cache.sqlite`):
+
+```
+expander_cache   — sha256(model+query) → JSON Vec<SubQuery>
 ```
 
 Triggers keep `documents_fts` in sync with `documents` on insert/update/delete.

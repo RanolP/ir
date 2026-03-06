@@ -11,50 +11,49 @@
 
 use crate::error::{Error, Result};
 use crate::llm::{LlamaBackend, model_load_params, models};
-use crate::llm::expander::{SubQuery, fallback, parse_output};
-use llama_cpp_2::{
-    context::params::LlamaContextParams,
-    llama_batch::LlamaBatch,
-    model::{AddBos, LlamaModel},
-    sampling::LlamaSampler,
-};
-use std::num::NonZeroU32;
+use crate::llm::expander::{QueryExpander, SubQuery, fallback, parse_output};
+use crate::llm::generate::{self, GenerateParams};
+use crate::llm::scoring::{self, Scorer};
+use llama_cpp_2::context::LlamaContext;
+use llama_cpp_2::model::{AddBos, LlamaModel};
 use std::path::Path;
+use std::sync::Mutex;
 
 const RERANK_CONTEXT_SIZE: u32 = 2048;
 const EXPAND_CONTEXT_SIZE: u32 = 2048;
-const MAX_DOC_CHARS: usize = 6000;
 const MAX_EXPAND_TOKENS: usize = 300;
 
 pub struct Qwen35 {
     backend: &'static LlamaBackend,
     model: LlamaModel,
+    model_filename: String,
     yes_token_id: i32,
     no_token_id: i32,
+    // ! Cached rerank context: model outlives context (same struct)
+    cached_rerank_ctx: Mutex<Option<LlamaContext<'static>>>,
 }
+
+// ! Safety: LlamaModel is Send+Sync, LlamaContext access is serialized by Mutex
+unsafe impl Send for Qwen35 {}
+unsafe impl Sync for Qwen35 {}
 
 impl Qwen35 {
     pub fn load(path: &Path) -> Result<Self> {
         let backend = crate::llm::init_backend()?;
         let model = LlamaModel::load_from_file(backend, path, &model_load_params())
             .map_err(|e| Error::Other(format!("load qwen3.5: {e}")))?;
-
-        let yes_tokens = model
-            .str_to_token("Yes", AddBos::Never)
-            .map_err(|e| Error::Other(format!("tokenize 'Yes': {e}")))?;
-        let no_tokens = model
-            .str_to_token("No", AddBos::Never)
-            .map_err(|e| Error::Other(format!("tokenize 'No': {e}")))?;
-
-        // Use last token of each (handles BPE subword splits)
-        let yes_id = yes_tokens.last().map(|t| t.0).unwrap_or(0);
-        let no_id = no_tokens.last().map(|t| t.0).unwrap_or(1);
-
+        let model_filename = path
+            .file_name()
+            .map(|f| f.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let (yes_token_id, no_token_id) = scoring::resolve_yes_no_tokens(&model)?;
         Ok(Self {
             backend,
             model,
-            yes_token_id: yes_id,
-            no_token_id: no_id,
+            model_filename,
+            yes_token_id,
+            no_token_id,
+            cached_rerank_ctx: Mutex::new(None),
         })
     }
 
@@ -75,89 +74,25 @@ impl Qwen35 {
         )))
     }
 
-    /// Score relevance of a document to a query. Returns P(Yes) in [0, 1].
-    ///
-    /// // ! DSPy-optimized prompt — do not edit manually; re-run research/dspy_optimize.py
-    pub fn score_relevance(&self, query: &str, doc: &str) -> Result<f64> {
-        let doc_truncated = if doc.len() > MAX_DOC_CHARS {
-            &doc[..doc.floor_char_boundary(MAX_DOC_CHARS)]
-        } else {
-            doc
-        };
-
-        let prompt = format!(
-            "<|im_start|>system\n\
-             Judge whether the Document meets the requirements based on the Query and the Instruct provided. \
-             Note that the answer can only be \"yes\" or \"no\".<|im_end|>\n\
-             <|im_start|>user\n\
-             <Instruct>: Given a web search query, retrieve relevant passages that answer the query\n\
-             <Query>: {query}\n\
-             <Document>: {doc_truncated}<|im_end|>\n\
-             <|im_start|>assistant\n\
-             <think>\n\
-             </think>\n"
-        );
-
-        let n_threads = std::thread::available_parallelism()
-            .map(|n| n.get() as i32)
-            .unwrap_or(4);
-
-        let ctx_params = LlamaContextParams::default()
-            .with_n_ctx(NonZeroU32::new(RERANK_CONTEXT_SIZE))
-            .with_offload_kqv(false)
-            .with_n_threads(n_threads)
-            .with_n_threads_batch(n_threads);
-
-        let mut ctx = self
-            .model
-            .new_context(self.backend, ctx_params)
-            .map_err(|e| Error::Other(format!("rerank context: {e}")))?;
-
-        let tokens = self
-            .model
-            .str_to_token(&prompt, AddBos::Never) // ! ChatML starts with <|im_start|>; extra BOS confuses model
-            .map_err(|e| Error::Other(format!("tokenize: {e}")))?;
-
-        if tokens.is_empty() {
-            return Ok(0.0);
-        }
-
-        let n = tokens.len().min(RERANK_CONTEXT_SIZE as usize - 1);
-        let mut batch = LlamaBatch::new(n, 1);
-        for (i, &tok) in tokens[..n].iter().enumerate() {
-            batch
-                .add(tok, i as i32, &[0], i == n - 1)
-                .map_err(|e| Error::Other(format!("batch add: {e}")))?;
-        }
-
-        ctx.decode(&mut batch)
-            .map_err(|e| Error::Other(format!("decode: {e}")))?;
-
-        let logits = ctx.get_logits_ith((n - 1) as i32);
-        let yes_idx = self.yes_token_id as usize;
-        let no_idx = self.no_token_id as usize;
-        if yes_idx >= logits.len() || no_idx >= logits.len() {
-            return Err(Error::Other(format!(
-                "token id out of range: yes={yes_idx}, no={no_idx}, vocab={}",
-                logits.len()
-            )));
-        }
-
-        let yes_logit = logits[yes_idx];
-        let no_logit = logits[no_idx];
-        let max_logit = yes_logit.max(no_logit);
-        let yes_exp = (yes_logit - max_logit).exp() as f64;
-        let no_exp = (no_logit - max_logit).exp() as f64;
-
-        Ok(yes_exp / (yes_exp + no_exp))
-    }
-
     /// Expand a query into typed sub-queries (lex/vec/hyde). Falls back on parse failure.
     ///
     /// // ! DSPy-optimized prompt — do not edit manually; re-run research/dspy_optimize.py
     pub fn expand(&self, query: &str) -> Result<Vec<SubQuery>> {
         let prompt = build_expand_prompt(query);
-        let raw = self.generate_expand(&prompt)?;
+        let raw = generate::generate(
+            &self.model,
+            self.backend,
+            &prompt,
+            &GenerateParams {
+                ctx_size: EXPAND_CONTEXT_SIZE,
+                max_tokens: MAX_EXPAND_TOKENS,
+                add_bos: AddBos::Never, // ! ChatML prompt; no extra BOS
+                temp: 0.7,
+                top_k: 20,
+                top_p: 0.8,
+                seed: 42,
+            },
+        )?;
         let parsed = parse_output(&raw);
 
         let query_lower = query.to_lowercase();
@@ -174,74 +109,52 @@ impl Qwen35 {
         }
     }
 
-    fn generate_expand(&self, prompt: &str) -> Result<String> {
-        let n_threads = std::thread::available_parallelism()
-            .map(|n| n.get() as i32)
-            .unwrap_or(4);
-
-        let ctx_params = LlamaContextParams::default()
-            .with_n_ctx(NonZeroU32::new(EXPAND_CONTEXT_SIZE))
-            .with_offload_kqv(false)
-            .with_n_threads(n_threads)
-            .with_n_threads_batch(n_threads);
-
-        let mut ctx = self
-            .model
-            .new_context(self.backend, ctx_params)
-            .map_err(|e| Error::Other(format!("expand context: {e}")))?;
-
-        let prompt_tokens = self
-            .model
-            .str_to_token(prompt, AddBos::Never) // ! ChatML prompt; no extra BOS
-            .map_err(|e| Error::Other(format!("tokenize expand: {e}")))?;
-
-        let n_prompt = prompt_tokens.len();
-        if n_prompt == 0 {
-            return Ok(String::new());
+    fn get_or_create_rerank_ctx(&self) -> Result<std::sync::MutexGuard<'_, Option<LlamaContext<'static>>>> {
+        let mut guard = self.cached_rerank_ctx.lock().unwrap();
+        if guard.is_none() {
+            let ctx = scoring::create_scoring_context(&self.model, self.backend, RERANK_CONTEXT_SIZE)?;
+            // ! Safety: model lives in same struct; context is dropped first via Drop impl
+            let ctx: LlamaContext<'static> = unsafe { std::mem::transmute(ctx) };
+            *guard = Some(ctx);
         }
+        Ok(guard)
+    }
+}
 
-        let mut batch = LlamaBatch::new(n_prompt, 1);
-        for (i, &tok) in prompt_tokens.iter().enumerate() {
-            batch
-                .add(tok, i as i32, &[0], i == n_prompt - 1)
-                .map_err(|e| Error::Other(format!("batch add: {e}")))?;
-        }
-        ctx.decode(&mut batch)
-            .map_err(|e| Error::Other(format!("decode prompt: {e}")))?;
+impl Drop for Qwen35 {
+    fn drop(&mut self) {
+        // ! Drop context before model
+        let _ = self.cached_rerank_ctx.lock().map(|mut g| g.take());
+    }
+}
 
-        let mut sampler = LlamaSampler::chain_simple([
-            LlamaSampler::temp(0.7),
-            LlamaSampler::top_k(20),
-            LlamaSampler::top_p(0.8, 1),
-            LlamaSampler::dist(42),
-        ]);
+impl Scorer for Qwen35 {
+    fn model_id(&self) -> &str {
+        &self.model_filename
+    }
 
-        let mut output = String::new();
-        let mut n_cur = n_prompt as i32;
+    /// // ! DSPy-optimized prompt — do not edit manually; re-run research/dspy_optimize.py
+    fn score_batch(&self, query: &str, docs: &[&str]) -> Result<Vec<f64>> {
+        let mut guard = self.get_or_create_rerank_ctx()?;
+        let ctx = guard.as_mut().unwrap();
+        scoring::score_batch_with_ctx(
+            ctx,
+            &self.model,
+            self.yes_token_id,
+            self.no_token_id,
+            query,
+            docs,
+            RERANK_CONTEXT_SIZE,
+        )
+    }
+}
 
-        for _ in 0..MAX_EXPAND_TOKENS {
-            let token = sampler.sample(&ctx, -1);
-            sampler.accept(token);
-
-            if self.model.is_eog_token(token) {
-                break;
-            }
-
-            let bytes = self
-                .model
-                .token_to_piece_bytes(token, 32, true, None)
-                .map_err(|e| Error::Other(format!("token_to_piece_bytes: {e}")))?;
-            output.push_str(&String::from_utf8_lossy(&bytes));
-
-            let mut next = LlamaBatch::new(1, 1);
-            next.add(token, n_cur, &[0], true)
-                .map_err(|e| Error::Other(format!("batch next: {e}")))?;
-            ctx.decode(&mut next)
-                .map_err(|e| Error::Other(format!("decode next: {e}")))?;
-            n_cur += 1;
-        }
-
-        Ok(output)
+impl QueryExpander for Qwen35 {
+    fn expand_query(&self, query: &str) -> Result<Vec<SubQuery>> {
+        self.expand(query)
+    }
+    fn model_id(&self) -> &str {
+        &self.model_filename
     }
 }
 
@@ -301,8 +214,8 @@ mod tests {
         assert!(!tokens.is_empty(), "tokenization returned empty");
 
         // Generate 10 tokens from a trivial prompt
-        let result = q.generate_expand("hello");
-        assert!(result.is_ok(), "generate failed: {:?}", result.err());
+        let result = q.expand("hello");
+        assert!(result.is_ok(), "expand failed: {:?}", result.err());
         println!("0.8B output: {:?}", result.unwrap());
     }
 
@@ -343,23 +256,24 @@ mod tests {
 
     #[test]
     #[ignore]
-    fn score_relevance_orders_correctly() {
+    fn score_batch_orders_correctly() {
+        use crate::llm::scoring::Scorer;
         let q = Qwen35::load_default().expect("load model");
-        let relevant = q
-            .score_relevance(
+        let scores = q
+            .score_batch(
                 "rust memory management",
-                "Rust uses ownership and borrowing to manage memory without a garbage collector",
+                &[
+                    "Rust uses ownership and borrowing to manage memory without a garbage collector",
+                    "Python uses a garbage collector. JavaScript also has automatic memory management.",
+                ],
             )
-            .expect("score");
-        let irrelevant = q
-            .score_relevance(
-                "rust memory management",
-                "Python uses a garbage collector. JavaScript also has automatic memory management.",
-            )
-            .expect("score");
+            .expect("score_batch");
+        assert_eq!(scores.len(), 2);
         assert!(
-            relevant > irrelevant,
-            "relevant={relevant:.3} should > irrelevant={irrelevant:.3}"
+            scores[0] > scores[1],
+            "relevant={:.3} should > irrelevant={:.3}",
+            scores[0],
+            scores[1]
         );
     }
 }

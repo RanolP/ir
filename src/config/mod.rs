@@ -76,7 +76,7 @@ impl Config {
 
 /// Base directory for all ir state: $XDG_CONFIG_HOME/ir or ~/.config/ir.
 /// Consistent across platforms; avoids platform-specific paths like ~/Library.
-fn ir_dir() -> PathBuf {
+pub(crate) fn ir_dir() -> PathBuf {
     std::env::var("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
@@ -105,6 +105,10 @@ pub fn daemon_socket_path() -> PathBuf {
 
 pub fn daemon_pid_path() -> PathBuf {
     ir_dir().join("daemon.pid")
+}
+
+pub fn expander_cache_path() -> PathBuf {
+    ir_dir().join("expander_cache.sqlite")
 }
 
 fn validate_collection_name(name: &str) -> Result<()> {
