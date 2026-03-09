@@ -59,6 +59,18 @@ impl Config {
         Ok(())
     }
 
+    pub fn set_collection_path(&mut self, name: &str, new_path: &str) -> Result<()> {
+        let resolved = std::fs::canonicalize(new_path)
+            .map_err(|e| Error::Other(format!("invalid path {new_path:?}: {e}")))?;
+        let col = self
+            .collections
+            .iter_mut()
+            .find(|c| c.name == name)
+            .ok_or_else(|| Error::CollectionNotFound(name.to_string()))?;
+        col.path = resolved.to_string_lossy().into_owned();
+        Ok(())
+    }
+
     pub fn rename_collection(&mut self, old: &str, new: &str) -> Result<()> {
         validate_collection_name(new)?;
         if self.get_collection(new).is_some() {

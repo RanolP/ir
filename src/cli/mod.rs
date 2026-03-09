@@ -130,4 +130,6 @@ pub enum CollectionCmd {
     Rename { old: String, new: String },
     /// List all collections
     Ls,
+    /// Update the source path of a collection
+    SetPath { name: String, path: String },
 }

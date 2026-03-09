@@ -107,6 +107,12 @@ fn handle_collection(cmd: CollectionCmd) -> Result<()> {
             config.save()?;
             println!("renamed '{old}' → '{new}'");
         }
+        CollectionCmd::SetPath { name, path } => {
+            config.set_collection_path(&name, &path)?;
+            config.save()?;
+            println!("updated path for '{name}' → {path}");
+            println!("run `ir daemon stop` then `ir update {name}` to sync");
+        }
         CollectionCmd::Ls => {
             if config.collections.is_empty() {
                 println!("no collections configured");
