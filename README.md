@@ -6,7 +6,7 @@ Local semantic search engine for markdown knowledge bases. Rust port of [qmd](ht
 - **Persistent daemon** — models stay loaded between queries; first search auto-starts it
 - **Dual LLM cache** — expander outputs and reranker scores are persisted; repeated queries are instant
 
-Search quality is benchmarked on BEIR/NFCorpus (nDCG@10 = 0.4032 with reranking).
+Search quality is benchmarked on 4 BEIR datasets; reranking adds up to +14.5% nDCG@10 over pure vector search.
 
 ## Features
 
@@ -133,16 +133,20 @@ Query
 
 Expander and reranker outputs are cached (SQLite). Repeated queries skip LLM inference entirely.
 
-## Benchmark: BEIR/NFCorpus
+## Benchmark: BEIR (4 datasets, nDCG@10)
 
-| Mode | nDCG@10 | Notes |
-|---|---|---|
-| BM25 | 0.2037 | no model |
-| Vector | 0.3866 | EmbeddingGemma 300M |
-| Hybrid (score-fusion α=0.80) | 0.3924 | +1.5% vs vector |
-| **Hybrid + reranker** | **0.4032** | **+2.8% vs score-fusion** |
+EmbeddingGemma 300M embeddings + qmd-expander-1.7B + Qwen3-Reranker-0.6B.
 
-See [research/experiment.md](research/experiment.md) for full results, reproduction steps, and the ongoing Qwen3.5 unification experiment.
+| Dataset | BM25 | Vector | Hybrid | +Reranker | LLM gain |
+|---|---|---|---|---|---|
+| NFCorpus (323q) | 0.2046 | 0.3898 | 0.3954 | **0.4001** | +1.2% |
+| SciFact (300q) | 0.0500 | 0.7847 | 0.7873 | **0.7797** | −1.0% |
+| FiQA (648q) | 0.0298 | 0.4324 | 0.4266 | **0.4567** | +7.1% |
+| ArguAna (1406q) | 0.0012 | 0.4264 | 0.4263 | **0.4879** | +14.5% |
+
+BM25 fusion (0.80·vec + 0.20·bm25) provides no statistically significant lift over pure vector on any dataset (paired t-test). Reranker gains are largest on conversational/argument retrieval tasks.
+
+See [research/experiment.md](research/experiment.md) for reproduction steps.
 
 ## vs qmd
 
@@ -155,7 +159,7 @@ ir is a Rust port of [qmd](https://github.com/tobi/qmd) with a different storage
 | sqlite-vec | Dynamically loaded `.so` | Statically compiled in |
 | Process model | Spawns per query | Daemon keeps models warm |
 | LLM cache | Reranker scores (per-collection) | Reranker scores + expander outputs (global) |
-| Quality (NFCorpus nDCG@10) | No published numbers | 0.4032 |
+| Quality (NFCorpus nDCG@10) | No published numbers | 0.4001 |
 
 ### Performance (macOS M4 Max, same models and query)
 
