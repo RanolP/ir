@@ -1341,6 +1341,7 @@ struct EvalResult {
     ndcg: f64,
     recall: f64,
     n_queries: usize,
+    per_query: HashMap<String, f64>, // query_id → nDCG@k
 }
 
 fn load_cached_results(
@@ -1386,11 +1387,13 @@ fn evaluate_bm25(
     let cached = load_cached_results(conn, run_key, "bm25");
     let n_cached = cached.len();
     let (mut total_ndcg, mut total_recall, mut n) = (0.0f64, 0.0f64, 0usize);
+    let mut per_query: HashMap<String, f64> = HashMap::new();
 
     // Include cached results in totals.
-    for (ndcg, recall) in cached.values() {
+    for (qid, (ndcg, recall)) in &cached {
         total_ndcg += ndcg;
         total_recall += recall;
+        per_query.insert(qid.clone(), *ndcg);
         n += 1;
     }
 
@@ -1409,6 +1412,7 @@ fn evaluate_bm25(
         let ndcg = ndcg_at_k(&ranked, relevant, k);
         let recall = recall_at_k(&ranked, relevant, k);
         save_query_result(conn, run_key, &q.id, "bm25", ndcg, recall);
+        per_query.insert(q.id.clone(), ndcg);
         total_ndcg += ndcg;
         total_recall += recall;
         n += 1;
@@ -1418,6 +1422,7 @@ fn evaluate_bm25(
         ndcg: if n > 0 { total_ndcg / n as f64 } else { 0.0 },
         recall: if n > 0 { total_recall / n as f64 } else { 0.0 },
         n_queries: n,
+        per_query,
     }
 }
 
@@ -1432,10 +1437,12 @@ fn evaluate_vector(
     let cached = load_cached_results(conn, run_key, "vector");
     let n_cached = cached.len();
     let (mut total_ndcg, mut total_recall, mut n) = (0.0f64, 0.0f64, 0usize);
+    let mut per_query: HashMap<String, f64> = HashMap::new();
 
-    for (ndcg, recall) in cached.values() {
+    for (qid, (ndcg, recall)) in &cached {
         total_ndcg += ndcg;
         total_recall += recall;
+        per_query.insert(qid.clone(), *ndcg);
         n += 1;
     }
 
@@ -1455,6 +1462,7 @@ fn evaluate_vector(
         let ndcg = ndcg_at_k(&ranked, relevant, k);
         let recall = recall_at_k(&ranked, relevant, k);
         save_query_result(conn, run_key, &q.id, "vector", ndcg, recall);
+        per_query.insert(q.id.clone(), ndcg);
         total_ndcg += ndcg;
         total_recall += recall;
         n += 1;
@@ -1464,6 +1472,7 @@ fn evaluate_vector(
         ndcg: if n > 0 { total_ndcg / n as f64 } else { 0.0 },
         recall: if n > 0 { total_recall / n as f64 } else { 0.0 },
         n_queries: n,
+        per_query,
     }
 }
 
@@ -1487,10 +1496,12 @@ fn evaluate_hybrid(
     let cached = load_cached_results(conn, run_key, mode_name);
     let n_cached = cached.len();
     let (mut total_ndcg, mut total_recall, mut n) = (0.0f64, 0.0f64, 0usize);
+    let mut per_query: HashMap<String, f64> = HashMap::new();
 
-    for (ndcg, recall) in cached.values() {
+    for (qid, (ndcg, recall)) in &cached {
         total_ndcg += ndcg;
         total_recall += recall;
+        per_query.insert(qid.clone(), *ndcg);
         n += 1;
     }
 
@@ -1552,6 +1563,7 @@ fn evaluate_hybrid(
         let ndcg = ndcg_at_k(&ranked, relevant, k);
         let recall = recall_at_k(&ranked, relevant, k);
         save_query_result(conn, run_key, &q.id, mode_name, ndcg, recall);
+        per_query.insert(q.id.clone(), ndcg);
         total_ndcg += ndcg;
         total_recall += recall;
         n += 1;
@@ -1561,6 +1573,7 @@ fn evaluate_hybrid(
         ndcg: if n > 0 { total_ndcg / n as f64 } else { 0.0 },
         recall: if n > 0 { total_recall / n as f64 } else { 0.0 },
         n_queries: n,
+        per_query,
     }
 }
 
@@ -1686,6 +1699,60 @@ fn tune_rerank_blend(
         best.0,
         best.1
     );
+}
+
+// ── Statistics ────────────────────────────────────────────────────────────────
+
+/// Paired t-test on per-query nDCG: a vs b (a - b).
+/// Returns (mean_diff, se, ci_lo, ci_hi) or None if fewer than 2 paired queries.
+fn paired_t_test(
+    a: &HashMap<String, f64>,
+    b: &HashMap<String, f64>,
+) -> Option<(f64, f64, f64, f64)> {
+    let diffs: Vec<f64> = a
+        .iter()
+        .filter_map(|(qid, &va)| b.get(qid).map(|&vb| va - vb))
+        .collect();
+    let n = diffs.len();
+    if n < 2 {
+        return None;
+    }
+    let mean = diffs.iter().sum::<f64>() / n as f64;
+    let var = diffs.iter().map(|d| (d - mean).powi(2)).sum::<f64>() / (n - 1) as f64;
+    let se = (var / n as f64).sqrt();
+    let margin = 1.96 * se; // normal approximation (valid for n≥30)
+    Some((mean, se, mean - margin, mean + margin))
+}
+
+fn print_paired_comparisons(results: &[EvalResult]) {
+    let hybrid = results
+        .iter()
+        .find(|r| r.mode == "hybrid" || r.mode == "hybrid-rerank");
+    let Some(hyb) = hybrid else { return };
+
+    let baselines: Vec<&EvalResult> = results
+        .iter()
+        .filter(|r| r.mode == "vector" || r.mode == "bm25")
+        .collect();
+    if baselines.is_empty() {
+        return;
+    }
+
+    println!("\n── Paired comparisons (nDCG@k, hybrid vs baseline) ────────────");
+    let w = 18;
+    for base in &baselines {
+        let label = format!("{} vs {}", hyb.mode, base.mode);
+        let Some((mean, se, lo, hi)) = paired_t_test(&hyb.per_query, &base.per_query) else {
+            println!("  {label:<w$}  n<2, skipping");
+            continue;
+        };
+        let t = if se > 0.0 { mean / se } else { 0.0 };
+        let sig = if t.abs() >= 1.96 { "sig" } else { "not sig" };
+        println!(
+            "  {label:<w$}  Δ={:+.4}  SE={:.4}  t={:+.2}  95%CI=[{:+.4},{:+.4}]  ({sig})",
+            mean, se, t, lo, hi
+        );
+    }
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
@@ -2059,7 +2126,12 @@ fn main() -> Result<()> {
     }
 
     // Results table
-    println!("\n── NFCorpus evaluation (k={k}) ────────────────────────────────");
+    let corpus_label = args
+        .data_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("corpus");
+    println!("\n── {corpus_label} evaluation (k={k}) ────────────────────────────────");
     println!(
         "{:<10}  {:>10}  {:>12}  {:>10}",
         "mode", "nDCG@10", "Recall@10", "queries"
@@ -2117,6 +2189,10 @@ fn main() -> Result<()> {
                 hybrid_ndcg,
             );
         }
+    }
+
+    if args.mode == EvalMode::All {
+        print_paired_comparisons(&results);
     }
 
     Ok(())
