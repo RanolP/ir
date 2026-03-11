@@ -25,6 +25,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+/// Per-collection routing information kept in DaemonState.
+struct CollectionInfo {
+    db_path: PathBuf,
+    preprocessor_commands: Vec<String>,
+}
+
 // ── Protocol types ────────────────────────────────────────────────────────────
 
 #[derive(Serialize, Deserialize)]
@@ -175,19 +181,51 @@ pub fn query(req: &DaemonRequest) -> Result<QueryResponse> {
 
 // ── Server ────────────────────────────────────────────────────────────────────
 
-/// Config snapshot loaded once at daemon startup; avoids YAML disk reads per query.
+/// Config snapshot — reloaded when config.yml mtime changes.
 struct DaemonState {
-    collection_paths: HashMap<String, PathBuf>,
+    collections: HashMap<String, CollectionInfo>,
+    config_mtime: SystemTime,
 }
 
 impl DaemonState {
     fn load() -> Result<Self> {
         let cfg = config::Config::load()?;
-        let collection_paths = cfg.collections.iter()
-            .map(|c| (c.name.clone(), collection_db_path(&c.name)))
+        let collections = cfg
+            .collections
+            .iter()
+            .map(|c| {
+                let pp_aliases = c.preprocessor.as_deref().unwrap_or(&[]);
+                let preprocessor_commands = cfg.resolve_preprocessor_commands(pp_aliases);
+                (
+                    c.name.clone(),
+                    CollectionInfo {
+                        db_path: collection_db_path(&c.name),
+                        preprocessor_commands,
+                    },
+                )
+            })
             .collect();
-        Ok(Self { collection_paths })
+        let config_mtime = config_mtime();
+        Ok(Self { collections, config_mtime })
     }
+
+    /// Reload if config.yml has been modified since last load.
+    fn reload_if_stale(&mut self) {
+        let mtime = config_mtime();
+        if mtime != self.config_mtime {
+            eprintln!("daemon: config changed, reloading");
+            match DaemonState::load() {
+                Ok(fresh) => *self = fresh,
+                Err(e) => eprintln!("daemon: config reload failed: {e}"),
+            }
+        }
+    }
+}
+
+fn config_mtime() -> SystemTime {
+    std::fs::metadata(config::config_path())
+        .and_then(|m| m.modified())
+        .unwrap_or(UNIX_EPOCH)
 }
 
 pub fn start_server(timeout_secs: u64) -> Result<()> {
@@ -221,7 +259,7 @@ pub fn start_server(timeout_secs: u64) -> Result<()> {
         expander_cache: None,
     };
 
-    let state = DaemonState::load()?;
+    let mut state = DaemonState::load()?;
 
     // Bind socket — tier-1 signal. Clients can connect for score-fusion queries now.
     let listener = UnixListener::bind(&sock_path)
@@ -310,6 +348,7 @@ pub fn start_server(timeout_secs: u64) -> Result<()> {
         match stream {
             Ok(s) => {
                 last_activity.store(unix_now(), Ordering::Relaxed);
+                state.reload_if_stale();
                 if let Err(e) = handle_connection(s, &hybrid, &state) {
                     eprintln!("connection error: {e}");
                 }
@@ -372,8 +411,8 @@ fn handle_request(
 
     let mode: SearchMode = req.mode.parse().map_err(Error::Other)?;
 
-    let selected: Vec<(&String, &PathBuf)> = req.collections.iter()
-        .filter_map(|name| state.collection_paths.get(name).map(|p| (name, p)))
+    let selected: Vec<(&String, &CollectionInfo)> = req.collections.iter()
+        .filter_map(|name| state.collections.get(name).map(|info| (name, info)))
         .collect();
 
     if selected.is_empty() {
@@ -384,7 +423,13 @@ fn handle_request(
 
     // Fresh RW connections per query — sees live index updates, enables cache writes.
     let dbs: Vec<CollectionDb> = selected.iter()
-        .map(|(name, path)| CollectionDb::open_rw(name.as_str(), path))
+        .map(|(name, info)| {
+            CollectionDb::open_rw(
+                name.as_str(),
+                &info.db_path,
+                info.preprocessor_commands.clone(),
+            )
+        })
         .collect::<Result<Vec<_>>>()?;
 
     let (results, log) = match mode {
