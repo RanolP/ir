@@ -6,6 +6,7 @@
 
 use crate::db::{CollectionDb, fts};
 use crate::error::Result;
+use crate::preprocess::preprocess_query;
 use crate::types::SearchResult;
 
 pub struct SearchRequest<'a> {
@@ -15,19 +16,19 @@ pub struct SearchRequest<'a> {
 }
 
 /// Run BM25 search across one or more collection DBs, merge and sort by score.
+/// Per-DB preprocessing is applied when the DB has configured preprocessor commands.
 /// Note: rusqlite::Connection is !Send, so we use sequential iteration here.
-/// In practice the common case is a single collection (no overhead).
 pub fn bm25(dbs: &[CollectionDb], req: &SearchRequest) -> Result<Vec<SearchResult>> {
-    let fts_query = fts::build_query(req.query);
-    if fts_query.is_empty() {
-        return Ok(vec![]);
-    }
-
     let results: Vec<Vec<SearchResult>> = dbs
         .iter()
         .map(|db| {
+            let preprocessed_query = preprocess_query(req.query, &db.preprocessor_commands);
+            let fts_query = fts::build_query(&preprocessed_query);
+            if fts_query.is_empty() {
+                return Ok(vec![]);
+            }
             let q = fts::BM25Query {
-                fts_query: fts_query.clone(),
+                fts_query,
                 collection: &db.name,
                 limit: req.limit * 2, // over-fetch to allow for merging
                 title_weight: None,
@@ -38,6 +39,7 @@ pub fn bm25(dbs: &[CollectionDb], req: &SearchRequest) -> Result<Vec<SearchResul
 
     merge_and_filter(results, req)
 }
+
 
 #[cfg(test)]
 mod tests {

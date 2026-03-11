@@ -4,8 +4,10 @@ pub mod embed;
 pub mod hasher;
 pub mod scanner;
 
+use crate::config::Config;
 use crate::db::CollectionDb;
 use crate::error::Result;
+use crate::preprocess::PreprocessChain;
 use crate::types::Collection;
 use chrono::Utc;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -33,11 +35,35 @@ pub fn update(
     db: &CollectionDb,
     collection: &Collection,
     opts: &UpdateOptions,
+    config: &Config,
 ) -> Result<(usize, usize, usize)> {
     let conn = db.conn();
 
+    // Resolve preprocessor aliases to command strings.
+    let pp_aliases = collection.preprocessor.as_deref().unwrap_or(&[]);
+    let pp_commands = config.resolve_preprocessor_commands(pp_aliases);
+    let has_preprocessor = !pp_commands.is_empty();
+
+    // Check stored has_preprocessor to detect migration.
+    let stored_has_preprocessor: bool = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'has_preprocessor'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+        .map(|v| v == "1")
+        .unwrap_or(false);
+
+    let force = opts.force || (stored_has_preprocessor != has_preprocessor);
+    if !opts.force && stored_has_preprocessor != has_preprocessor {
+        eprintln!(
+            "preprocessor config changed (was={stored_has_preprocessor}, now={has_preprocessor}) — forcing re-index"
+        );
+    }
+
     // 1. Load current DB state: {rel_path → hash}
-    if opts.force {
+    if force {
         // Wipe existing data so everything is re-indexed from scratch.
         conn.execute_batch(
             "DELETE FROM documents;
@@ -46,6 +72,8 @@ pub fn update(
              DELETE FROM vectors_vec;
              DELETE FROM llm_cache;",
         )?;
+        // Re-init schema with correct trigger state.
+        crate::db::schema::init(conn, &db.name, has_preprocessor)?;
     }
     let stored: HashMap<String, String> = {
         let mut stmt = conn.prepare("SELECT path, hash FROM documents WHERE active = 1")?;
@@ -79,15 +107,36 @@ pub fn update(
 
     pb.set_length((n_add + n_update + n_deactivate) as u64);
 
+    // Spawn preprocessor chain once for the whole batch.
+    let mut chain = if has_preprocessor {
+        let c = PreprocessChain::spawn(&pp_commands);
+        if !c.is_active() {
+            eprintln!("warning: all preprocessors failed to spawn — indexing raw text");
+        }
+        Some(c)
+    } else {
+        None
+    };
+
     // 5–7. Apply diff atomically so a crash leaves the DB consistent.
     conn.execute_batch("BEGIN IMMEDIATE")?;
-    let apply = || -> Result<()> {
+    let mut apply = || -> Result<()> {
         // 5. Deactivate removed files
         for rel_path in &d.to_deactivate {
-            conn.execute(
-                "UPDATE documents SET active = 0 WHERE path = ?1",
-                [rel_path],
-            )?;
+            if has_preprocessor {
+                // ! Triggers disabled — must manually remove from FTS.
+                let id: Option<i64> = conn
+                    .query_row("SELECT id FROM documents WHERE path = ?1", [rel_path], |r| {
+                        r.get(0)
+                    })
+                    .ok();
+                conn.execute("UPDATE documents SET active = 0 WHERE path = ?1", [rel_path])?;
+                if let Some(id) = id {
+                    conn.execute("DELETE FROM documents_fts WHERE rowid = ?1", [id])?;
+                }
+            } else {
+                conn.execute("UPDATE documents SET active = 0 WHERE path = ?1", [rel_path])?;
+            }
             pb.inc(1);
             pb.set_message(format!("deactivate {rel_path}"));
         }
@@ -102,7 +151,7 @@ pub fn update(
             let title = chunker::extract_title(&text, rel_path);
             let now = Utc::now().to_rfc3339();
 
-            store_document(conn, rel_path, &title, hash, &text, &now, &now)?;
+            store_document(conn, rel_path, &title, hash, &text, &now, &now, chain.as_mut())?;
             pb.inc(1);
             pb.set_message(format!("add {rel_path}"));
         }
@@ -124,8 +173,19 @@ pub fn update(
                 )
                 .unwrap_or_else(|_| now.clone());
 
+            if has_preprocessor {
+                // ! Triggers disabled — must manually remove from FTS before delete.
+                let id: Option<i64> = conn
+                    .query_row("SELECT id FROM documents WHERE path = ?1", [rel_path], |r| {
+                        r.get(0)
+                    })
+                    .ok();
+                if let Some(id) = id {
+                    conn.execute("DELETE FROM documents_fts WHERE rowid = ?1", [id])?;
+                }
+            }
             conn.execute("DELETE FROM documents WHERE path = ?1", [rel_path])?;
-            store_document(conn, rel_path, &title, hash, &text, &created_at, &now)?;
+            store_document(conn, rel_path, &title, hash, &text, &created_at, &now, chain.as_mut())?;
             pb.inc(1);
             pb.set_message(format!("update {rel_path}"));
         }
@@ -152,6 +212,7 @@ fn store_document(
     text: &str,
     created_at: &str,
     modified_at: &str,
+    chain: Option<&mut PreprocessChain>,
 ) -> Result<()> {
     // Upsert content (content-addressed, may already exist from another file)
     conn.execute(
@@ -164,6 +225,18 @@ fn store_document(
          VALUES (?1, ?2, ?3, ?4, ?5, 1)",
         rusqlite::params![rel_path, title, hash, created_at, modified_at],
     )?;
+
+    // When chain is active, triggers are disabled — explicitly insert preprocessed text into FTS.
+    if let Some(chain) = chain {
+        if chain.is_active() {
+            let rowid = conn.last_insert_rowid();
+            let processed = chain.process_text(text)?;
+            conn.execute(
+                "INSERT INTO documents_fts(rowid, path, title, body) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![rowid, rel_path, title, processed],
+            )?;
+        }
+    }
 
     Ok(())
 }

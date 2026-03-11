@@ -41,12 +41,16 @@ pub fn ensure_sqlite_vec() {
 
 pub struct CollectionDb {
     pub name: String,
+    /// Resolved preprocessor command strings for this collection (e.g. ["kiwi-tokenize", "mecab -Owakati"]).
+    /// Empty if no preprocessing is configured. Used at query time to spawn a PreprocessChain.
+    pub preprocessor_commands: Vec<String>,
     conn: Connection,
 }
 
 impl CollectionDb {
     /// Open (or create) a collection DB at the given path with read-write access.
-    pub fn open(name: impl Into<String>, db_path: &Path) -> Result<Self> {
+    /// `has_preprocessor` controls whether FTS triggers are installed in the schema.
+    pub fn open(name: impl Into<String>, db_path: &Path, has_preprocessor: bool) -> Result<Self> {
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -61,14 +65,19 @@ impl CollectionDb {
         configure(&conn)?;
 
         let name = name.into();
-        schema::init(&conn, &name)?;
+        schema::init(&conn, &name, has_preprocessor)?;
 
-        Ok(Self { name, conn })
+        Ok(Self { name, preprocessor_commands: vec![], conn })
     }
 
     /// Open an existing collection DB with read-write access (no schema init).
     /// Use for search paths that need cache writes.
-    pub fn open_rw(name: impl Into<String>, db_path: &Path) -> Result<Self> {
+    /// `preprocessor_commands` are the resolved command strings for query-time preprocessing.
+    pub fn open_rw(
+        name: impl Into<String>,
+        db_path: &Path,
+        preprocessor_commands: Vec<String>,
+    ) -> Result<Self> {
         ensure_sqlite_vec();
 
         let conn = Connection::open_with_flags(
@@ -80,6 +89,7 @@ impl CollectionDb {
 
         Ok(Self {
             name: name.into(),
+            preprocessor_commands,
             conn,
         })
     }

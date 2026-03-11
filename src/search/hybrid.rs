@@ -17,6 +17,7 @@ use crate::llm::{
     expander::{QueryExpander, SubQuery, SubQueryKind, fallback},
     scoring::Scorer,
 };
+use crate::preprocess::preprocess_query;
 use crate::search::rrf::{self, RankedList};
 use crate::types::SearchResult;
 use rusqlite::Connection;
@@ -186,6 +187,20 @@ fn score_fusion_two_list(
     log: &mut Logger,
 ) -> Result<Vec<SearchResult>> {
     let fetch_n = req.limit * 3;
+    // Log preprocessor chain usage for each collection.
+    if log.verbose {
+        for db in dbs {
+            if db.preprocessor_commands.is_empty() {
+                log.log.push(format!("[preprocessor] {}: none", db.name));
+            } else {
+                log.log.push(format!(
+                    "[preprocessor] {}: {}",
+                    db.name,
+                    db.preprocessor_commands.join(" | ")
+                ));
+            }
+        }
+    }
     let bm25_list = bm25_across(dbs, req.query, fetch_n)?;
     let t0 = Instant::now();
     let emb = embedder.embed_query(req.query)?;
@@ -307,14 +322,15 @@ fn rrf_from_subqueries(
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 fn bm25_across(dbs: &[CollectionDb], query: &str, limit: usize) -> Result<Vec<SearchResult>> {
-    let fts_query = fts::build_query(query);
-    if fts_query.is_empty() {
-        return Ok(vec![]);
-    }
     dbs.iter()
         .map(|db| {
+            let preprocessed = preprocess_query(query, &db.preprocessor_commands);
+            let fts_query = fts::build_query(&preprocessed);
+            if fts_query.is_empty() {
+                return Ok(vec![]);
+            }
             let q = fts::BM25Query {
-                fts_query: fts_query.clone(),
+                fts_query,
                 collection: &db.name,
                 limit,
                 title_weight: None,
@@ -324,6 +340,7 @@ fn bm25_across(dbs: &[CollectionDb], query: &str, limit: usize) -> Result<Vec<Se
         .collect::<Result<Vec<Vec<_>>>>()
         .map(|vv| vv.into_iter().flatten().collect())
 }
+
 
 fn vec_across(dbs: &[CollectionDb], embedding: &[f32], limit: usize) -> Result<Vec<SearchResult>> {
     dbs.iter()

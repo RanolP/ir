@@ -216,8 +216,8 @@ mod tests {
     fn open_test_db() -> Connection {
         crate::db::ensure_sqlite_vec();
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(include_str!("../db/schema.sql"))
-            .unwrap();
+        conn.execute_batch(include_str!("../db/schema_base.sql")).unwrap();
+        conn.execute_batch(include_str!("../db/schema_triggers.sql")).unwrap();
         conn
     }
 
@@ -275,7 +275,7 @@ mod tests {
         use crate::db::CollectionDb;
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.sqlite");
-        let db = CollectionDb::open("test", &db_path).unwrap();
+        let db = CollectionDb::open("test", &db_path, false).unwrap();
         let conn = db.conn();
 
         let hash = "testhash";

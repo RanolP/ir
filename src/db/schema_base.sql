@@ -16,33 +16,13 @@ CREATE TABLE IF NOT EXISTS documents (
     active      INTEGER NOT NULL DEFAULT 1
 );
 
--- Full-text search index
+-- Full-text search index (porter unicode61: English stemming + Unicode normalization)
+-- FTS tokenizer is always porter unicode61 regardless of preprocessor.
+-- Preprocessors handle CJK morphology before this stage; porter handles English stemming.
 CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
     path, title, body,
     tokenize='porter unicode61'
 );
-
--- Sync FTS on insert
-CREATE TRIGGER IF NOT EXISTS documents_ai AFTER INSERT ON documents BEGIN
-    INSERT INTO documents_fts(rowid, path, title, body)
-    SELECT new.id, new.path, new.title, c.doc
-    FROM content c WHERE c.hash = new.hash;
-END;
-
--- Sync FTS on delete
-CREATE TRIGGER IF NOT EXISTS documents_ad AFTER DELETE ON documents BEGIN
-    DELETE FROM documents_fts WHERE rowid = old.id;
-END;
-
--- Sync FTS on update: only re-insert when the document is active.
--- Deactivation (active→0) deletes from FTS without re-inserting.
-DROP TRIGGER IF EXISTS documents_au;
-CREATE TRIGGER documents_au AFTER UPDATE ON documents BEGIN
-    DELETE FROM documents_fts WHERE rowid = old.id;
-    INSERT INTO documents_fts(rowid, path, title, body)
-    SELECT new.id, new.path, new.title, c.doc
-    FROM content c WHERE c.hash = new.hash AND new.active = 1;
-END;
 
 -- Vector embeddings (sqlite-vec)
 CREATE VIRTUAL TABLE IF NOT EXISTS vectors_vec USING vec0(
