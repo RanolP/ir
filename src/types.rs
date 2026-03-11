@@ -10,6 +10,10 @@ pub struct Collection {
     pub excludes: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Preprocessor aliases to apply (in order) before FTS indexing and query time.
+    /// Each alias must be registered in config.preprocessors.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preprocessor: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

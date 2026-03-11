@@ -7,6 +7,7 @@ pub use context::detect_collection;
 use crate::error::{Error, Result};
 use crate::types::Collection;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 
@@ -14,6 +15,9 @@ use std::path::PathBuf;
 pub struct Config {
     #[serde(default)]
     pub collections: Vec<Collection>,
+    /// alias → command string (e.g. "ko" → "kiwi-tokenize", "ja" → "mecab -Owakati")
+    #[serde(default)]
+    pub preprocessors: HashMap<String, String>,
 }
 
 impl Config {
@@ -71,6 +75,38 @@ impl Config {
         Ok(())
     }
 
+    pub fn add_preprocessor(&mut self, alias: &str, command: &str) -> Result<()> {
+        if alias.is_empty() || alias.contains(' ') {
+            return Err(Error::Other(format!("invalid preprocessor alias: {alias:?}")));
+        }
+        self.preprocessors.insert(alias.to_string(), command.to_string());
+        Ok(())
+    }
+
+    pub fn remove_preprocessor(&mut self, alias: &str) -> Result<()> {
+        if self.preprocessors.remove(alias).is_none() {
+            return Err(Error::Other(format!("preprocessor alias not found: {alias:?}")));
+        }
+        Ok(())
+    }
+
+    /// Resolve a list of alias names to their command strings.
+    /// Aliases not found in the registry are skipped with a warning.
+    pub fn resolve_preprocessor_commands(&self, aliases: &[String]) -> Vec<String> {
+        aliases
+            .iter()
+            .filter_map(|alias| {
+                match self.preprocessors.get(alias) {
+                    Some(cmd) => Some(cmd.clone()),
+                    None => {
+                        eprintln!("warning: preprocessor alias '{alias}' not found — skipping");
+                        None
+                    }
+                }
+            })
+            .collect()
+    }
+
     pub fn rename_collection(&mut self, old: &str, new: &str) -> Result<()> {
         validate_collection_name(new)?;
         if self.get_collection(new).is_some() {
@@ -88,7 +124,7 @@ impl Config {
 
 /// Base directory for all ir state: $XDG_CONFIG_HOME/ir or ~/.config/ir.
 /// Consistent across platforms; avoids platform-specific paths like ~/Library.
-pub(crate) fn ir_dir() -> PathBuf {
+pub fn ir_dir() -> PathBuf {
     std::env::var("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
@@ -146,6 +182,7 @@ mod tests {
             globs: vec![],
             excludes: vec![],
             description: None,
+            preprocessor: None,
         }
     }
 

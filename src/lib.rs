@@ -4,5 +4,6 @@ pub mod db;
 pub mod error;
 pub mod index;
 pub mod llm;
+pub mod preprocess;
 pub mod search;
 pub mod types;
