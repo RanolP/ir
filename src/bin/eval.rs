@@ -24,6 +24,7 @@ use std::path::{Path, PathBuf};
 use ir_search::db::{fts, schema, vectors};
 use ir_search::error::{Error, Result};
 use ir_search::index::{chunker, hasher};
+use ir_search::preprocess::PreprocessChain;
 use ir_search::llm::{
     embedding::{Embedder, EmbeddingPooling},
     expander::{Expander, SubQueryKind},
@@ -70,6 +71,7 @@ struct Args {
     max_queries: Option<usize>,
     rrf_no_expander: bool,
     title_weight: f64,
+    preprocessor: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -111,6 +113,7 @@ fn parse_args() -> Args {
     let mut max_queries: Option<usize> = None;
     let mut rrf_no_expander = false;
     let mut title_weight = 1.0f64;
+    let mut preprocessor: Option<String> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -301,6 +304,12 @@ fn parse_args() -> Args {
                     title_weight = args[i].parse().expect("--title-weight must be a number");
                 }
             }
+            "--preprocessor" => {
+                i += 1;
+                if i < args.len() {
+                    preprocessor = Some(args[i].clone());
+                }
+            }
             "--help" | "-h" => {
                 println!(
                     "Usage: eval [--data DIR] [--limit K] [--mode bm25|vector|hybrid|all] \
@@ -311,7 +320,7 @@ fn parse_args() -> Args {
                      [--rrf-lex-weight W] [--rrf-vec-weight W] [--rrf-hyde-weight W] \
                      [--prf] [--prf-weight W] [--prf-docs N] [--prf-terms N] \
                      [--tune-alpha] [--tune-rerank] [--chunk-size TOKENS] [--max-docs N] [--max-queries N] \
-                     [--rrf-no-expander] [--title-weight W]"
+                     [--rrf-no-expander] [--title-weight W] [--preprocessor CMD]"
                 );
                 std::process::exit(0);
             }
@@ -350,6 +359,7 @@ fn parse_args() -> Args {
         max_queries,
         rrf_no_expander,
         title_weight,
+        preprocessor,
     }
 }
 
@@ -473,10 +483,11 @@ fn eval_run_key(args: &Args) -> String {
         .or_else(|_| std::env::var("QMD_RERANKER_MODEL"))
         .unwrap_or_default();
     let qwen_model = std::env::var("IR_QWEN_MODEL").unwrap_or_default();
+    let pp = args.preprocessor.as_deref().unwrap_or("");
     format!(
         "embed={embed_model}|expander={expander_model}|reranker={reranker_model}|qwen={qwen_model}|\
          alpha={:.4}|chunk={:?}|rerank={},w={:.3},n={}|expander_on={}|prf={}|alpha_norm={:.3}|\
-         rrf_k={:.1},lex={:.2},vec={:.2},hyde={:.2}|title_w={:.2}",
+         rrf_k={:.1},lex={:.2},vec={:.2},hyde={:.2}|title_w={:.2}|pp={pp}",
         args.alpha,
         args.chunk_size_tokens,
         args.use_rerank,
@@ -493,7 +504,11 @@ fn eval_run_key(args: &Args) -> String {
     )
 }
 
-fn index_corpus(conn: &Connection, docs: &[CorpusDoc]) -> Result<()> {
+fn index_corpus(
+    conn: &Connection,
+    docs: &[CorpusDoc],
+    mut chain: Option<&mut PreprocessChain>,
+) -> Result<()> {
     let now = "2024-01-01T00:00:00Z";
 
     for doc in docs {
@@ -506,11 +521,23 @@ fn index_corpus(conn: &Connection, docs: &[CorpusDoc]) -> Result<()> {
         )?;
 
         // path = doc_id so search results expose the BEIR corpus id
-        conn.execute(
+        let n_changed = conn.execute(
             "INSERT OR IGNORE INTO documents (path, title, hash, created_at, modified_at, active)
              VALUES (?1, ?2, ?3, ?4, ?5, 1)",
             rusqlite::params![doc.id, doc.title, hash, now, now],
         )?;
+
+        // When chain is active, FTS triggers are disabled — insert preprocessed text explicitly.
+        if let Some(ch) = chain.as_deref_mut() {
+            if ch.is_active() && n_changed > 0 {
+                let rowid = conn.last_insert_rowid();
+                let processed = ch.process_text(&text)?;
+                conn.execute(
+                    "INSERT INTO documents_fts(rowid, path, title, body) VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params![rowid, doc.id, doc.title, processed],
+                )?;
+            }
+        }
     }
 
     Ok(())
@@ -744,8 +771,20 @@ fn recall_at_k(ranked: &[String], relevant: &HashMap<String, u32>, k: usize) -> 
 
 // ── Search ────────────────────────────────────────────────────────────────────
 
-fn bm25_search(conn: &Connection, query: &str, limit: usize, title_weight: f64) -> Vec<SearchResult> {
-    let fts_query = fts::build_query(query);
+fn bm25_search(
+    conn: &Connection,
+    query: &str,
+    limit: usize,
+    title_weight: f64,
+    chain: Option<&mut PreprocessChain>,
+) -> Vec<SearchResult> {
+    let effective_query = match chain {
+        Some(ch) if ch.is_active() => {
+            ch.process_text(query).unwrap_or_else(|_| query.to_string())
+        }
+        _ => query.to_string(),
+    };
+    let fts_query = fts::build_query(&effective_query);
     if fts_query.is_empty() {
         return vec![];
     }
@@ -824,9 +863,10 @@ fn hybrid_search(
     embedder: &Embedder,
     expander: Option<&Expander>,
     cfg: &HybridConfig,
+    mut chain: Option<&mut PreprocessChain>,
 ) -> HybridRun {
     let fetch_n = limit * 3;
-    let bm25_results = bm25_search(conn, query, fetch_n, cfg.title_weight);
+    let bm25_results = bm25_search(conn, query, fetch_n, cfg.title_weight, chain.as_deref_mut());
     let vec_results = vector_search_from_embedding(conn, query_embedding, fetch_n);
 
     let alpha = if cfg.adaptive_alpha {
@@ -853,6 +893,7 @@ fn hybrid_search(
                 alpha,
                 &bm25_results,
                 &vec_results,
+                chain,
             )
         } else if cfg.rrf_no_expander {
             rrf_fuse_weighted(
@@ -929,6 +970,7 @@ fn expanded_fusion(
     alpha: f64,
     fallback_bm25: &[SearchResult],
     fallback_vec: &[SearchResult],
+    mut chain: Option<&mut PreprocessChain>,
 ) -> Vec<SearchResult> {
     let sub_queries = expander
         .expand(query)
@@ -946,7 +988,7 @@ fn expanded_fusion(
                 };
 
                 let results = match sub.kind {
-                    SubQueryKind::Lex => bm25_search(conn, &sub.text, fetch_n, cfg.title_weight),
+                    SubQueryKind::Lex => bm25_search(conn, &sub.text, fetch_n, cfg.title_weight, chain.as_deref_mut()),
                     SubQueryKind::Vec | SubQueryKind::Hyde => {
                         if let Ok(embedding) = embedder.embed_query(&sub.text) {
                             vector_search_from_embedding(conn, &embedding, fetch_n)
@@ -978,7 +1020,7 @@ fn expanded_fusion(
                 };
                 match sub.kind {
                     SubQueryKind::Lex => {
-                        let mut results = bm25_search(conn, &sub.text, fetch_n, cfg.title_weight);
+                        let mut results = bm25_search(conn, &sub.text, fetch_n, cfg.title_weight, chain.as_deref_mut());
                         results.iter_mut().for_each(|r| r.score *= weight);
                         bm25_pool.extend(results);
                     }
@@ -1107,11 +1149,14 @@ fn fuse_linear(
     merged
 }
 
-fn build_term_stats(doc_texts: &HashMap<String, String>) -> TermStats {
+fn build_term_stats(
+    doc_texts: &HashMap<String, String>,
+    mut chain: Option<&mut PreprocessChain>,
+) -> TermStats {
     let mut df: HashMap<String, usize> = HashMap::new();
     for text in doc_texts.values() {
         let mut seen: HashMap<String, bool> = HashMap::new();
-        for term in tokenize_terms(text) {
+        for term in tokenize_terms(text, chain.as_deref_mut()) {
             seen.insert(term, true);
         }
         for term in seen.into_keys() {
@@ -1124,7 +1169,25 @@ fn build_term_stats(doc_texts: &HashMap<String, String>) -> TermStats {
     }
 }
 
-fn tokenize_terms(text: &str) -> Vec<String> {
+fn tokenize_terms(text: &str, chain: Option<&mut PreprocessChain>) -> Vec<String> {
+    if let Some(ch) = chain {
+        if ch.is_active() {
+            let processed = ch.process_text(text).unwrap_or_else(|_| text.to_string());
+            return processed
+                .split_whitespace()
+                .filter_map(|token| {
+                    let term = token.trim().to_lowercase();
+                    if term.is_empty()
+                        || (term.is_ascii() && (term.len() < 2 || is_stopword(&term)))
+                    {
+                        None
+                    } else {
+                        Some(term)
+                    }
+                })
+                .collect();
+        }
+    }
     text.split(|c: char| !c.is_ascii_alphanumeric())
         .filter_map(|token| {
             let term = token.trim().to_ascii_lowercase();
@@ -1198,8 +1261,9 @@ fn prf_expand_query(
     term_stats: &TermStats,
     top_docs: usize,
     top_terms: usize,
+    mut chain: Option<&mut PreprocessChain>,
 ) -> Option<String> {
-    let query_terms: HashMap<String, bool> = tokenize_terms(query)
+    let query_terms: HashMap<String, bool> = tokenize_terms(query, chain.as_deref_mut())
         .into_iter()
         .map(|t| (t, true))
         .collect();
@@ -1209,7 +1273,7 @@ fn prf_expand_query(
         let Some(text) = doc_texts.get(&result.path) else {
             continue;
         };
-        for term in tokenize_terms(text) {
+        for term in tokenize_terms(text, chain.as_deref_mut()) {
             if query_terms.contains_key(&term) {
                 continue;
             }
@@ -1252,6 +1316,7 @@ fn apply_prf(
     doc_texts: &HashMap<String, String>,
     term_stats: &TermStats,
     prf: PrfConfig,
+    chain: Option<&mut PreprocessChain>,
 ) -> Vec<SearchResult> {
     let Some(expanded_query) = prf_expand_query(
         query,
@@ -1260,11 +1325,13 @@ fn apply_prf(
         term_stats,
         prf.top_docs,
         prf.top_terms,
+        chain,
     ) else {
         return base_results.to_vec();
     };
 
-    let prf_results = bm25_search(conn, &expanded_query, limit * 3, 1.0);
+    // Expanded query contains already-tokenized morphemes; skip chain re-processing.
+    let prf_results = bm25_search(conn, &expanded_query, limit * 3, 1.0, None);
     let primary_weight = (1.0 - prf.weight).clamp(0.0, 1.0);
     let secondary_weight = prf.weight.clamp(0.0, 1.0);
     fuse_linear(
@@ -1393,6 +1460,7 @@ fn evaluate_bm25(
     qrels: &Qrels,
     k: usize,
     run_key: &str,
+    mut chain: Option<&mut PreprocessChain>,
 ) -> EvalResult {
     let cached = load_cached_results(conn, run_key, "bm25");
     let n_cached = cached.len();
@@ -1417,7 +1485,7 @@ fn evaluate_bm25(
     for (i, q) in pending.iter().enumerate() {
         maybe_log_query_progress("bm25", i + n_cached, queries.len());
         let Some(relevant) = qrels.get(&q.id) else { continue; };
-        let results = bm25_search(conn, &q.text, k, 1.0);
+        let results = bm25_search(conn, &q.text, k, 1.0, chain.as_deref_mut());
         let ranked: Vec<String> = results.iter().map(|r| r.path.clone()).collect();
         let ndcg = ndcg_at_k(&ranked, relevant, k);
         let recall = recall_at_k(&ranked, relevant, k);
@@ -1502,6 +1570,7 @@ fn evaluate_hybrid(
     doc_texts: &HashMap<String, String>,
     mode_name: &'static str,
     run_key: &str,
+    mut chain: Option<&mut PreprocessChain>,
 ) -> EvalResult {
     let cached = load_cached_results(conn, run_key, mode_name);
     let n_cached = cached.len();
@@ -1540,6 +1609,7 @@ fn evaluate_hybrid(
             embedder,
             expander,
             hybrid_cfg,
+            chain.as_deref_mut(),
         );
 
         if let Some(prf_cfg) = hybrid_cfg.prf {
@@ -1552,6 +1622,7 @@ fn evaluate_hybrid(
                 doc_texts,
                 term_stats,
                 prf_cfg,
+                chain.as_deref_mut(),
             );
         }
 
@@ -1602,6 +1673,7 @@ fn tune_score_fusion(
     reranker: Option<&Reranker>,
     rerank_weight: f64,
     rerank_top_n: usize,
+    mut chain: Option<&mut PreprocessChain>,
 ) {
     println!("\n── Score-fusion tuning (α*vec + (1-α)*bm25) ──────────────────");
     println!("{:<8}  {:>10}  {:>12}", "alpha", "nDCG@10", "Recall@10");
@@ -1631,6 +1703,7 @@ fn tune_score_fusion(
             doc_texts,
             "hybrid",
             &tune_key,
+            chain.as_deref_mut(),
         );
         let ndcg = r.ndcg;
         let recall = r.recall;
@@ -1661,6 +1734,7 @@ fn tune_rerank_blend(
     reranker: &Reranker,
     rerank_top_n: usize,
     doc_texts: &HashMap<String, String>,
+    mut chain: Option<&mut PreprocessChain>,
 ) {
     println!("\n── Reranker blend tuning ───────────────────────────────────────");
     println!(
@@ -1690,6 +1764,7 @@ fn tune_rerank_blend(
             doc_texts,
             "hybrid-rerank",
             &tune_key,
+            chain.as_deref_mut(),
         );
         println!(
             "{:<14}  {:>10.4}  {:>12.4}",
@@ -1818,8 +1893,18 @@ fn main() -> Result<()> {
         .to_string();
 
     // If cache_db was not explicitly set, derive from corpus name.
+    // Each preprocessor gets its own DB — mixing them contaminates FTS via INSERT OR IGNORE.
     let cache_db = if args.cache_db == PathBuf::from("test-data/nfcorpus-eval.sqlite") {
-        PathBuf::from(format!("test-data/{corpus_name}-eval.sqlite"))
+        match &args.preprocessor {
+            Some(pp) => {
+                let pp_name = Path::new(pp)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("pp");
+                PathBuf::from(format!("test-data/{corpus_name}-eval-{pp_name}.sqlite"))
+            }
+            None => PathBuf::from(format!("test-data/{corpus_name}-eval.sqlite")),
+        }
     } else {
         args.cache_db.clone()
     };
@@ -1840,6 +1925,16 @@ fn main() -> Result<()> {
         }
     }
 
+    let mut preprocess_chain: Option<PreprocessChain> = args
+        .preprocessor
+        .as_ref()
+        .map(|cmd| PreprocessChain::spawn(&[cmd.clone()]));
+    if let Some(ref ch) = preprocess_chain {
+        if ch.is_active() {
+            println!("preprocessor: {}", args.preprocessor.as_deref().unwrap_or(""));
+        }
+    }
+
     println!("loading corpus...");
     let mut corpus = load_corpus(&corpus_path)?;
     if let Some(max_docs) = args.max_docs {
@@ -1848,7 +1943,11 @@ fn main() -> Result<()> {
     println!("  {} documents", corpus.len());
     let doc_texts: HashMap<String, String> =
         corpus.iter().map(|d| (d.id.clone(), doc_text(d))).collect();
-    let term_stats = build_term_stats(&doc_texts);
+    // Only run corpus through the preprocessor for term stats when PRF is active.
+    // Without PRF, term stats are unused for BM25 and running 9k+ docs through the
+    // chain would exhaust the subprocess before indexing.
+    let prf_chain = if args.use_prf { preprocess_chain.as_mut() } else { None };
+    let term_stats = build_term_stats(&doc_texts, prf_chain);
 
     println!("loading queries...");
     let all_queries = load_queries(&queries_path)?;
@@ -1919,9 +2018,10 @@ fn main() -> Result<()> {
          PRAGMA cache_size   = -64000;
          PRAGMA foreign_keys = ON;",
     )?;
-    schema::init(&conn, &corpus_name)?;
+    let has_preprocessor = preprocess_chain.as_ref().map_or(false, |ch| ch.is_active());
+    schema::init(&conn, &corpus_name, has_preprocessor)?;
     ensure_eval_cache_schema(&conn)?;
-    index_corpus(&conn, &corpus)?;
+    index_corpus(&conn, &corpus, preprocess_chain.as_mut())?;
     println!("  done\n");
 
     let needs_embedder = matches!(
@@ -2048,7 +2148,7 @@ fn main() -> Result<()> {
     if matches!(args.mode, EvalMode::Bm25 | EvalMode::All) {
         print!("evaluating bm25 ({} queries)... ", queries.len());
         let _ = std::io::stdout().flush();
-        results.push(evaluate_bm25(&conn, &queries, &qrels, k, &run_key));
+        results.push(evaluate_bm25(&conn, &queries, &qrels, k, &run_key, preprocess_chain.as_mut()));
         println!("done");
     }
 
@@ -2100,6 +2200,7 @@ fn main() -> Result<()> {
                 &doc_texts,
                 mode_name,
                 &run_key,
+                preprocess_chain.as_mut(),
             ));
             println!("done");
 
@@ -2169,6 +2270,7 @@ fn main() -> Result<()> {
                     reranker_ref,
                     args.rerank_weight,
                     args.rerank_top_n,
+                    preprocess_chain.as_mut(),
                 );
             }
 
@@ -2187,6 +2289,7 @@ fn main() -> Result<()> {
                         r,
                         args.rerank_top_n,
                         &doc_texts,
+                        preprocess_chain.as_mut(),
                     );
                 } else {
                     println!("\n── Reranker blend tuning ───────────────────────────────────────");
