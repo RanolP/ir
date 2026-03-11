@@ -5,11 +5,12 @@ mod db;
 mod error;
 mod index;
 mod llm;
+mod preprocess;
 mod search;
 mod types;
 
 use clap::Parser;
-use cli::{Cli, CollectionCmd, Command, DaemonCmd, output};
+use cli::{Cli, CollectionCmd, Command, DaemonCmd, PreprocessorCmd, output};
 use config::{Config, collection_db_path};
 use error::Result;
 use types::{Collection, SearchMode};
@@ -63,6 +64,7 @@ fn run() -> Result<()> {
             DaemonCmd::Stop => daemon::stop(),
             DaemonCmd::Status => daemon::status(),
         },
+        Command::Preprocessor { cmd } => handle_preprocessor(cmd),
     }
 }
 
@@ -75,7 +77,16 @@ fn handle_collection(cmd: CollectionCmd) -> Result<()> {
             glob,
             exclude,
             description,
+            preprocessor,
         } => {
+            // Validate aliases before mutating config.
+            for alias in &preprocessor {
+                if !config.preprocessors.contains_key(alias.as_str()) {
+                    return Err(error::Error::Other(format!(
+                        "preprocessor alias '{alias}' not registered. Run: ir preprocessor add {alias} <command>"
+                    )));
+                }
+            }
             let resolved = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone().into());
             config.add_collection(Collection {
                 name: name.clone(),
@@ -83,6 +94,7 @@ fn handle_collection(cmd: CollectionCmd) -> Result<()> {
                 globs: glob,
                 excludes: exclude,
                 description,
+                preprocessor: if preprocessor.is_empty() { None } else { Some(preprocessor) },
             })?;
             config.save()?;
             println!("added collection '{name}'");
@@ -209,7 +221,9 @@ fn handle_search(
         .filter_map(|name| config.get_collection(name))
         .collect();
     let dbs: Vec<db::CollectionDb> = cols.iter()
-        .map(|c| db::CollectionDb::open_rw(&c.name, &collection_db_path(&c.name)))
+        .map(|c| {
+            db::CollectionDb::open_rw(&c.name, &collection_db_path(&c.name))
+        })
         .collect::<Result<Vec<_>>>()?;
 
     // Tier-0: BM25 in-process, no model needed.
@@ -352,6 +366,109 @@ fn resolve_collections(config: &Config, filter: &[String]) -> Result<Vec<String>
         }
         Ok(filter.to_vec())
     }
+}
+
+fn handle_preprocessor(cmd: PreprocessorCmd) -> Result<()> {
+    let mut config = Config::load()?;
+    match cmd {
+        PreprocessorCmd::Add { alias, command } => {
+            if command.is_empty() {
+                return Err(error::Error::Other("command must not be empty".into()));
+            }
+            let cmd_str = command.join(" ");
+            config.add_preprocessor(&alias, &cmd_str)?;
+            config.save()?;
+            println!("registered preprocessor '{alias}': {cmd_str}");
+        }
+        PreprocessorCmd::Install { lang } => {
+            install_preprocessor(&mut config, &lang)?;
+        }
+        PreprocessorCmd::List => {
+            if config.preprocessors.is_empty() {
+                println!("no preprocessors registered");
+            } else {
+                let mut entries: Vec<_> = config.preprocessors.iter().collect();
+                entries.sort_by_key(|(k, _)| k.as_str());
+                for (alias, cmd) in entries {
+                    println!("{:<12} {}", alias, cmd);
+                }
+            }
+        }
+        PreprocessorCmd::Remove { alias } => {
+            config.remove_preprocessor(&alias)?;
+            config.save()?;
+            println!("removed preprocessor '{alias}'");
+        }
+    }
+    Ok(())
+}
+
+/// Download/install a bundled preprocessor and register it.
+fn install_preprocessor(config: &mut Config, lang: &str) -> Result<()> {
+    enum Kind { Script { repo_subdir: &'static str, script_name: &'static str }, Cargo { crate_name: &'static str } }
+    struct Entry { alias: &'static str, kind: Kind }
+
+    let known: &[Entry] = &[
+        Entry { alias: "ko-kiwi",    kind: Kind::Script { repo_subdir: "ko", script_name: "kiwi-tokenize" } },
+        Entry { alias: "ko-mecab",   kind: Kind::Script { repo_subdir: "ko", script_name: "mecab-tokenize" } },
+        Entry { alias: "ko-lindera", kind: Kind::Cargo  { crate_name: "lindera-tokenize" } },
+        Entry { alias: "ja",         kind: Kind::Script { repo_subdir: "ja", script_name: "mecab-tokenize" } },
+    ];
+
+    let entry = known
+        .iter()
+        .find(|e| e.alias == lang)
+        .ok_or_else(|| error::Error::Other(
+            format!("unknown lang '{lang}'. Available: ko-kiwi, ko-mecab, ko-lindera, ja")
+        ))?;
+
+    let cmd_str = match &entry.kind {
+        Kind::Script { repo_subdir, script_name } => {
+            let install_dir = config::ir_dir().join("preprocessors").join(repo_subdir);
+            std::fs::create_dir_all(&install_dir)?;
+            let script_path = install_dir.join(script_name);
+            let url = format!(
+                "https://raw.githubusercontent.com/vlwkaos/ir/korean/preprocessors/{repo_subdir}/{script_name}"
+            );
+            let status = std::process::Command::new("curl")
+                .args(["-fsSL", &url, "-o", &script_path.to_string_lossy()])
+                .status()
+                .map_err(|e| error::Error::Other(format!("curl: {e}")))?;
+            if !status.success() {
+                return Err(error::Error::Other(format!(
+                    "download failed. Install manually to {}", script_path.display()
+                )));
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))
+                    .map_err(error::Error::Io)?;
+            }
+            script_path.to_string_lossy().into_owned()
+        }
+        Kind::Cargo { crate_name } => {
+            // Installs binary to ~/.cargo/bin/<crate_name>.
+            // Requires: cargo install <crate_name> (published on crates.io).
+            let status = std::process::Command::new("cargo")
+                .args(["install", crate_name])
+                .status()
+                .map_err(|e| error::Error::Other(format!("cargo: {e}")))?;
+            if !status.success() {
+                return Err(error::Error::Other(format!(
+                    "cargo install {crate_name} failed. Build manually:\n  cd preprocessors/ko/lindera-tokenize && cargo build --release\n  ir preprocessor add ko-lindera ./target/release/{crate_name}"
+                )));
+            }
+            // Binary lands in ~/.cargo/bin/ which is on PATH; register by name.
+            crate_name.to_string()
+        }
+    };
+
+    let alias = entry.alias;
+    config.add_preprocessor(alias, &cmd_str)?;
+    config.save()?;
+    println!("installed '{alias}' preprocessor → {cmd_str}");
+    Ok(())
 }
 
 fn handle_embed(collection: Option<String>, force: bool) -> Result<()> {

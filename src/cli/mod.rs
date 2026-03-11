@@ -87,6 +87,11 @@ pub enum Command {
         #[command(subcommand)]
         cmd: DaemonCmd,
     },
+    /// Manage text preprocessors for CJK / morphological analysis
+    Preprocessor {
+        #[command(subcommand)]
+        cmd: PreprocessorCmd,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -118,6 +123,9 @@ pub enum CollectionCmd {
         /// Short description
         #[arg(long)]
         description: Option<String>,
+        /// Preprocessor alias(es) for BM25/FTS5 tokenization (registered via `ir preprocessor add`)
+        #[arg(long = "preprocessor", short = 'p')]
+        preprocessor: Vec<String>,
     },
     /// Remove a collection (keeps DB file by default)
     Rm {
@@ -132,4 +140,27 @@ pub enum CollectionCmd {
     Ls,
     /// Update the source path of a collection
     SetPath { name: String, path: String },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum PreprocessorCmd {
+    /// Register a preprocessor alias
+    Add {
+        /// Alias name (e.g. "ko")
+        alias: String,
+        /// Command to run (e.g. "kiwi-tokenize" or "mecab -Owakati")
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
+    },
+    /// Download and register a bundled preprocessor wrapper
+    Install {
+        /// Language code to install (ko, ja)
+        lang: String,
+    },
+    /// List registered preprocessors
+    List,
+    /// Remove a preprocessor alias
+    Remove {
+        alias: String,
+    },
 }
