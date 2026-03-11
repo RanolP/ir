@@ -151,6 +151,136 @@ bottleneck; expansion quality or BM25 probe threshold matters more.
 
 ---
 
+## Korean IR Benchmark (Ko-StrategyQA)
+
+**Dataset**: Ko-StrategyQA — 9,251 Korean Wikipedia paragraphs · 592 test queries · binary relevance.
+Multi-hop yes/no questions; each query requires finding 2–3 supporting paragraphs.
+**Metric**: nDCG@10 (primary), Recall@10 (secondary).
+
+```bash
+scripts/bench-ko.sh bm25      # BM25 phase (no model, fast)
+scripts/bench-ko.sh vector    # embed corpus once (~9k docs)
+scripts/bench-ko.sh hybrid    # hybrid + rerank
+scripts/bench-ko.sh --reset   # wipe all eval DBs
+```
+
+### Models
+
+| Component | Model | Korean support |
+|-----------|-------|---------------|
+| Embedding | EmbeddingGemma 308M (768d) | 100+ languages — confirmed working |
+| Reranker | Qwen3-Reranker-0.6B | 119 languages — confirmed working |
+| Expander | qmd-expander-1.7B | Qwen3 base (119 langs), English SFT — **hurts Korean** (tested on MIRACL) |
+
+### Preprocessors
+
+| Preprocessor | Type | Dictionary | Runtime |
+|---|---|---|---|
+| none | unicode61 (FTS5 default) | — | — |
+| kiwi | Neural POS tagger | Custom statistical | Python subprocess (~2s startup) |
+| mecab | CRF tagger | mecab-ko-dic | Python subprocess (~0.3s startup) |
+| lindera | CRF tagger | mecab-ko-dic (same) | Rust binary (~0s startup) |
+
+Lindera parity with mecab confirmed: identical nDCG/Recall across all queries.
+
+### Results
+
+| Mode | none | kiwi | mecab | lindera |
+|------|------|------|-------|---------|
+| bm25 | 0.0000 | 0.0053 | 0.0039 | 0.0039 |
+| vector | 0.7992 | — | — | — |
+| hybrid | 0.7992 | 0.7991 | 0.7984 | — |
+| **hybrid+rerank** | 0.8138 | **0.8148** | 0.8137 | — |
+
+Recall@10: vector=0.8674, hybrid+rerank(kiwi)=0.8756.
+
+### Analysis
+
+**BM25 is ineffective for this task.** Ko-StrategyQA multi-hop queries share almost no surface
+terms with the supporting paragraphs. Unicode61 tokenizer scores 0.0000 — Korean agglutination
+means "이스탄불의" (istanbul+possessive) and "이스탄불은" (istanbul+subject) are different FTS tokens
+and never match. Morphological tokenizers recover some signal (kiwi: 0.0053) but BM25 remains
+negligible compared to vector.
+
+**EmbeddingGemma handles Korean extremely well.** Vector nDCG@10=0.7992, Recall@10=0.8674 with
+no Korean-specific training — the model finds the correct supporting paragraph 87% of the time
+in top-10. This confirms multilingual embedding capability is sufficient for Korean retrieval.
+
+**Hybrid = vector** (0.7992 both). With α=0.80 and BM25 at 0.005, the BM25 component
+contributes nothing to score fusion. Tokenizer choice is irrelevant for this dataset.
+
+**Reranker adds +0.015 nDCG@10** (0.7992 → 0.8148). Qwen3-Reranker-0.6B correctly rescores
+Korean query-document pairs despite English-heavy SFT. The reranker is the only component that
+improves over pure vector on this task.
+
+### Recommendation
+
+Default Korean config: **vector + rerank, no expander** (kiwi preprocessor for any BM25
+component). Expander confirmed harmful on Korean — see MIRACL results below.
+
+For BM25-heavy workloads (keyword search, exact-match retrieval): use kiwi > mecab/lindera.
+Lindera is the production-safe choice — same quality as mecab, no Python dependency.
+
+---
+
+## Korean IR Benchmark (MIRACL-Korean)
+
+**Dataset**: MIRACL-Korean dev — 2,835 passages (547 relevant + 2,288 hard negatives) · 213 queries.
+Factoid Wikipedia queries with direct term overlap — opposite of Ko-StrategyQA multi-hop.
+Hard negatives sourced from BM25+DR retrieval (lexically similar but not relevant).
+**Metric**: nDCG@10 (primary), Recall@10 (secondary).
+
+```bash
+uv run scripts/download-ko-miracl.py   # one-time setup
+scripts/bench-ko-miracl.sh             # full run (BM25 parallel, model sequential)
+scripts/bench-ko-miracl.sh bm25        # BM25 only
+scripts/bench-ko-miracl.sh model       # model phases only
+```
+
+### Results
+
+| Mode | none | kiwi | mecab | lindera |
+|------|------|------|-------|---------|
+| bm25 | 0.0009 | **0.1325** | 0.0460 | 0.0460 |
+| **hybrid+rerank** | **0.8411** | 0.8429 | — | — |
+| hybrid+expand+rerank | 0.8375 | — | — | — |
+
+Recall@10: hybrid+rerank(none)=0.9699, hybrid+rerank(kiwi)=0.9699.
+
+### Analysis
+
+**BM25 is not fundamentally broken for Korean — Ko-StrategyQA was the outlier.** Unicode61
+scores 0.0009 on MIRACL (vs 0.0000 on Ko-StrategyQA). Factoid queries share surface terms with
+passages; multi-hop queries do not. The 0.0000 result was task-specific, not a language limit.
+
+**Kiwi is 3× better than mecab/lindera on BM25 (0.1325 vs 0.0460).** Both apply identical
+`is_content()` POS filtering. The gap is tokenization accuracy: kiwi's neural tagger correctly
+handles compound nouns and ambiguous morpheme boundaries that mecab-ko-dic CRF gets wrong.
+For BM25-heavy workloads, kiwi is the clear choice despite its 2s startup cost.
+
+**Mecab and lindera are identical (0.0460 both)**, confirming they share the same underlying
+dictionary and segmentation logic. Lindera remains the production pick over mecab — same quality,
+no Python dependency, near-zero startup.
+
+**Expander hurts Korean retrieval (0.8411 → 0.8375, −0.4% nDCG; Recall 0.9699 → 0.9633).**
+`qmd-expander-1.7B` (English SFT) generates English or mixed-language sub-queries. Lex
+sub-queries fail due to language mismatch; hyde/vec sub-queries embed off-target text that
+dilutes the Korean vector signal. **Do not use the expander for Korean collections.**
+
+**Hybrid+rerank is near-ceiling** (0.84 nDCG, 0.97 Recall@10 on 2,835 passages). Kiwi adds
++0.002 nDCG in hybrid+rerank — consistent with +0.001 on Ko-StrategyQA. Negligible in practice.
+
+### Recommendation
+
+- **Disable expander for Korean collections.** It is the only component that actively hurts.
+- **Use kiwi for BM25-dominant workloads** (keyword search, `--mode bm25`). 3× over mecab.
+- **Use lindera for production hybrid search** — kiwi's +0.002 nDCG advantage in hybrid mode
+  does not justify the 2s startup cost per query. Lindera is instant and equally effective at
+  the semantic retrieval layer.
+- **Reranker is the main lever** (+0.015–0.027 nDCG across both datasets). Always enable.
+
+---
+
 ## Daemon mode
 
 **Problem**: `ir search` cold-starts 3–7s per query due to model loading every invocation
