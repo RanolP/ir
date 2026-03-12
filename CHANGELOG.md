@@ -1,3 +1,17 @@
+## [0.5.1] - 2026-03-12
+
+### Features
+
+- Tiered async daemon startup: BM25 runs in-process immediately; embedder binds socket (tier 1, ~1s); expander+reranker load in background (tier 2, ~3–5s) ([`101da40`](https://github.com/vlwkaos/ir/commit/101da40))
+
+### Bug Fixes
+
+- `--mode bm25` now returns directly without a daemon round-trip; `--mode vector` no longer short-circuits on a strong BM25 signal ([`b86279c`](https://github.com/vlwkaos/ir/commit/b86279c))
+- Tier-0 strong-signal threshold raised: raw BM25 floor 0.75 / gap 0.10 (was using fused thresholds calibrated on 0.80·vec+0.20·bm25) ([`b86279c`](https://github.com/vlwkaos/ir/commit/b86279c))
+- Guard `start_in_background` with `is_running()` check to prevent orphaning a live daemon ([`b86279c`](https://github.com/vlwkaos/ir/commit/b86279c))
+- Skip tier-2 signal file when both expander and reranker fail to load ([`b86279c`](https://github.com/vlwkaos/ir/commit/b86279c))
+- Use `open_rw` for client-side collection DBs: no schema init, fails fast on missing DB ([`b86279c`](https://github.com/vlwkaos/ir/commit/b86279c))
+
 ## [0.5.0] - 2026-03-10
 
 ### Features
