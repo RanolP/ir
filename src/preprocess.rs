@@ -32,6 +32,7 @@ impl PreprocessHandle {
     /// Spawn a preprocessor subprocess from a command string (e.g. "mecab -Owakati").
     /// Returns None on spawn failure (logs warning).
     pub fn spawn(cmd_str: &str) -> Option<Self> {
+        // ! paths with spaces unsupported; commands must be simple tokens (e.g. "mecab -Owakati")
         let mut parts = cmd_str.split_whitespace();
         let program = parts.next()?;
         let args: Vec<&str> = parts.collect();
@@ -116,12 +117,17 @@ impl PreprocessChain {
 }
 
 /// Preprocess a query through a command chain. Falls back to raw query on spawn failure or I/O error.
+#[cfg(test)]
 pub fn preprocess_query(query: &str, commands: &[String]) -> String {
     if commands.is_empty() {
         return query.to_string();
     }
     let mut chain = PreprocessChain::spawn(commands);
     if !chain.is_active() {
+        eprintln!(
+            "warning: preprocessor configured ({}) but failed to start; using raw query",
+            commands.join(", ")
+        );
         return query.to_string();
     }
     chain.process_text(query).unwrap_or_else(|_| query.to_string())
@@ -153,5 +159,67 @@ mod tests {
         let input = "line one\nline two\nline three";
         let out = chain.process_text(input).unwrap();
         assert_eq!(out, input);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tr_transforms_text() {
+        let mut chain = PreprocessChain::spawn(&["tr A-Z a-z".to_string()]);
+        assert!(chain.is_active());
+        let out = chain.process_text("HELLO WORLD").unwrap();
+        assert_eq!(out, "hello world");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn chain_pipes_through_multiple() {
+        let cmds = vec!["tr A-Z a-z".to_string(), "tr ' ' '_'".to_string()];
+        let mut chain = PreprocessChain::spawn(&cmds);
+        assert!(chain.is_active());
+        let out = chain.process_text("HELLO WORLD").unwrap();
+        assert_eq!(out, "hello_world");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preprocess_query_applies_transformation() {
+        let cmds = vec!["tr A-Z a-z".to_string()];
+        let out = preprocess_query("HELLO WORLD", &cmds);
+        assert_eq!(out, "hello world");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preprocess_query_empty_commands_returns_raw() {
+        let out = preprocess_query("HELLO WORLD", &[]);
+        assert_eq!(out, "HELLO WORLD");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preprocess_query_invalid_command_returns_raw() {
+        let cmds = vec!["__nonexistent_command_xyz__".to_string()];
+        let out = preprocess_query("HELLO WORLD", &cmds);
+        assert_eq!(out, "HELLO WORLD");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn chain_skips_invalid_handles() {
+        let cmds = vec!["__nonexistent_command_xyz__".to_string(), "tr A-Z a-z".to_string()];
+        let mut chain = PreprocessChain::spawn(&cmds);
+        // One valid handle should remain active
+        assert!(chain.is_active());
+        let out = chain.process_text("HELLO WORLD").unwrap();
+        assert_eq!(out, "hello world");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn multiline_with_transformation() {
+        let mut chain = PreprocessChain::spawn(&["tr A-Z a-z".to_string()]);
+        assert!(chain.is_active());
+        let out = chain.process_text("HELLO\nWORLD").unwrap();
+        assert_eq!(out, "hello\nworld");
     }
 }

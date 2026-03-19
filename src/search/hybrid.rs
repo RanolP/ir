@@ -17,7 +17,6 @@ use crate::llm::{
     expander::{QueryExpander, SubQuery, SubQueryKind, fallback},
     scoring::Scorer,
 };
-use crate::preprocess::preprocess_query;
 use crate::search::rrf::{self, RankedList};
 use crate::types::SearchResult;
 use rusqlite::Connection;
@@ -324,7 +323,7 @@ fn rrf_from_subqueries(
 fn bm25_across(dbs: &[CollectionDb], query: &str, limit: usize) -> Result<Vec<SearchResult>> {
     dbs.iter()
         .map(|db| {
-            let preprocessed = preprocess_query(query, &db.preprocessor_commands);
+            let preprocessed = db.preprocess_query(query);
             let fts_query = fts::build_query(&preprocessed);
             if fts_query.is_empty() {
                 return Ok(vec![]);

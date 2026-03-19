@@ -8,8 +8,10 @@ pub mod schema;
 pub mod vectors;
 
 use crate::error::Result;
+use crate::preprocess::PreprocessChain;
 use rusqlite::ffi::{sqlite3, sqlite3_api_routines, sqlite3_auto_extension};
 use rusqlite::{Connection, OpenFlags};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Once;
@@ -45,6 +47,8 @@ pub struct CollectionDb {
     /// Empty if no preprocessing is configured. Used at query time to spawn a PreprocessChain.
     pub preprocessor_commands: Vec<String>,
     conn: Connection,
+    /// Lazily spawned preprocessor chain, reused across BM25 calls within one search request.
+    preprocess_chain: RefCell<Option<PreprocessChain>>,
 }
 
 impl CollectionDb {
@@ -67,7 +71,7 @@ impl CollectionDb {
         let name = name.into();
         schema::init(&conn, &name, has_preprocessor)?;
 
-        Ok(Self { name, preprocessor_commands: vec![], conn })
+        Ok(Self { name, preprocessor_commands: vec![], conn, preprocess_chain: RefCell::new(None) })
     }
 
     /// Open an existing collection DB with read-write access (no schema init).
@@ -91,11 +95,31 @@ impl CollectionDb {
             name: name.into(),
             preprocessor_commands,
             conn,
+            preprocess_chain: RefCell::new(None),
         })
     }
 
     pub fn conn(&self) -> &Connection {
         &self.conn
+    }
+
+    /// Preprocess a query using the collection's configured preprocessor chain.
+    /// Lazily spawns the chain on first call and reuses it for subsequent calls.
+    /// Falls back to the raw query on spawn failure or I/O error.
+    pub fn preprocess_query(&self, query: &str) -> String {
+        if self.preprocessor_commands.is_empty() {
+            return query.to_string();
+        }
+        let mut chain_ref = self.preprocess_chain.borrow_mut();
+        let chain = chain_ref.get_or_insert_with(|| PreprocessChain::spawn(&self.preprocessor_commands));
+        if !chain.is_active() {
+            eprintln!(
+                "warning: preprocessor ({}) failed to start; using raw query",
+                self.preprocessor_commands.join(", ")
+            );
+            return query.to_string();
+        }
+        chain.process_text(query).unwrap_or_else(|_| query.to_string())
     }
 }
 

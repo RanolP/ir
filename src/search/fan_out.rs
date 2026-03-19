@@ -6,7 +6,6 @@
 
 use crate::db::{CollectionDb, fts};
 use crate::error::Result;
-use crate::preprocess::preprocess_query;
 use crate::types::SearchResult;
 
 pub struct SearchRequest<'a> {
@@ -22,7 +21,7 @@ pub fn bm25(dbs: &[CollectionDb], req: &SearchRequest) -> Result<Vec<SearchResul
     let results: Vec<Vec<SearchResult>> = dbs
         .iter()
         .map(|db| {
-            let preprocessed_query = preprocess_query(req.query, &db.preprocessor_commands);
+            let preprocessed_query = db.preprocess_query(req.query);
             let fts_query = fts::build_query(&preprocessed_query);
             if fts_query.is_empty() {
                 return Ok(vec![]);
