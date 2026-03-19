@@ -11,12 +11,12 @@
 // Bind:     ir collection add <name> <path> --preprocessor <alias>
 //
 // Examples:
-//   ir preprocessor add ko /path/to/kiwi-tokenize
+//   ir preprocessor install ko   (installs lindera-tokenize, registers as "ko")
 //   ir preprocessor add ja "mecab -Owakati"
 //   ir collection add wiki ~/wiki --preprocessor ko
 //
 // Subprocess lifetime: stays alive for batch indexing; spawned per-query for search.
-// Acceptable for mecab/lindera (<10ms startup). kiwi has ~2s cold-start — known cost.
+// Lindera startup: <10ms (Rust binary, embedded dictionary).
 
 use crate::error::Result;
 use std::io::{BufRead, BufReader, BufWriter, Write};

@@ -409,17 +409,17 @@ fn install_preprocessor(config: &mut Config, lang: &str) -> Result<()> {
     struct Entry { alias: &'static str, kind: Kind }
 
     let known: &[Entry] = &[
-        Entry { alias: "ko-kiwi",    kind: Kind::Script { repo_subdir: "ko", script_name: "kiwi-tokenize" } },
-        Entry { alias: "ko-mecab",   kind: Kind::Script { repo_subdir: "ko", script_name: "mecab-tokenize" } },
-        Entry { alias: "ko-lindera", kind: Kind::Cargo  { crate_name: "lindera-tokenize" } },
+        Entry { alias: "ko",         kind: Kind::Cargo  { crate_name: "lindera-tokenize" } },
         Entry { alias: "ja",         kind: Kind::Script { repo_subdir: "ja", script_name: "mecab-tokenize" } },
+        Entry { alias: "ja-lindera", kind: Kind::Cargo  { crate_name: "lindera-tokenize-ja" } },
+        Entry { alias: "zh-bigram",  kind: Kind::Cargo  { crate_name: "bigram-tokenize-zh" } },
     ];
 
     let entry = known
         .iter()
         .find(|e| e.alias == lang)
         .ok_or_else(|| error::Error::Other(
-            format!("unknown lang '{lang}'. Available: ko-kiwi, ko-mecab, ko-lindera, ja")
+            format!("unknown lang '{lang}'. Available: ko, ja, ja-lindera, zh-bigram")
         ))?;
 
     let cmd_str = match &entry.kind {
@@ -456,7 +456,7 @@ fn install_preprocessor(config: &mut Config, lang: &str) -> Result<()> {
                 .map_err(|e| error::Error::Other(format!("cargo: {e}")))?;
             if !status.success() {
                 return Err(error::Error::Other(format!(
-                    "cargo install {crate_name} failed. Build manually:\n  cd preprocessors/ko/lindera-tokenize && cargo build --release\n  ir preprocessor add ko-lindera ./target/release/{crate_name}"
+                    "cargo install {crate_name} failed. Build manually from the appropriate preprocessors/ subdir:\n  cargo build --release\n  ir preprocessor add <alias> ./target/release/{crate_name}"
                 )));
             }
             // Binary lands in ~/.cargo/bin/ which is on PATH; register by name.

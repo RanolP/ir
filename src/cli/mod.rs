@@ -154,7 +154,7 @@ pub enum PreprocessorCmd {
     },
     /// Download and register a bundled preprocessor wrapper
     Install {
-        /// Language code to install (ko, ja)
+        /// Language code to install (ko, ja, ja-lindera, zh-bigram)
         lang: String,
     },
     /// List registered preprocessors
