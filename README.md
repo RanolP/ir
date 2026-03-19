@@ -144,28 +144,21 @@ ir update wiki
 ir search "서울 지하철" -c wiki
 ```
 
-`ir preprocessor install ko` runs `cargo install lindera-tokenize` — embedded mecab-ko-dic dictionary, no system deps. ~30s compile on first install.
-
-Manual install from repo:
-
-```bash
-cd preprocessors/ko/lindera-tokenize && cargo build --release
-ir preprocessor add ko ./target/release/lindera-tokenize
-```
+`ir preprocessor install ko` downloads a pre-built binary from the GitHub release — embedded ko-dic dictionary, no system deps, no Rust toolchain required.
 
 **Other languages:**
 
 ```bash
-ir preprocessor install ja           # Japanese (MeCab shell wrapper)
-ir preprocessor install ja-lindera   # Japanese (lindera, no MeCab dep)
-ir preprocessor install zh-bigram    # Chinese (bigram tokenizer)
+ir preprocessor install ja    # Japanese (Lindera + ipadic)
+ir preprocessor install zh    # Chinese (bigram tokenizer)
 ```
 
 **Manage:**
 
 ```bash
-ir preprocessor list
-ir preprocessor remove ko
+ir preprocessor list          # shows registered + available bundled preprocessors
+ir preprocessor remove ko     # unregister (keeps binary)
+ir preprocessor remove ko -d  # unregister and delete binary
 ```
 
 The protocol is stdin/stdout line-by-line: one UTF-8 line in, one tokenized line out, process stays alive between lines. Any executable following this protocol can be registered.
