@@ -1,0 +1,289 @@
+# ir
+
+[ENG](README.md) | [한국어](README.ko.md)
+
+마크다운 지식베이스를 위한 로컬 시맨틱 검색 엔진. [qmd](https://github.com/tobi/qmd)의 Rust 포트, 세 가지 핵심 차이점:
+
+- **컬렉션별 SQLite** — 각 컬렉션이 독립 파일; 공유 전역 인덱스 없음
+- **퍼시스턴트 데몬** — 모델이 쿼리 사이에 메모리에 상주; 첫 검색 시 자동 시작
+- **이중 LLM 캐시** — 확장기 출력과 재순위 점수 영속화; 반복 쿼리는 즉각 반환
+
+4개 BEIR 데이터셋 기준 검색 품질 측정; 재순위화로 순수 벡터 대비 최대 +14.5% nDCG@10.
+
+<details>
+<summary><strong>기능</strong></summary>
+
+- **하이브리드 검색** — BM25 탐색 → 점수 융합 (0.80·벡터 + 0.20·BM25) → LLM 재순위화
+- **쿼리 확장** — 확장기 모델 존재 시 lex/vec/hyde 타입 서브쿼리 생성
+- **강신호 단축** — BM25 최고점 ≥ 0.85 AND 차이 ≥ 0.15이면 즉시 반환
+- **데몬 모드** — 쿼리 사이에 모델 상주; 첫 검색 시 자동 시작
+- **이중 LLM 캐시** — 확장기 출력 전역 캐시; 재순위 점수 컬렉션별 캐시
+- **컬렉션별 SQLite** — 독립 WAL 저널, 격리 백업, 컬렉션 간 경합 없음
+- **내용 주소 저장** — SHA-256으로 동일 파일 중복 제거
+- **FTS5 인젝션 안전** — 모든 사용자 입력 FTS5 쿼리 생성 전 이스케이프
+- **Metal GPU** — macOS에서 기본적으로 전 레이어 Metal 오프로드; `IR_GPU_LAYERS=N`으로 조정
+- **자동 다운로드** — 첫 사용 시 HuggingFace Hub에서 모델 자동 다운로드
+
+</details>
+
+## 설치
+
+```bash
+cargo install --path .
+```
+
+Rust 1.80 이상 필요. macOS에서 llama.cpp가 Metal과 자동 링크됩니다.
+
+## 빠른 시작
+
+```bash
+ir collection add notes ~/notes   # 컬렉션 등록
+ir update notes                   # 문서 인덱싱
+ir search "러스트 메모리 안전성"  # 검색 (데몬 자동 시작)
+```
+
+<details>
+<summary><strong>모델</strong></summary>
+
+모델은 첫 사용 시 HuggingFace Hub에서 자동으로 다운로드되어 `~/.cache/huggingface/`에 캐시됩니다. 별도 설정 불필요.
+
+| 모델 | HF 저장소 | 필요 기능 |
+|---|---|---|
+| [EmbeddingGemma 300M](https://huggingface.co/ggml-org/embeddinggemma-300M-GGUF) | `ggml-org/embeddinggemma-300M-GGUF` | `ir embed`, 벡터 검색, 하이브리드 |
+| [Qwen3.5-0.8B](https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF) | `unsloth/Qwen3.5-0.8B-GGUF` | 통합 확장+재순위 (선택) |
+| [Qwen3.5-2B](https://huggingface.co/unsloth/Qwen3.5-2B-GGUF) | `unsloth/Qwen3.5-2B-GGUF` | 통합 확장+재순위 (선택) |
+| [Qwen3-Reranker 0.6B](https://huggingface.co/ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF) | `ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF` | 재순위화 전용 (선택) |
+| [qmd-query-expansion 1.7B](https://huggingface.co/tobil/qmd-query-expansion-1.7B) | `tobil/qmd-query-expansion-1.7B` | 쿼리 확장 전용 (선택) |
+
+BM25 검색은 모델 없이 동작합니다. `IR_QWEN_MODEL`이 설정되거나 `~/local-models/`에 Qwen3.5 GGUF가 있으면 확장기와 재순위기를 대체합니다.
+
+**로컬 모델:**
+
+```bash
+export IR_MODEL_DIRS="$HOME/my-models"
+export IR_QWEN_MODEL="$HOME/local-models/Qwen3.5-2B-Q4_K_M.gguf"   # 통합
+export IR_EMBEDDING_MODEL="$HOME/my-models/embeddinggemma-300M-Q8_0.gguf"
+export IR_RERANKER_MODEL="$HOME/my-models/qwen3-reranker-0.6b-q8_0.gguf"
+export IR_EXPANDER_MODEL="$HOME/my-models/qmd-query-expansion-1.7B-q4_k_m.gguf"
+```
+
+탐색 순서: 환경변수 → `IR_MODEL_DIRS` → `~/local-models/` → `~/.cache/ir/models/` → `~/.cache/qmd/models/` → HF Hub 자동 다운로드.
+
+**GPU:**
+
+```bash
+IR_GPU_LAYERS=0 ir search "쿼리"    # CPU 강제
+IR_GPU_LAYERS=32 ir search "쿼리"   # 부분 오프로드
+```
+
+</details>
+
+<details>
+<summary><strong>사용법</strong></summary>
+
+**컬렉션:**
+
+```bash
+ir collection add notes ~/notes
+ir collection add code  ~/code
+ir collection ls
+ir collection rm notes
+ir status                    # 컬렉션별 인덱스 상태
+```
+
+**인덱싱 및 임베딩:**
+
+```bash
+ir update                    # 모든 컬렉션 인덱싱
+ir update notes              # 특정 컬렉션
+ir update notes --force      # 전체 재인덱싱
+
+ir embed                     # 미임베딩 문서 임베딩
+ir embed notes --force       # 전체 재임베딩
+```
+
+**검색:**
+
+```bash
+ir search "러스트 메모리 안전성"
+ir search "sqlite 아키텍처"    --mode bm25
+ir search "비동기 패턴"        --mode vector
+ir search "에러 처리"          --mode hybrid -c notes --min-score 0.4
+
+# 출력 형식
+ir search "소유권" --json
+ir search "소유권" --md
+ir search "소유권" --files   # 경로만
+```
+
+**데몬:**
+
+```bash
+ir daemon start              # 시작 (첫 검색 시 자동 시작)
+ir daemon stop
+ir daemon status
+```
+
+데몬은 모델을 메모리에 유지합니다. Unix 소켓을 통한 후속 쿼리는 모델 로딩을 건너뜁니다 (약 30ms 응답).
+
+</details>
+
+<details>
+<summary><strong>전처리기 — 한국어 / 일본어 / 중국어</strong></summary>
+
+전처리기는 BM25 인덱싱 전에 텍스트를 형태소 분석합니다. 전처리기 없이는 교착어 형식("이스탄불의", "東京都")이 하나의 FTS 토큰으로 처리되어 형태소 단위 쿼리와 매칭되지 않습니다. 인덱싱 시와 쿼리 시 동일한 전처리기가 적용됩니다.
+
+**한국어 (lindera, Mode::Decompose):**
+
+```bash
+ir preprocessor install ko          # lindera-tokenize 설치 후 "ko"로 등록
+ir collection add wiki ~/wiki --preprocessor ko
+ir update wiki
+ir search "서울 지하철" -c wiki
+```
+
+`ir preprocessor install ko`는 `cargo install lindera-tokenize`를 실행합니다. mecab-ko-dic 사전이 내장되어 별도 시스템 의존성이 없습니다. 첫 설치 시 약 30초 컴파일.
+
+저장소에서 직접 빌드:
+
+```bash
+cd preprocessors/ko/lindera-tokenize && cargo build --release
+ir preprocessor add ko ./target/release/lindera-tokenize
+```
+
+**다른 언어:**
+
+```bash
+ir preprocessor install ja           # 일본어 (MeCab 래퍼)
+ir preprocessor install ja-lindera   # 일본어 (lindera, MeCab 불필요)
+ir preprocessor install zh-bigram    # 중국어 (바이그램 토크나이저)
+```
+
+**관리:**
+
+```bash
+ir preprocessor list
+ir preprocessor remove ko
+```
+
+프로토콜은 stdin/stdout 라인 단위: UTF-8 한 줄 입력, 토큰화된 한 줄 출력, 프로세스는 라인 간 유지. 이 프로토콜을 따르는 실행 파일은 모두 등록 가능.
+
+lindera 처리 속도: M-시리즈 Mac 기준 약 5,600 문서/초 · 1.8 MB/초. 시작 시간 거의 없음 (Rust 바이너리, 내장 사전).
+
+**한국어 BM25 벤치마크** (MIRACL-Korean, 쿼리 213개):
+
+| 전처리기 | nDCG@10 | 비고 |
+|---|---|---|
+| 없음 | 0.0009 | 교착어 토큰 매칭 불가 |
+| lindera | 0.0460 | 형태소 분석으로 50배 향상 |
+| lindera hybrid+rerank | **0.8411** | 2,835 패시지 기준 거의 최고 성능 |
+
+복합어 분해 벤치마크 (복합어 내 구성 요소를 타겟으로 한 쿼리 50개):
+
+| 전처리기 | nDCG@10 | 비고 |
+|---|---|---|
+| 없음 | 0.0000 | FTS 인덱스에 구성 요소 없음 |
+| lindera | **0.6326** | Mode::Decompose로 복합어 분해 |
+
+상세 결과 및 근거: [research/experiment.md](research/experiment.md)
+
+</details>
+
+<details>
+<summary><strong>검색 파이프라인</strong></summary>
+
+```
+쿼리
+  │
+  ├─ BM25 탐색 ──► 점수 ≥ 0.85 AND 차이 ≥ 0.15? ──► 즉시 반환
+  │
+  ├─ 확장기 있음:  확장 → lex/vec/hyde 서브쿼리 → RRF 융합
+  ├─ 확장기 없음:  BM25 + 벡터 → 점수 융합 (0.80·벡터 + 0.20·BM25)
+  │
+  └─ 재순위기: 최종 = 0.40·융합 + 0.60·P(관련)
+```
+
+확장기와 재순위기 출력은 SQLite에 캐시됩니다. 반복 쿼리는 LLM 추론을 건너뜁니다.
+
+</details>
+
+<details>
+<summary><strong>벤치마크 — BEIR (4개 데이터셋, nDCG@10)</strong></summary>
+
+EmbeddingGemma 300M 임베딩 + qmd-expander-1.7B + Qwen3-Reranker-0.6B.
+
+| 데이터셋 | BM25 | 벡터 | 하이브리드 | +재순위 | LLM 향상 |
+|---|---|---|---|---|---|
+| NFCorpus (323q) | 0.2046 | 0.3898 | 0.3954 | **0.4001** | +1.2% |
+| SciFact (300q) | 0.0500 | 0.7847 | 0.7873 | **0.7797** | −1.0% |
+| FiQA (648q) | 0.0298 | 0.4324 | 0.4266 | **0.4567** | +7.1% |
+| ArguAna (1406q) | 0.0012 | 0.4264 | 0.4263 | **0.4879** | +14.5% |
+
+BM25 융합은 어느 데이터셋에서도 순수 벡터 대비 통계적으로 유의미한 향상 없음 (paired t-test). 재순위 향상은 대화형/논증 검색 작업에서 가장 큼.
+
+재현 방법: [research/experiment.md](research/experiment.md)
+
+</details>
+
+<details>
+<summary><strong>qmd와 비교</strong></summary>
+
+ir은 [qmd](https://github.com/tobi/qmd)의 Rust 포트로, 다른 저장소 모델과 퍼시스턴트 데몬을 갖춤.
+
+| | qmd | ir |
+|---|---|---|
+| 저장소 | 모든 컬렉션에 단일 SQLite | 컬렉션별 SQLite — `rm name.sqlite`로 삭제 |
+| 동시 쓰기 | 공유 WAL 저널 | 컬렉션별 독립 WAL |
+| sqlite-vec | 동적 로드 `.so` | 정적 컴파일 |
+| 프로세스 모델 | 쿼리마다 스폰 | 데몬이 모델 유지 |
+| LLM 캐시 | 재순위 점수 (컬렉션별) | 재순위 점수 + 확장기 출력 (전역) |
+| 품질 (NFCorpus nDCG@10) | 미공개 | 0.4001 |
+
+**성능** (macOS M4 Max, 동일 모델·쿼리):
+
+| | ir | qmd | 비율 |
+|---|---:|---:|---|
+| **콜드** (캐시 없음) | 3.0s | 9.5s | **3×** |
+| **웜** (데몬 + 캐시 활성) | 30ms | 840ms | **28×** |
+
+콜드 차이: ir은 재순위 후보 최대 20개 vs qmd 40개. 웜 차이: qmd는 쿼리마다 ~800ms 프로세스 스폰 + JS 런타임 부담; ir 데몬 왕복은 30ms (임베딩 + kNN만).
+
+</details>
+
+<details>
+<summary><strong>개발</strong></summary>
+
+```bash
+cargo build                  # 디버그 빌드
+cargo build --release        # 릴리즈 빌드
+cargo test                   # 단위 테스트 (모델 불필요)
+cargo test -- --ignored      # 모델 의존 테스트 (모델 필요)
+cargo run --bin eval -- --data test-data/nfcorpus --mode all
+```
+
+</details>
+
+<details>
+<summary><strong>스키마</strong></summary>
+
+각 컬렉션 데이터베이스 (`~/.config/ir/collections/<name>.sqlite`):
+
+```
+content          — 해시 → 전체 텍스트 (내용 주소)
+documents        — 경로, 제목, 해시, 활성 플래그
+documents_fts    — FTS5 가상 테이블 (porter 토크나이저)
+vectors_vec      — sqlite-vec kNN (768차원 코사인, EmbeddingGemma 형식)
+content_vectors  — 청크 메타데이터 (해시, 순번, 위치, 모델)
+llm_cache        — 재순위 점수 캐시 (sha256(모델+쿼리+문서) → 점수)
+meta             — 컬렉션 메타데이터 (이름, 스키마 버전)
+```
+
+전역 캐시 (`~/.config/ir/expander_cache.sqlite`):
+
+```
+expander_cache   — sha256(모델+쿼리) → JSON Vec<SubQuery>
+```
+
+트리거가 insert/update/delete 시 `documents_fts`를 `documents`와 동기화합니다.
+
+</details>

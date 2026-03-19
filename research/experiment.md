@@ -172,7 +172,7 @@ scripts/bench-ko.sh --reset   # wipe all eval DBs
 | Reranker | Qwen3-Reranker-0.6B | 119 languages — confirmed working |
 | Expander | qmd-expander-1.7B | Qwen3 base (119 langs), English SFT — **hurts Korean** (tested on MIRACL) |
 
-### Preprocessors
+### Preprocessors evaluated
 
 | Preprocessor | Type | Dictionary | Runtime |
 |---|---|---|---|
@@ -180,8 +180,6 @@ scripts/bench-ko.sh --reset   # wipe all eval DBs
 | kiwi | Neural POS tagger | Custom statistical | Python subprocess (~2s startup) |
 | mecab | CRF tagger | mecab-ko-dic | Python subprocess (~0.3s startup) |
 | lindera | CRF tagger | mecab-ko-dic (same) | Rust binary (~0s startup) |
-
-Lindera parity with mecab confirmed: identical nDCG/Recall across all queries.
 
 ### Results
 
@@ -213,13 +211,10 @@ contributes nothing to score fusion. Tokenizer choice is irrelevant for this dat
 Korean query-document pairs despite English-heavy SFT. The reranker is the only component that
 improves over pure vector on this task.
 
-### Recommendation
-
-Default Korean config: **vector + rerank, no expander** (kiwi preprocessor for any BM25
-component). Expander confirmed harmful on Korean — see MIRACL results below.
-
-For BM25-heavy workloads (keyword search, exact-match retrieval): use kiwi > mecab/lindera.
-Lindera is the production-safe choice — same quality as mecab, no Python dependency.
+**Decision: lindera as the single ko preprocessor.** Kiwi's +0.001 nDCG in hybrid+rerank does
+not justify its 2s Python startup per query. Mecab parity with lindera confirmed; lindera is
+the production-safe choice (Rust, embedded dictionary, zero Python dep). See MIRACL and compound
+benchmark below for the decompounding rationale.
 
 ---
 
@@ -253,31 +248,62 @@ Recall@10: hybrid+rerank(none)=0.9699, hybrid+rerank(kiwi)=0.9699.
 scores 0.0009 on MIRACL (vs 0.0000 on Ko-StrategyQA). Factoid queries share surface terms with
 passages; multi-hop queries do not. The 0.0000 result was task-specific, not a language limit.
 
-**Kiwi is 3× better than mecab/lindera on BM25 (0.1325 vs 0.0460).** Both apply identical
-`is_content()` POS filtering. The gap is tokenization accuracy: kiwi's neural tagger correctly
-handles compound nouns and ambiguous morpheme boundaries that mecab-ko-dic CRF gets wrong.
-For BM25-heavy workloads, kiwi is the clear choice despite its 2s startup cost.
+**Kiwi is 3× better than mecab/lindera on BM25 (0.1325 vs 0.0460).** The gap is tokenization
+accuracy: kiwi's neural tagger correctly handles compound nouns and ambiguous morpheme boundaries
+that mecab-ko-dic CRF gets wrong.
 
 **Mecab and lindera are identical (0.0460 both)**, confirming they share the same underlying
-dictionary and segmentation logic. Lindera remains the production pick over mecab — same quality,
-no Python dependency, near-zero startup.
+dictionary and segmentation logic.
 
 **Expander hurts Korean retrieval (0.8411 → 0.8375, −0.4% nDCG; Recall 0.9699 → 0.9633).**
-`qmd-expander-1.7B` (English SFT) generates English or mixed-language sub-queries. Lex
-sub-queries fail due to language mismatch; hyde/vec sub-queries embed off-target text that
-dilutes the Korean vector signal. **Do not use the expander for Korean collections.**
+`qmd-expander-1.7B` (English SFT) generates English or mixed-language sub-queries that dilute
+the Korean vector signal. **Do not use the expander for Korean collections.**
 
-**Hybrid+rerank is near-ceiling** (0.84 nDCG, 0.97 Recall@10 on 2,835 passages). Kiwi adds
-+0.002 nDCG in hybrid+rerank — consistent with +0.001 on Ko-StrategyQA. Negligible in practice.
+**Hybrid+rerank is near-ceiling** (0.84 nDCG, 0.97 Recall@10). Kiwi adds +0.002 nDCG vs none
+in hybrid+rerank — negligible in practice.
 
 ### Recommendation
 
-- **Disable expander for Korean collections.** It is the only component that actively hurts.
-- **Use kiwi for BM25-dominant workloads** (keyword search, `--mode bm25`). 3× over mecab.
-- **Use lindera for production hybrid search** — kiwi's +0.002 nDCG advantage in hybrid mode
-  does not justify the 2s startup cost per query. Lindera is instant and equally effective at
-  the semantic retrieval layer.
-- **Reranker is the main lever** (+0.015–0.027 nDCG across both datasets). Always enable.
+- Disable expander for Korean collections.
+- Reranker is the main lever (+0.015–0.027 nDCG). Always enable.
+- **lindera is the ko preprocessor.** Kiwi's +0.002 nDCG in hybrid mode does not justify its
+  2s Python startup per query. Lindera handles compound decompounding — see below.
+
+---
+
+## Korean Compound Decompounding Benchmark
+
+**Hypothesis**: lindera `Mode::Decompose` (other_penalty_length_threshold=2) indexes compound
+sub-parts, enabling BM25 to match queries whose terms only exist inside compound nouns.
+Without decompounding, BM25 returns zero hits for these queries.
+
+**Dataset**: 50 synthetic queries from ko-miracl corpus. Each query uses the sub-components
+of a compound noun that does not appear decomposed anywhere in the raw corpus.
+
+```bash
+uv run scripts/gen-compound-bench.py   # generates test-data/ko-compound/
+scripts/bench-compound.sh
+```
+
+### Results (ko-compound, nDCG@10)
+
+| preprocessor | nDCG@10 | Recall@10 | note |
+|---|---|---|---|
+| none | 0.0000 | 0.0000 | compounds indexed whole — sub-parts missing from FTS |
+| lindera | **0.6326** | **0.6400** | Mode::Decompose splits compounds, sub-parts indexed |
+
+### Analysis
+
+**None scores 0.0000 exactly** — confirming the query construction is correct. Sub-components
+of selected compounds genuinely do not appear independently in the corpus (strict filter).
+
+**Lindera scores 0.63 nDCG**, not 1.0 — expected: some compounds decompose further when used
+as query terms (e.g. `협동조합` in the query decomposes to `협동 조합`, while the indexed
+document has `협동조합체가` decomposed as `협동조합 체가`). Term mismatch at query time
+causes partial recall.
+
+**This confirms the core value of lindera over unicode61 for Korean BM25**: compound nouns
+are common in Korean Wikipedia and would be completely missed without decompounding.
 
 ---
 

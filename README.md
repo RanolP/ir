@@ -1,25 +1,30 @@
 # ir
 
+[ENG](README.md) | [한국어](README.ko.md)
+
 Local semantic search engine for markdown knowledge bases. Rust port of [qmd](https://github.com/tobi/qmd) with three key differences:
 
 - **Per-collection SQLite** — each collection is an independent file; no shared global index
 - **Persistent daemon** — models stay loaded between queries; first search auto-starts it
 - **Dual LLM cache** — expander outputs and reranker scores are persisted; repeated queries are instant
 
-Search quality is benchmarked on 4 BEIR datasets; reranking adds up to +14.5% nDCG@10 over pure vector search.
+Search quality benchmarked on 4 BEIR datasets; reranking adds up to +14.5% nDCG@10 over pure vector.
 
-## Features
+<details>
+<summary><strong>Features</strong></summary>
 
 - **Hybrid search** — BM25 probe → score fusion (0.80·vec + 0.20·bm25) → LLM reranking
 - **Query expansion** — typed sub-queries (lex/vec/hyde) when expander model is present
 - **Strong-signal shortcut** — skips expansion when top BM25 score ≥ 0.85 with gap ≥ 0.15
-- **Daemon mode** — keeps models warm between queries; auto-starts on first search, eliminates per-call model load overhead
-- **Dual LLM cache** — expander outputs cached globally (`~/.config/ir/expander_cache.sqlite`); reranker scores cached per-collection; repeated queries skip all inference
+- **Daemon mode** — keeps models warm between queries; auto-starts on first search
+- **Dual LLM cache** — expander outputs cached globally; reranker scores cached per-collection
 - **Per-collection SQLite** — independent WAL journals, isolated backup, zero cross-collection contention
 - **Content-addressed storage** — identical files deduplicated by SHA-256 within a collection
 - **FTS5 injection-safe** — all user input escaped before FTS5 query construction
 - **Metal GPU** — all layers offloaded to Metal on macOS by default; `IR_GPU_LAYERS=N` to override
 - **Auto-download** — models fetched from HuggingFace Hub on first use; `HF_HUB_OFFLINE=1` to disable
+
+</details>
 
 ## Installation
 
@@ -29,7 +34,16 @@ cargo install --path .
 
 Requires Rust 1.80+. On macOS, links llama.cpp with Metal automatically.
 
-## Models
+## Quick start
+
+```bash
+ir collection add notes ~/notes   # register a collection
+ir update notes                   # index documents
+ir search "memory safety in rust" # search (daemon auto-starts)
+```
+
+<details>
+<summary><strong>Models</strong></summary>
 
 Models are downloaded automatically from HuggingFace Hub on first use and cached in `~/.cache/huggingface/`. No manual setup required.
 
@@ -41,41 +55,45 @@ Models are downloaded automatically from HuggingFace Hub on first use and cached
 | [Qwen3-Reranker 0.6B](https://huggingface.co/ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF) | `ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF` | reranking only (optional) |
 | [qmd-query-expansion 1.7B](https://huggingface.co/tobil/qmd-query-expansion-1.7B) | `tobil/qmd-query-expansion-1.7B` | expansion only (optional) |
 
-BM25 search works without any models. When `IR_QWEN_MODEL` is set (or a Qwen3.5 GGUF is found in `~/local-models/`), it is used for both expansion and reranking, replacing the two separate models.
+BM25 search works without any models. When `IR_QWEN_MODEL` is set (or a Qwen3.5 GGUF is found in `~/local-models/`), it replaces both the expander and reranker.
 
-To use local models, point to a directory or individual files:
+**Local models:**
 
 ```bash
-export IR_MODEL_DIRS="$HOME/my-models"          # ':'-separated list
+export IR_MODEL_DIRS="$HOME/my-models"
 export IR_QWEN_MODEL="$HOME/local-models/Qwen3.5-2B-Q4_K_M.gguf"   # unified
 export IR_EMBEDDING_MODEL="$HOME/my-models/embeddinggemma-300M-Q8_0.gguf"
 export IR_RERANKER_MODEL="$HOME/my-models/qwen3-reranker-0.6b-q8_0.gguf"
 export IR_EXPANDER_MODEL="$HOME/my-models/qmd-query-expansion-1.7B-q4_k_m.gguf"
 ```
 
-Local search order: env overrides → `IR_MODEL_DIRS` → `~/local-models/` → `~/.cache/ir/models/` → `~/.cache/qmd/models/`. If no local file is found, auto-download kicks in. Set `HF_HUB_OFFLINE=1` to disable network access.
+Search order: env → `IR_MODEL_DIRS` → `~/local-models/` → `~/.cache/ir/models/` → `~/.cache/qmd/models/` → HF Hub auto-download.
 
 Compatibility aliases: `QMD_EMBEDDING_MODEL`, `QMD_RERANKER_MODEL`, `QMD_EXPANDER_MODEL`, `QMD_MODEL_DIRS`.
 
-### GPU
-
-All model layers are offloaded to Metal by default on macOS. To override:
+**GPU:**
 
 ```bash
 IR_GPU_LAYERS=0 ir search "query"   # force CPU
 IR_GPU_LAYERS=32 ir search "query"  # partial offload
 ```
 
-## Usage
+</details>
 
-### Add a collection
+<details>
+<summary><strong>Usage</strong></summary>
+
+**Collections:**
 
 ```bash
 ir collection add notes ~/notes
 ir collection add code  ~/code
+ir collection ls
+ir collection rm notes
+ir status                    # index health per collection
 ```
 
-### Index and embed
+**Index and embed:**
 
 ```bash
 ir update                    # index all collections
@@ -86,7 +104,7 @@ ir embed                     # embed all unembedded documents
 ir embed notes --force       # re-embed everything
 ```
 
-### Search
+**Search:**
 
 ```bash
 ir search "memory safety in rust"
@@ -100,25 +118,81 @@ ir search "ownership" --md
 ir search "ownership" --files   # paths only
 ```
 
-### Daemon
+**Daemon:**
 
 ```bash
-ir daemon start              # start background daemon (auto-started on first search)
+ir daemon start              # start (auto-started on first search)
 ir daemon stop
 ir daemon status
 ```
 
-The daemon keeps models warm in memory. The first query auto-starts it. Subsequent queries over the Unix socket skip model loading entirely.
+The daemon keeps models warm in memory. Subsequent queries over the Unix socket skip model loading entirely (~30ms round-trip vs 3s cold).
 
-### Other
+</details>
+
+<details>
+<summary><strong>Preprocessors — Korean / Japanese / Chinese</strong></summary>
+
+Preprocessors tokenize text before BM25 indexing. Without one, agglutinated words ("이스탄불의", "東京都") are treated as single FTS tokens and never match morpheme-level queries. The same preprocessor runs at index time and query time.
+
+**Korean (lindera, Mode::Decompose):**
 
 ```bash
-ir status                    # index health per collection
-ir collection ls             # list collections
-ir collection rm notes       # remove collection
+ir preprocessor install ko          # installs lindera-tokenize, registers as "ko"
+ir collection add wiki ~/wiki --preprocessor ko
+ir update wiki
+ir search "서울 지하철" -c wiki
 ```
 
-## Search Pipeline
+`ir preprocessor install ko` runs `cargo install lindera-tokenize` — embedded mecab-ko-dic dictionary, no system deps. ~30s compile on first install.
+
+Manual install from repo:
+
+```bash
+cd preprocessors/ko/lindera-tokenize && cargo build --release
+ir preprocessor add ko ./target/release/lindera-tokenize
+```
+
+**Other languages:**
+
+```bash
+ir preprocessor install ja           # Japanese (MeCab shell wrapper)
+ir preprocessor install ja-lindera   # Japanese (lindera, no MeCab dep)
+ir preprocessor install zh-bigram    # Chinese (bigram tokenizer)
+```
+
+**Manage:**
+
+```bash
+ir preprocessor list
+ir preprocessor remove ko
+```
+
+The protocol is stdin/stdout line-by-line: one UTF-8 line in, one tokenized line out, process stays alive between lines. Any executable following this protocol can be registered.
+
+Lindera throughput: ~5,600 Korean docs/s · 1.8 MB/s on M-series Mac. Near-zero cold start (Rust binary, embedded dictionary).
+
+**Korean BM25 benchmark** (MIRACL-Korean, 213 queries):
+
+| preprocessor | nDCG@10 | note |
+|---|---|---|
+| none | 0.0009 | agglutinated tokens never match |
+| lindera | 0.0460 | 50× gain from morphological tokenization |
+| lindera hybrid+rerank | **0.8411** | near-ceiling on 2,835 passages |
+
+Compound decompounding benchmark (50 queries targeting compound sub-components):
+
+| preprocessor | nDCG@10 | note |
+|---|---|---|
+| none | 0.0000 | sub-parts absent from FTS index |
+| lindera | **0.6326** | Mode::Decompose splits compounds |
+
+See [research/experiment.md](research/experiment.md) for full results and rationale.
+
+</details>
+
+<details>
+<summary><strong>Search Pipeline</strong></summary>
 
 ```
 Query → BM25 probe → score fusion (0.80·vec + 0.20·bm25) → reranking
@@ -130,7 +204,10 @@ All LLM outputs cached in SQLite — repeated queries skip inference entirely.
 
 See [research/pipeline.md](research/pipeline.md) for staged async daemon design.
 
-## Benchmark: BEIR (4 datasets, nDCG@10)
+</details>
+
+<details>
+<summary><strong>Benchmark — BEIR (4 datasets, nDCG@10)</strong></summary>
 
 EmbeddingGemma 300M embeddings + qmd-expander-1.7B + Qwen3-Reranker-0.6B.
 
@@ -141,11 +218,14 @@ EmbeddingGemma 300M embeddings + qmd-expander-1.7B + Qwen3-Reranker-0.6B.
 | FiQA (648q) | 0.0298 | 0.4324 | 0.4266 | **0.4567** | +7.1% |
 | ArguAna (1406q) | 0.0012 | 0.4264 | 0.4263 | **0.4879** | +14.5% |
 
-BM25 fusion (0.80·vec + 0.20·bm25) provides no statistically significant lift over pure vector on any dataset (paired t-test). Reranker gains are largest on conversational/argument retrieval tasks.
+BM25 fusion provides no statistically significant lift over pure vector (paired t-test). Reranker gains are largest on conversational/argument retrieval.
 
 See [research/experiment.md](research/experiment.md) for reproduction steps.
 
-## vs qmd
+</details>
+
+<details>
+<summary><strong>vs qmd</strong></summary>
 
 ir is a Rust port of [qmd](https://github.com/tobi/qmd) with a different storage model and a persistent daemon.
 
@@ -158,12 +238,51 @@ ir is a Rust port of [qmd](https://github.com/tobi/qmd) with a different storage
 | LLM cache | Reranker scores (per-collection) | Reranker scores + expander outputs (global) |
 | Quality (NFCorpus nDCG@10) | No published numbers | 0.4001 |
 
-### Performance (macOS M4 Max, same models and query)
+**Performance** (macOS M4 Max, same models and query):
 
 | | ir | qmd | Ratio |
 |---|---:|---:|---|
 | **Cold** (no cache) | 3.0s | 9.5s | **3×** |
 | **Warm** (daemon + caches hot) | 30ms | 840ms | **28×** |
 
-Same GGUF models (`qmd-query-expansion-1.7B` + `qwen3-reranker-0.6b`) — LLM inference time is identical. Cold difference: ir caps reranking at 20 candidates vs qmd's 40. Warm difference: qmd pays ~800ms process spawn + JS runtime per invocation; ir's daemon round-trip is 30ms (embed + kNN only).
+Cold difference: ir caps reranking at 20 candidates vs qmd's 40. Warm difference: qmd pays ~800ms process spawn + JS runtime per invocation; ir's daemon round-trip is 30ms (embed + kNN only).
 
+</details>
+
+<details>
+<summary><strong>Development</strong></summary>
+
+```bash
+cargo build                  # debug build
+cargo build --release        # release build
+cargo test                   # unit tests (no models required)
+cargo test -- --ignored      # model-dependent tests (requires models)
+cargo run --bin eval -- --data test-data/nfcorpus --mode all
+```
+
+</details>
+
+<details>
+<summary><strong>Schema</strong></summary>
+
+Each collection database (`~/.config/ir/collections/<name>.sqlite`):
+
+```
+content          — hash → full text (content-addressed)
+documents        — path, title, hash, active flag
+documents_fts    — FTS5 virtual table (porter tokenizer)
+vectors_vec      — sqlite-vec kNN (768d cosine, EmbeddingGemma format)
+content_vectors  — chunk metadata (hash, seq, pos, model)
+llm_cache        — reranker score cache (sha256(model+query+doc) → score)
+meta             — collection metadata (name, schema version)
+```
+
+Global cache (`~/.config/ir/expander_cache.sqlite`):
+
+```
+expander_cache   — sha256(model+query) → JSON Vec<SubQuery>
+```
+
+Triggers keep `documents_fts` in sync with `documents` on insert/update/delete.
+
+</details>

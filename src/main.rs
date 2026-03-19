@@ -174,10 +174,12 @@ fn handle_update(collection: Option<String>, force: bool) -> Result<()> {
 
     for col in cols {
         let db_path = collection_db_path(&col.name);
-        let db = db::CollectionDb::open(&col.name, &db_path)?;
+        let pp_aliases = col.preprocessor.as_deref().unwrap_or(&[]);
+        let has_preprocessor = !config.resolve_preprocessor_commands(pp_aliases).is_empty();
+        let db = db::CollectionDb::open(&col.name, &db_path, has_preprocessor)?;
         println!("updating '{}'…", col.name);
         let opts = index::UpdateOptions { force };
-        let (added, updated, deactivated) = index::update(&db, col, &opts)?;
+        let (added, updated, deactivated) = index::update(&db, col, &opts, &config)?;
         println!(
             "  {} added, {} updated, {} deactivated",
             added, updated, deactivated
@@ -222,7 +224,9 @@ fn handle_search(
         .collect();
     let dbs: Vec<db::CollectionDb> = cols.iter()
         .map(|c| {
-            db::CollectionDb::open_rw(&c.name, &collection_db_path(&c.name))
+            let pp_aliases = c.preprocessor.as_deref().unwrap_or(&[]);
+            let pp_commands = config.resolve_preprocessor_commands(pp_aliases);
+            db::CollectionDb::open_rw(&c.name, &collection_db_path(&c.name), pp_commands)
         })
         .collect::<Result<Vec<_>>>()?;
 
@@ -488,7 +492,9 @@ fn handle_embed(collection: Option<String>, force: bool) -> Result<()> {
 
     for col in cols {
         let db_path = collection_db_path(&col.name);
-        let db = db::CollectionDb::open(&col.name, &db_path)?;
+        let pp_aliases = col.preprocessor.as_deref().unwrap_or(&[]);
+        let has_preprocessor = !config.resolve_preprocessor_commands(pp_aliases).is_empty();
+        let db = db::CollectionDb::open(&col.name, &db_path, has_preprocessor)?;
         println!("embedding '{}'…", col.name);
         let opts = index::embed::EmbedOptions { force };
         let (docs, chunks) = index::embed::embed(&db, &embedder, &opts, llm::models::EMBEDDING)?;
