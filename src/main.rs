@@ -403,14 +403,13 @@ fn handle_preprocessor(cmd: PreprocessorCmd) -> Result<()> {
                 .collect();
             if !uninstalled.is_empty() {
                 if !entries.is_empty() { println!(); }
-                println!("available:");
+                println!("available (ir preprocessor install <lang>):");
                 for k in uninstalled {
-                    println!("  {:<10} {}  (ir preprocessor install {})", k.alias, k.description, k.alias);
+                    println!("  {:<10} {}", k.alias, k.description);
                 }
             }
-            if entries.is_empty() && known.iter().all(|k| !config.preprocessors.contains_key(k.alias)) {
-                println!("no preprocessors registered. Run `ir preprocessor list` to see available.");
-            }
+            println!();
+            println!("  custom: ir preprocessor add <alias> <command>");
         }
         PreprocessorCmd::Remove { alias, delete } => {
             let cmd = config.preprocessors.get(&alias).cloned();
