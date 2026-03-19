@@ -166,8 +166,16 @@ pub enum PreprocessorCmd {
         #[arg(long, short = 'd')]
         delete: bool,
     },
-    /// Add a preprocessor to a collection and re-index
-    Bind { alias: String, collection: Option<String> },
+    /// Wire a registered preprocessor alias to a collection and re-index
+    Bind {
+        /// Registered preprocessor alias (e.g. "ko", "ja"). Run `ir preprocessor list` to see available aliases.
+        alias: String,
+        collection: Option<String>,
+    },
     /// Remove a preprocessor from a collection and re-index
-    Unbind { alias: String, collection: String },
+    Unbind {
+        /// Registered preprocessor alias (e.g. "ko", "ja")
+        alias: String,
+        collection: String,
+    },
 }

@@ -130,10 +130,14 @@ fn handle_collection(cmd: CollectionCmd) -> Result<()> {
                 println!("no collections configured");
             } else {
                 for c in &config.collections {
+                    let pp = c.preprocessor.as_ref()
+                        .filter(|v| !v.is_empty())
+                        .map(|v| format!("  [{}]", v.join(", ")))
+                        .unwrap_or_default();
                     if let Some(desc) = &c.description {
-                        println!("{:<20} {}  # {}", c.name, c.path, desc);
+                        println!("{:<20} {}{}  # {}", c.name, c.path, pp, desc);
                     } else {
-                        println!("{:<20} {}", c.name, c.path);
+                        println!("{:<20} {}{}", c.name, c.path, pp);
                     }
                 }
             }
@@ -413,8 +417,14 @@ fn handle_preprocessor(cmd: PreprocessorCmd) -> Result<()> {
         }
         PreprocessorCmd::Bind { alias, collection } => {
             if !config.preprocessors.contains_key(&alias) {
+                let known_aliases: Vec<&str> = known_preprocessors().iter().map(|k| k.alias).collect();
+                let hint = if known_aliases.contains(&alias.as_str()) {
+                    format!("run: ir preprocessor install {alias}")
+                } else {
+                    format!("run: ir preprocessor add {alias} <command>  (or `ir preprocessor list` to see options)")
+                };
                 return Err(error::Error::Other(format!(
-                    "preprocessor '{alias}' not registered. Run: ir preprocessor install {alias}"
+                    "preprocessor alias '{alias}' not registered — {hint}"
                 )));
             }
             let targets = match collection {
@@ -429,7 +439,9 @@ fn handle_preprocessor(cmd: PreprocessorCmd) -> Result<()> {
                 if !pp.contains(&alias) { pp.push(alias.clone()); }
                 config.save()?;
                 println!("bound '{alias}' to '{name}', re-indexing…");
-                handle_update(Some(name), false)?;
+                if let Err(e) = handle_update(Some(name.clone()), false) {
+                    eprintln!("warning: re-index failed for '{name}': {e}");
+                }
             }
         }
         PreprocessorCmd::Unbind { alias, collection } => {
