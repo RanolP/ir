@@ -1,0 +1,8 @@
+[package]
+name = "bigram-tokenize-zh"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "bigram-tokenize-zh"
+path = "src/main.rs"
