@@ -1,3 +1,12 @@
+## [0.6.2] - 2026-03-19
+
+### Features
+
+- `ir preprocessor list` now shows registered preprocessors and available bundled ones ([`9193ad9`](https://github.com/vlwkaos/ir/commit/9193ad9))
+- `ir preprocessor remove` is soft by default; `--delete` / `-d` also removes the binary if installed under the ir preprocessors dir ([`9193ad9`](https://github.com/vlwkaos/ir/commit/9193ad9))
+- `ir preprocessor install` now downloads pre-built binaries from GitHub releases instead of building from crates.io ([`9193ad9`](https://github.com/vlwkaos/ir/commit/9193ad9))
+- Preprocessor binaries (`lindera-tokenize`, `lindera-tokenize-ja`, `bigram-tokenize-zh`) are now built and uploaded as release assets ([`9193ad9`](https://github.com/vlwkaos/ir/commit/9193ad9))
+
 ## [0.6.0] - 2026-03-19
 
 ### Features
