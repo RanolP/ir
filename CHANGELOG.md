@@ -1,3 +1,25 @@
+## [0.6.0] - 2026-03-19
+
+### Features
+
+- Japanese and Chinese preprocessing support (WIP) ([`b281bc6`](https://github.com/vlwkaos/ir/commit/b281bc6))
+- Korean preprocessor switched to Lindera tokenizer with compound noun decompounding ([`66f6808`](https://github.com/vlwkaos/ir/commit/66f6808))
+- Preprocessor pipeline now warms subprocess per-request for lower latency ([`e316fb4`](https://github.com/vlwkaos/ir/commit/e316fb4))
+- Daemon hot-reloads config on SIGHUP ([`b25e3ea`](https://github.com/vlwkaos/ir/commit/b25e3ea))
+- Preprocessor subcommand added to CLI ([`d330d47`](https://github.com/vlwkaos/ir/commit/d330d47))
+- Preprocessor parallelism support ([`854784e`](https://github.com/vlwkaos/ir/commit/854784e))
+- DB threads preprocessor commands ([`9112e64`](https://github.com/vlwkaos/ir/commit/9112e64))
+- Compound noun decompounding benchmark added to eval ([`fa210e8`](https://github.com/vlwkaos/ir/commit/fa210e8))
+
+### Bug Fixes
+
+- BM25 strong-signal items now propagate correctly through the pipeline ([`64a5fd6`](https://github.com/vlwkaos/ir/commit/64a5fd6))
+- Consolidated preprocessor install list and fixed download URL ([`555be35`](https://github.com/vlwkaos/ir/commit/555be35))
+
+### Refactor
+
+- Korean preprocessing consolidated to Lindera ([`355625e`](https://github.com/vlwkaos/ir/commit/355625e))
+
 ## [0.5.1] - 2026-03-12
 
 ### Features
