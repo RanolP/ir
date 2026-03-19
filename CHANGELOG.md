@@ -1,3 +1,16 @@
+## [0.6.3] - 2026-03-19
+
+### Features
+
+- `ir preprocessor bind <alias> [collection]` — wire a preprocessor to a collection and re-index; omitting collection shows an interactive multiselect picker ([`6ed9515`](https://github.com/vlwkaos/ir/commit/6ed9515))
+- `ir preprocessor unbind <alias> <collection>` — remove a preprocessor from a collection and re-index ([`6ed9515`](https://github.com/vlwkaos/ir/commit/6ed9515))
+- `ir preprocessor install` now launches the collection picker after download ([`6ed9515`](https://github.com/vlwkaos/ir/commit/6ed9515))
+- `ir preprocessor list` shows install hint in section header and custom add tip ([`4230d82`](https://github.com/vlwkaos/ir/commit/4230d82))
+
+### Docs
+
+- Preprocessor guide updated for binary download install, correct lang codes, and new bind/unbind commands ([`5e134bf`](https://github.com/vlwkaos/ir/commit/5e134bf))
+
 ## [0.6.2] - 2026-03-19
 
 ### Features
