@@ -5,7 +5,7 @@
 use std::io::{self, BufRead, Write};
 
 use lindera::dictionary::load_dictionary;
-use lindera::mode::Mode;
+use lindera::mode::{Mode, Penalty};
 use lindera::segmenter::Segmenter;
 use lindera::tokenizer::Tokenizer;
 
@@ -19,7 +19,17 @@ fn is_content(tag: &str) -> bool {
 
 fn main() -> lindera::LinderaResult<()> {
     let dictionary = load_dictionary("embedded://ko-dic")?;
-    let segmenter = Segmenter::new(Mode::Normal, dictionary, None);
+    // ! other_penalty_length_threshold=2: Hangul is "other" (not kanji), default=7 skips all short compounds
+    let segmenter = Segmenter::new(
+        Mode::Decompose(Penalty {
+            kanji_penalty_length_threshold: 2,
+            kanji_penalty_length_penalty: 3000,
+            other_penalty_length_threshold: 2,
+            other_penalty_length_penalty: 3000,
+        }),
+        dictionary,
+        None,
+    );
     let tokenizer = Tokenizer::new(segmenter);
 
     let stdin = io::stdin();
