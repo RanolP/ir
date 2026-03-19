@@ -1,3 +1,15 @@
+## [0.6.4] - 2026-03-20
+
+### Features
+
+- `ir collection ls` now shows bound preprocessors per collection as `[alias, ...]` ([`644ee1f`](https://github.com/vlwkaos/ir/commit/644ee1f))
+
+### Bug Fixes
+
+- `ir preprocessor bind`: re-index failure is now a warning instead of a fatal error — binding is saved regardless ([`644ee1f`](https://github.com/vlwkaos/ir/commit/644ee1f))
+- `ir preprocessor bind`: clearer error when alias is not registered, with `install` or `add` hint depending on whether alias is a known bundled preprocessor ([`644ee1f`](https://github.com/vlwkaos/ir/commit/644ee1f))
+- Daemon race: parallel `ir search` invocations no longer spawn duplicate daemons; flock on `daemon.lock` ensures only one client spawns the process ([`d45d817`](https://github.com/vlwkaos/ir/commit/d45d817))
+
 ## [0.6.3] - 2026-03-19
 
 ### Features
