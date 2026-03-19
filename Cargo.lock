@@ -876,6 +876,7 @@ dependencies = [
  "hf-hub",
  "ignore",
  "indicatif",
+ "libc",
  "llama-cpp-2",
  "memmap2",
  "rayon",

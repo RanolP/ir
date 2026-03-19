@@ -18,7 +18,7 @@ use crate::types::SearchMode;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::{fs::PermissionsExt, io::AsRawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -83,26 +83,75 @@ pub fn is_running() -> bool {
     UnixStream::connect(config::daemon_socket_path()).is_ok()
 }
 
+fn open_lock_file() -> Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(config::daemon_lock_path())
+        .map_err(Error::Io)
+}
+
+/// Try a non-blocking exclusive flock on `daemon.lock`.
+/// Returns the open File (lock held as long as it's alive) or None if already locked.
+fn try_lock_daemon() -> Result<Option<std::fs::File>> {
+    let file = open_lock_file()?;
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        if err.kind() == std::io::ErrorKind::WouldBlock {
+            return Ok(None); // another process holds the lock
+        }
+        return Err(Error::Io(err));
+    }
+    Ok(Some(file))
+}
+
+/// Acquire a blocking exclusive flock on `daemon.lock`.
+/// Blocks until the lock is available; returns the File (lock held as long as it's alive).
+fn lock_daemon() -> Result<std::fs::File> {
+    let file = open_lock_file()?;
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+    if rc != 0 {
+        return Err(Error::Io(std::io::Error::last_os_error()));
+    }
+    Ok(file)
+}
+
 /// Spawn `ir daemon start` as a detached background process.
 /// Stderr is redirected to `~/.config/ir/daemon.log`.
+/// Uses a non-blocking flock so parallel `ir search` invocations don't each
+/// spawn their own daemon — only the first one wins; the rest skip and call
+/// wait_ready() to block until the winning daemon's socket is live.
 pub fn start_in_background() -> Result<()> {
-    let exe = std::env::current_exe().map_err(Error::Io)?;
-    let log_path = config::daemon_socket_path()
-        .parent()
-        .unwrap_or(std::path::Path::new("/tmp"))
-        .join("daemon.log");
-    let log_file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-        .map_err(Error::Io)?;
-    std::process::Command::new(exe)
-        .args(["daemon", "start"])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(log_file)
-        .spawn()
-        .map_err(|e| Error::Other(format!("spawn daemon: {e}")))?;
+    // Try non-blocking lock. If another process is already starting the daemon,
+    // skip the spawn — wait_ready() will pick up the socket once it's live.
+    match try_lock_daemon()? {
+        None => return Ok(()), // another process is starting the daemon
+        Some(_lock) => {
+            // Double-check under the lock — daemon may have come up while we waited.
+            if is_running() {
+                return Ok(());
+            }
+            let exe = std::env::current_exe().map_err(Error::Io)?;
+            let log_path = config::daemon_socket_path()
+                .parent()
+                .unwrap_or(std::path::Path::new("/tmp"))
+                .join("daemon.log");
+            let log_file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_path)
+                .map_err(Error::Io)?;
+            std::process::Command::new(exe)
+                .args(["daemon", "start"])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(log_file)
+                .spawn()
+                .map_err(|e| Error::Other(format!("spawn daemon: {e}")))?;
+            // _lock dropped here — daemon process will acquire its own lock in start_server
+        }
+    }
     Ok(())
 }
 
@@ -240,7 +289,18 @@ pub fn start_server(timeout_secs: u64) -> Result<()> {
             .map_err(Error::Io)?;
     }
 
-    // Remove stale files; next start will always replace them.
+    // Acquire exclusive lock before touching the socket file.
+    // Blocks if a client's start_in_background is mid-flight; prevents two
+    // servers from racing to remove/bind the same socket path.
+    let startup_lock = lock_daemon()?;
+
+    // Under the lock: bail if another daemon already won the race.
+    if is_running() {
+        eprintln!("daemon: already running, exiting");
+        return Ok(());
+    }
+
+    // Remove stale files; safe — we hold the lock.
     if sock_path.exists() { std::fs::remove_file(&sock_path).map_err(Error::Io)?; }
     let _ = std::fs::remove_file(&tier2_path);
 
@@ -268,6 +328,10 @@ pub fn start_server(timeout_secs: u64) -> Result<()> {
         .map_err(Error::Io)?;
     // Write PID immediately so stop() works from tier-1 onward.
     std::fs::write(&pid_path, std::process::id().to_string()).map_err(Error::Io)?;
+
+    // Socket is live — release the startup lock so any waiting clients can
+    // proceed (is_running() will now return true, preventing duplicate spawns).
+    drop(startup_lock);
 
     let timeout_msg = if timeout_secs > 0 { format!("  timeout={}s", timeout_secs) } else { "  timeout=never".into() };
     eprintln!("daemon ready (tier 1)  socket={}{}", sock_path.display(), timeout_msg);
