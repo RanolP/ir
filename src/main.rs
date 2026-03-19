@@ -411,6 +411,42 @@ fn handle_preprocessor(cmd: PreprocessorCmd) -> Result<()> {
             println!();
             println!("  custom: ir preprocessor add <alias> <command>");
         }
+        PreprocessorCmd::Bind { alias, collection } => {
+            if !config.preprocessors.contains_key(&alias) {
+                return Err(error::Error::Other(format!(
+                    "preprocessor '{alias}' not registered. Run: ir preprocessor install {alias}"
+                )));
+            }
+            let targets = match collection {
+                Some(name) => vec![name],
+                None => pick_collections_for_bind(&config, &alias)?,
+            };
+            for name in targets {
+                let col = config.collections.iter_mut()
+                    .find(|c| c.name == name)
+                    .ok_or_else(|| error::Error::Other(format!("collection '{name}' not found")))?;
+                let pp = col.preprocessor.get_or_insert_with(Vec::new);
+                if !pp.contains(&alias) { pp.push(alias.clone()); }
+                config.save()?;
+                println!("bound '{alias}' to '{name}', re-indexing…");
+                handle_update(Some(name), false)?;
+            }
+        }
+        PreprocessorCmd::Unbind { alias, collection } => {
+            let col = config.collections.iter_mut()
+                .find(|c| c.name == collection)
+                .ok_or_else(|| error::Error::Other(format!("collection '{collection}' not found")))?;
+            let pp = col.preprocessor.get_or_insert_with(Vec::new);
+            if !pp.contains(&alias) {
+                println!("'{alias}' not bound to '{collection}'");
+            } else {
+                pp.retain(|a| a != &alias);
+                if pp.is_empty() { col.preprocessor = None; }
+                config.save()?;
+                println!("unbound '{alias}' from '{collection}', re-indexing…");
+                handle_update(Some(collection), false)?;
+            }
+        }
         PreprocessorCmd::Remove { alias, delete } => {
             let cmd = config.preprocessors.get(&alias).cloned();
             config.remove_preprocessor(&alias)?;
@@ -461,6 +497,33 @@ fn known_preprocessors() -> &'static [KnownPreprocessor] {
             kind: PreprocessorKind::Binary { binary_name: "bigram-tokenize-zh" },
         },
     ]
+}
+
+/// Interactively pick collections to bind an alias to.
+/// Shows all collections with current preprocessors; pre-checks ones already bound.
+/// Returns selected collection names.
+fn pick_collections_for_bind(config: &Config, alias: &str) -> Result<Vec<String>> {
+    if config.collections.is_empty() {
+        println!("no collections configured");
+        return Ok(vec![]);
+    }
+    let items: Vec<String> = config.collections.iter().map(|c| {
+        let pp = match c.preprocessor.as_deref() {
+            Some(pp) if !pp.is_empty() => format!(" [{}]", pp.join(", ")),
+            _ => String::new(),
+        };
+        format!("{}{}", c.name, pp)
+    }).collect();
+    let defaults: Vec<bool> = config.collections.iter()
+        .map(|c| c.preprocessor.as_deref().unwrap_or(&[]).contains(&alias.to_string()))
+        .collect();
+    let selections = dialoguer::MultiSelect::new()
+        .with_prompt(format!("bind '{alias}' to collections (space to toggle, enter to confirm)"))
+        .items(&items)
+        .defaults(&defaults)
+        .interact()
+        .map_err(|e| error::Error::Other(format!("prompt: {e}")))?;
+    Ok(selections.into_iter().map(|i| config.collections[i].name.clone()).collect())
 }
 
 /// Download/install a bundled preprocessor and register it.
@@ -542,6 +605,21 @@ fn install_preprocessor(config: &mut Config, lang: &str) -> Result<()> {
     config.add_preprocessor(alias, &cmd_str)?;
     config.save()?;
     println!("installed '{alias}' preprocessor → {cmd_str}");
+
+    if !config.collections.is_empty() {
+        println!();
+        let targets = pick_collections_for_bind(config, alias)?;
+        for name in targets {
+            let col = config.collections.iter_mut()
+                .find(|c| c.name == name).unwrap();
+            let pp = col.preprocessor.get_or_insert_with(Vec::new);
+            if !pp.contains(&alias.to_string()) { pp.push(alias.to_string()); }
+            config.save()?;
+            println!("bound '{alias}' to '{name}', re-indexing…");
+            handle_update(Some(name), false)?;
+        }
+    }
+
     Ok(())
 }
 

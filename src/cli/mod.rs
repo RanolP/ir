@@ -154,7 +154,7 @@ pub enum PreprocessorCmd {
     },
     /// Download and register a bundled preprocessor wrapper
     Install {
-        /// Language code to install (ko, ja, ja-lindera, zh-bigram)
+        /// Language code to install (ko, ja, zh)
         lang: String,
     },
     /// List registered preprocessors and available bundled ones
@@ -166,4 +166,8 @@ pub enum PreprocessorCmd {
         #[arg(long, short = 'd')]
         delete: bool,
     },
+    /// Add a preprocessor to a collection and re-index
+    Bind { alias: String, collection: Option<String> },
+    /// Remove a preprocessor from a collection and re-index
+    Unbind { alias: String, collection: String },
 }
