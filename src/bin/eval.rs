@@ -2226,6 +2226,7 @@ fn main() -> Result<()> {
                     &doc_texts,
                     mode_name,
                     &cmp_run_key,
+                    preprocess_chain.as_mut(),
                 );
                 println!("done");
 

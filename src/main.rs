@@ -413,17 +413,15 @@ fn install_preprocessor(config: &mut Config, lang: &str) -> Result<()> {
     struct Entry { alias: &'static str, kind: Kind }
 
     let known: &[Entry] = &[
-        Entry { alias: "ko",         kind: Kind::Cargo  { crate_name: "lindera-tokenize" } },
-        Entry { alias: "ja",         kind: Kind::Script { repo_subdir: "ja", script_name: "mecab-tokenize" } },
-        Entry { alias: "ja-lindera", kind: Kind::Cargo  { crate_name: "lindera-tokenize-ja" } },
-        Entry { alias: "zh-bigram",  kind: Kind::Cargo  { crate_name: "bigram-tokenize-zh" } },
+        Entry { alias: "ko", kind: Kind::Cargo  { crate_name: "lindera-tokenize" } },
+        Entry { alias: "ja", kind: Kind::Script { repo_subdir: "ja", script_name: "mecab-tokenize" } },
     ];
 
     let entry = known
         .iter()
         .find(|e| e.alias == lang)
         .ok_or_else(|| error::Error::Other(
-            format!("unknown lang '{lang}'. Available: ko, ja, ja-lindera, zh-bigram")
+            format!("unknown lang '{lang}'. Available: ko, ja")
         ))?;
 
     let cmd_str = match &entry.kind {
@@ -432,7 +430,7 @@ fn install_preprocessor(config: &mut Config, lang: &str) -> Result<()> {
             std::fs::create_dir_all(&install_dir)?;
             let script_path = install_dir.join(script_name);
             let url = format!(
-                "https://raw.githubusercontent.com/vlwkaos/ir/korean/preprocessors/{repo_subdir}/{script_name}"
+                "https://raw.githubusercontent.com/vlwkaos/ir/main/preprocessors/{repo_subdir}/{script_name}"
             );
             let status = std::process::Command::new("curl")
                 .args(["-fsSL", &url, "-o", &script_path.to_string_lossy()])
