@@ -157,10 +157,13 @@ pub enum PreprocessorCmd {
         /// Language code to install (ko, ja, ja-lindera, zh-bigram)
         lang: String,
     },
-    /// List registered preprocessors
+    /// List registered preprocessors and available bundled ones
     List,
-    /// Remove a preprocessor alias
+    /// Unregister a preprocessor alias (soft by default)
     Remove {
         alias: String,
+        /// Also delete the binary if installed under the ir preprocessors dir
+        #[arg(long, short = 'd')]
+        delete: bool,
     },
 }

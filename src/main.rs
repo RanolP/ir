@@ -388,46 +388,134 @@ fn handle_preprocessor(cmd: PreprocessorCmd) -> Result<()> {
             install_preprocessor(&mut config, &lang)?;
         }
         PreprocessorCmd::List => {
-            if config.preprocessors.is_empty() {
-                println!("no preprocessors registered");
-            } else {
-                let mut entries: Vec<_> = config.preprocessors.iter().collect();
-                entries.sort_by_key(|(k, _)| k.as_str());
-                for (alias, cmd) in entries {
-                    println!("{:<12} {}", alias, cmd);
+            let known = known_preprocessors();
+            let mut entries: Vec<_> = config.preprocessors.iter().collect();
+            entries.sort_by_key(|(k, _)| k.as_str());
+            if !entries.is_empty() {
+                println!("registered:");
+                for (alias, cmd) in &entries {
+                    println!("  {:<10} {}", alias, cmd);
                 }
             }
+            let uninstalled: Vec<_> = known
+                .iter()
+                .filter(|k| !config.preprocessors.contains_key(k.alias))
+                .collect();
+            if !uninstalled.is_empty() {
+                if !entries.is_empty() { println!(); }
+                println!("available:");
+                for k in uninstalled {
+                    println!("  {:<10} {}  (ir preprocessor install {})", k.alias, k.description, k.alias);
+                }
+            }
+            if entries.is_empty() && known.iter().all(|k| !config.preprocessors.contains_key(k.alias)) {
+                println!("no preprocessors registered. Run `ir preprocessor list` to see available.");
+            }
         }
-        PreprocessorCmd::Remove { alias } => {
+        PreprocessorCmd::Remove { alias, delete } => {
+            let cmd = config.preprocessors.get(&alias).cloned();
             config.remove_preprocessor(&alias)?;
             config.save()?;
+            if delete {
+                if let Some(cmd_str) = cmd {
+                    let path = std::path::Path::new(&cmd_str);
+                    let preprocess_dir = config::ir_dir().join("preprocessors");
+                    if path.starts_with(&preprocess_dir) && path.is_file() {
+                        std::fs::remove_file(path).map_err(error::Error::Io)?;
+                        println!("deleted {}", path.display());
+                    } else {
+                        println!("note: '{cmd_str}' is outside the ir preprocessors dir, not deleted");
+                    }
+                }
+            }
             println!("removed preprocessor '{alias}'");
         }
     }
     Ok(())
 }
 
+enum PreprocessorKind {
+    Binary { binary_name: &'static str },
+    Script { repo_subdir: &'static str, script_name: &'static str },
+}
+struct KnownPreprocessor {
+    alias: &'static str,
+    description: &'static str,
+    kind: PreprocessorKind,
+}
+
+fn known_preprocessors() -> &'static [KnownPreprocessor] {
+    &[
+        KnownPreprocessor {
+            alias: "ko",
+            description: "Korean morphological analysis (Lindera + ko-dic)",
+            kind: PreprocessorKind::Binary { binary_name: "lindera-tokenize" },
+        },
+        KnownPreprocessor {
+            alias: "ja",
+            description: "Japanese tokenization (MeCab)",
+            kind: PreprocessorKind::Script { repo_subdir: "ja", script_name: "mecab-tokenize" },
+        },
+        KnownPreprocessor {
+            alias: "zh",
+            description: "Chinese bigram tokenization",
+            kind: PreprocessorKind::Binary { binary_name: "bigram-tokenize-zh" },
+        },
+    ]
+}
+
 /// Download/install a bundled preprocessor and register it.
 fn install_preprocessor(config: &mut Config, lang: &str) -> Result<()> {
-    enum Kind { Script { repo_subdir: &'static str, script_name: &'static str }, Cargo { crate_name: &'static str } }
-    struct Entry { alias: &'static str, kind: Kind }
+    let known = known_preprocessors();
 
-    let known: &[Entry] = &[
-        Entry { alias: "ko", kind: Kind::Cargo  { crate_name: "lindera-tokenize" } },
-        Entry { alias: "ja", kind: Kind::Script { repo_subdir: "ja", script_name: "mecab-tokenize" } },
-    ];
-
+    let available: Vec<&str> = known.iter().map(|e| e.alias).collect();
     let entry = known
         .iter()
         .find(|e| e.alias == lang)
         .ok_or_else(|| error::Error::Other(
-            format!("unknown lang '{lang}'. Available: ko, ja")
+            format!("unknown lang '{lang}'. Available: {}", available.join(", "))
         ))?;
 
+    let install_dir = config::ir_dir().join("preprocessors").join(entry.alias);
+    std::fs::create_dir_all(&install_dir)?;
+
     let cmd_str = match &entry.kind {
-        Kind::Script { repo_subdir, script_name } => {
-            let install_dir = config::ir_dir().join("preprocessors").join(repo_subdir);
-            std::fs::create_dir_all(&install_dir)?;
+        PreprocessorKind::Binary { binary_name } => {
+            let bin_path = install_dir.join(binary_name);
+            #[cfg(target_arch = "aarch64")]
+            let arch = "darwin-arm64";
+            #[cfg(target_arch = "x86_64")]
+            let arch = "darwin-x86_64";
+            #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+            let arch = "darwin-arm64";
+            let tarball = format!("{binary_name}-{arch}.tar.gz");
+            let url = format!(
+                "https://github.com/vlwkaos/ir/releases/latest/download/{tarball}"
+            );
+            let tar_path = install_dir.join(&tarball);
+            let status = std::process::Command::new("curl")
+                .args(["-fsSL", &url, "-o", &tar_path.to_string_lossy()])
+                .status()
+                .map_err(|e| error::Error::Other(format!("curl: {e}")))?;
+            if !status.success() {
+                return Err(error::Error::Other(format!(
+                    "download failed: {url}"
+                )));
+            }
+            std::process::Command::new("tar")
+                .args(["-xzf", &tar_path.to_string_lossy(), "-C", &install_dir.to_string_lossy()])
+                .status()
+                .map_err(|e| error::Error::Other(format!("tar: {e}")))?;
+            std::fs::remove_file(&tar_path).ok();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&bin_path, std::fs::Permissions::from_mode(0o755))
+                    .map_err(error::Error::Io)?;
+            }
+            bin_path.to_string_lossy().into_owned()
+        }
+        PreprocessorKind::Script { repo_subdir, script_name } => {
             let script_path = install_dir.join(script_name);
             let url = format!(
                 "https://raw.githubusercontent.com/vlwkaos/ir/main/preprocessors/{repo_subdir}/{script_name}"
@@ -448,21 +536,6 @@ fn install_preprocessor(config: &mut Config, lang: &str) -> Result<()> {
                     .map_err(error::Error::Io)?;
             }
             script_path.to_string_lossy().into_owned()
-        }
-        Kind::Cargo { crate_name } => {
-            // Installs binary to ~/.cargo/bin/<crate_name>.
-            // Requires: cargo install <crate_name> (published on crates.io).
-            let status = std::process::Command::new("cargo")
-                .args(["install", crate_name])
-                .status()
-                .map_err(|e| error::Error::Other(format!("cargo: {e}")))?;
-            if !status.success() {
-                return Err(error::Error::Other(format!(
-                    "cargo install {crate_name} failed. Build manually from the appropriate preprocessors/ subdir:\n  cargo build --release\n  ir preprocessor add <alias> ./target/release/{crate_name}"
-                )));
-            }
-            // Binary lands in ~/.cargo/bin/ which is on PATH; register by name.
-            crate_name.to_string()
         }
     };
 
