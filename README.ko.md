@@ -28,6 +28,15 @@
 
 ## 설치
 
+**Homebrew (macOS):**
+
+```bash
+brew tap vlwkaos/tap
+brew install ir
+```
+
+**소스에서 빌드:**
+
 ```bash
 cargo install --path .
 ```

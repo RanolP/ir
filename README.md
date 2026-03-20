@@ -28,6 +28,15 @@ Search quality benchmarked on 4 BEIR datasets; reranking adds up to +14.5% nDCG@
 
 ## Installation
 
+**Homebrew (macOS):**
+
+```bash
+brew tap vlwkaos/tap
+brew install ir
+```
+
+**From source:**
+
 ```bash
 cargo install --path .
 ```
