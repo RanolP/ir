@@ -51,6 +51,20 @@ ir update notes                   # 문서 인덱싱
 ir search "러스트 메모리 안전성"  # 검색 (데몬 자동 시작)
 ```
 
+**한국어/일본어/중국어 컬렉션:**
+
+```bash
+ir preprocessor install ko        # lindera-tokenize 다운로드 및 "ko" 등록
+                                  # 설치 후 컬렉션 바인딩 피커 표시
+
+ir collection add wiki ~/wiki     # 컬렉션이 없는 경우 추가
+ir preprocessor bind ko wiki      # "ko"를 컬렉션에 연결하고 재인덱싱
+
+ir search "서울 지하철" -c wiki
+```
+
+전처리기 없이는 "이스탄불의", "検索エンジン" 같은 교착어가 하나의 FTS 토큰으로 처리되어 형태소 단위 검색이 불가합니다.
+
 <details>
 <summary><strong>모델</strong></summary>
 
