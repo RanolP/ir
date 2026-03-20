@@ -47,10 +47,12 @@ Requires Rust 1.80+. On macOS, links llama.cpp with Metal automatically.
 
 ```bash
 ir collection add notes ~/notes   # register a collection
-ir update notes                   # index documents (BM25)
-ir embed notes                    # generate embeddings (vector + hybrid search)
+ir update notes                   # scan files → extract text → populate FTS5 index (BM25)
+ir embed notes                    # chunk text → run embedding model → store vectors (enables vector + hybrid search)
 ir search "memory safety in rust" # search (daemon auto-starts)
 ```
+
+`ir update` is fast (no models, pure text processing). `ir embed` is slow on first run (model inference per chunk) but only re-embeds changed content on subsequent runs. BM25 search works after `update` alone; vector and hybrid search require `embed`.
 
 <details>
 <summary><strong>Models</strong></summary>
