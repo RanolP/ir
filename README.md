@@ -47,7 +47,8 @@ Requires Rust 1.80+. On macOS, links llama.cpp with Metal automatically.
 
 ```bash
 ir collection add notes ~/notes   # register a collection
-ir update notes                   # index documents
+ir update notes                   # index documents (BM25)
+ir embed notes                    # generate embeddings (vector + hybrid search)
 ir search "memory safety in rust" # search (daemon auto-starts)
 ```
 
