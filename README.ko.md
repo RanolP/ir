@@ -136,13 +136,14 @@ ir daemon status
 **한국어 (lindera, Mode::Decompose):**
 
 ```bash
-ir preprocessor install ko          # lindera-tokenize 설치 후 "ko"로 등록
-ir collection add wiki ~/wiki --preprocessor ko
-ir update wiki
+ir preprocessor install ko          # lindera-tokenize 다운로드 후 "ko"로 등록
+                                    # 설치 후 컬렉션 바인딩 피커 표시
+ir collection add wiki ~/wiki       # 컬렉션 추가 (아직 없는 경우)
+ir preprocessor bind ko wiki        # "ko"를 컬렉션에 연결하고 재인덱싱
 ir search "서울 지하철" -c wiki
 ```
 
-`ir preprocessor install ko`는 `cargo install lindera-tokenize`를 실행합니다. mecab-ko-dic 사전이 내장되어 별도 시스템 의존성이 없습니다. 첫 설치 시 약 30초 컴파일.
+`ir preprocessor install ko`는 GitHub 릴리즈에서 미리 빌드된 바이너리를 다운로드합니다. mecab-ko-dic 사전이 내장되어 별도 시스템 의존성이나 Rust 툴체인이 필요 없습니다.
 
 저장소에서 직접 빌드:
 
@@ -154,9 +155,8 @@ ir preprocessor add ko ./target/release/lindera-tokenize
 **다른 언어:**
 
 ```bash
-ir preprocessor install ja           # 일본어 (MeCab 래퍼)
-ir preprocessor install ja-lindera   # 일본어 (lindera, MeCab 불필요)
-ir preprocessor install zh-bigram    # 중국어 (바이그램 토크나이저)
+ir preprocessor install ja    # 일본어 (lindera)
+ir preprocessor install zh    # 중국어 (바이그램 토크나이저)
 ```
 
 **관리:**
