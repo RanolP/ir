@@ -1,3 +1,9 @@
+## [0.6.6] - 2026-03-24
+
+### Features
+
+- `ir search --full` now prints stored document text inline; falls back to snippet if content is unavailable ([`ace970a`](https://github.com/vlwkaos/ir/commit/ace970a))
+
 ## [0.6.5] - 2026-03-24
 
 ### Features
