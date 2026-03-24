@@ -12,8 +12,13 @@ PREPROCESSORS=(
 
 ARM_TARGET="aarch64-apple-darwin"
 X86_TARGET="x86_64-apple-darwin"
-HAS_ARM=$(rustup target list --installed 2>/dev/null | grep -c "^${ARM_TARGET}$" || true)
-HAS_X86=$(rustup target list --installed 2>/dev/null | grep -c "^${X86_TARGET}$" || true)
+
+for target in "$ARM_TARGET" "$X86_TARGET"; do
+    if ! rustup target list --installed 2>/dev/null | grep -q "^${target}$"; then
+        echo "ERROR: required target '$target' not installed. Run: rustup target add $target"
+        exit 1
+    fi
+done
 
 for entry in "${PREPROCESSORS[@]}"; do
     dir="${entry%%:*}"
@@ -22,31 +27,15 @@ for entry in "${PREPROCESSORS[@]}"; do
     echo "Building preprocessor: $bin"
     pushd "$dir" > /dev/null
 
-    if [[ "$HAS_ARM" -gt 0 && "$HAS_X86" -gt 0 ]]; then
-        MACOSX_DEPLOYMENT_TARGET=11.0  cargo build --release --target "$ARM_TARGET"
-        MACOSX_DEPLOYMENT_TARGET=10.15 cargo build --release --target "$X86_TARGET"
-        lipo -create -output "target/release/$bin" \
-            "target/$ARM_TARGET/release/$bin" \
-            "target/$X86_TARGET/release/$bin"
-        tarball="${bin}-darwin-universal.tar.gz"
-        tar -czf "$tarball" -C target/release "$bin"
-        gh release upload "v$VERSION" "$tarball" --clobber
-        rm -f "$tarball"
-    elif [[ "$HAS_ARM" -gt 0 ]]; then
-        MACOSX_DEPLOYMENT_TARGET=11.0 cargo build --release --target "$ARM_TARGET"
-        cp "target/$ARM_TARGET/release/$bin" "target/release/$bin"
-        tarball="${bin}-darwin-arm64.tar.gz"
-        tar -czf "$tarball" -C target/release "$bin"
-        gh release upload "v$VERSION" "$tarball" --clobber
-        rm -f "$tarball"
-    else
-        MACOSX_DEPLOYMENT_TARGET=10.15 cargo build --release --target "$X86_TARGET"
-        cp "target/$X86_TARGET/release/$bin" "target/release/$bin"
-        tarball="${bin}-darwin-x86_64.tar.gz"
-        tar -czf "$tarball" -C target/release "$bin"
-        gh release upload "v$VERSION" "$tarball" --clobber
-        rm -f "$tarball"
-    fi
+    MACOSX_DEPLOYMENT_TARGET=11.0  cargo build --release --target "$ARM_TARGET"
+    MACOSX_DEPLOYMENT_TARGET=10.15 cargo build --release --target "$X86_TARGET"
+    lipo -create -output "target/release/$bin" \
+        "target/$ARM_TARGET/release/$bin" \
+        "target/$X86_TARGET/release/$bin"
+    tarball="${bin}-darwin-universal.tar.gz"
+    tar -czf "$tarball" -C target/release "$bin"
+    gh release upload "v$VERSION" "$tarball" --clobber
+    rm -f "$tarball"
 
     echo "Uploaded $bin to v$VERSION"
     popd > /dev/null
