@@ -1,3 +1,15 @@
+## [0.6.5] - 2026-03-24
+
+### Features
+
+- Japanese preprocessor (`ir preprocessor install ja`) now uses the self-contained `lindera-tokenize-ja` binary (Lindera + ipadic) instead of a MeCab shell script ([`1d89779`](https://github.com/vlwkaos/ir/commit/1d89779))
+- Japanese POS filter now includes フィラー (filler words), matching Lucene kuromoji default stoptags ([`1d89779`](https://github.com/vlwkaos/ir/commit/1d89779))
+
+### Docs
+
+- Added Japanese and Chinese preprocessor research to `research/experiment.md` — ipadic vs unidic comparison, Mode::Decompose penalty rationale, bigram vs word segmentation literature with MIRACL benchmarks ([`4b4b161`](https://github.com/vlwkaos/ir/commit/4b4b161))
+- README: installation, quick start, and Korean preprocessor docs ([`0256e86`](https://github.com/vlwkaos/ir/commit/0256e86), [`4974fed`](https://github.com/vlwkaos/ir/commit/4974fed), [`2494ef7`](https://github.com/vlwkaos/ir/commit/2494ef7))
+
 ## [0.6.4] - 2026-03-20
 
 ### Features
