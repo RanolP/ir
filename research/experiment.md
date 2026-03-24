@@ -307,6 +307,82 @@ are common in Korean Wikipedia and would be completely missed without decompound
 
 ---
 
+## Japanese Preprocessor Research
+
+**Decision**: Lindera + ipadic, Mode::Decompose(Penalty::default()), filter 助詞/助動詞/記号/接続詞/感動詞/フィラー.
+
+### Dictionary: ipadic vs unidic
+
+ipadic is the correct choice. All Anserini/MIRACL baselines use Lucene kuromoji, which is ipadic-based. ipadic's coarse-grained tokenization keeps semantic units intact (e.g. 図書館 as one token); unidic over-splits (図書 + 館), which inflates the index and creates term mismatch. ipadic has not been updated since 2007, but the core vocabulary for morphological segmentation has not changed.
+
+### Mode::Decompose with default penalties
+
+`Penalty::default()` gives `kanji_penalty_length_threshold=2, other_penalty_length_threshold=7`. This matches Lucene JapaneseTokenizer Mode.SEARCH and is correct for Japanese: kanji compounds are the decomposition target, and the default kanji threshold handles them. **No Korean-style override needed** — Korean required `other_penalty_length_threshold=2` because Hangul is classified as "other" (not kanji); Japanese kanji is classified as kanji.
+
+Lucene's SEARCH mode also emits the original compound as a synonym (for IDF boosting on exact matches). Lindera's Decompose does not — only decomposed parts are emitted. Minor recall tradeoff, acceptable for FTS5 where synonym support is unavailable.
+
+### POS Tag Filtering
+
+Lucene kuromoji default stoptags filter: 助詞, 助動詞, 記号, 接続詞, フィラー (fillers: あの, えと, うん), その他-間投, 非言語音.
+Our implementation matches this plus 感動詞 (interjections, also noise in IR).
+
+フィラー added to `is_content()` — these are conversational filler words that add no retrieval signal.
+連体詞 (adnominal adjectives: この, その) deliberately kept — they carry meaning and Lucene preserves them.
+
+### Benchmarks (Anserini baselines, Lucene JapaneseAnalyzer)
+
+| Benchmark | Metric | Score |
+|-----------|--------|-------|
+| MIRACL-ja v1.0 | nDCG@10 | 0.3689 |
+| MIRACL-ja v1.0 | Recall@100 | 0.8048 |
+| Mr. TyDi Japanese | MRR@100 | 0.211 |
+| Mr. TyDi Japanese | Recall@100 | 0.645 |
+
+Japanese BM25 is substantially more effective than Korean/Chinese because Japanese has word boundaries via morphological analysis and lower agglutination than Korean.
+
+---
+
+## Chinese Preprocessor Research
+
+**Decision**: Keep bigram-tokenize-zh (overlapping character bigrams, no dictionary). This matches the Anserini/Pyserini standard baseline and is well-supported by literature.
+
+### Bigram vs Word Segmentation for BM25
+
+The key question: does dictionary-based word segmentation (jieba, pkuseg, etc.) outperform character bigrams for Chinese BM25?
+
+**Evidence for bigram:**
+
+- **Anserini/Pyserini standard**: All major Chinese IR benchmark regressions (MIRACL-zh, HC4-zh) use Lucene CJKAnalyzer — a bigram tokenizer. Pipeline: StandardTokenizer → CJKWidthFilter → LowerCaseFilter → CJKBigramFilter → StopFilter. Lucene also provides SmartChineseAnalyzer (HMM word segmentation), but it is not used in benchmark regressions.
+
+- **Foo & Li (2004)** (ACM TALIP, TREC Chinese): Compared character, word, short-word, bigram across multiple retrieval models. Bigram achieved same precision as word segmentation with ~5% better recall. Recommended bigram as the best overall compromise.
+
+- **Peng et al. (2002)** (COLING): Non-monotonic relationship between segmentation accuracy and retrieval performance. Retrieval peaks at 70-77% segmentation accuracy, then *decreases* at 85-95%. Better segmentation does not guarantee better retrieval.
+
+- **Nie et al. (1997)** (SIGIR): Dictionary-free bigram is effective for Chinese retrieval, sometimes outperforming word-based approaches.
+
+### Segmentation Mismatch Problem
+
+The strongest argument for bigram: word segmentation is context-dependent. The same character sequence can segment differently depending on surrounding context. If query and document segment the same text differently, lexical match is zero for that term. Bigram is immune — the same character sequence always produces the same bigrams.
+
+This problem compounds in IR: both indexing and querying run the same segmenter independently. Any segmentation inconsistency between the two passes directly hurts recall.
+
+### Benchmarks (Anserini CJKAnalyzer baseline)
+
+| Benchmark | Metric | Score |
+|-----------|--------|-------|
+| MIRACL-zh v1.0 | nDCG@10 | 0.1801 |
+| MIRACL-zh v1.0 | Recall@100 | 0.5599 |
+| HC4-zh dev | nDCG@20 | 0.3908 |
+| HC4-zh test | nDCG@20 | 0.2526 |
+
+Low BM25 nDCG@10 on MIRACL-zh (0.18) is inherent to lexical matching on Chinese — not a tokenization failure. Vector search (Tier 1) and expansion + reranking (Tier 2) recover signal that BM25 cannot.
+
+### Our bigram-tokenize-zh vs Lucene CJKAnalyzer
+
+Our implementation matches the Lucene baseline exactly: overlapping character bigrams for CJK runs, whitespace-split + lowercase for non-CJK. Single CJK characters emitted as-is. Unicode coverage includes Extensions A–F. Zero dependencies, deterministic, immune to segmentation mismatch.
+
+---
+
 ## Daemon mode
 
 **Problem**: `ir search` cold-starts 3–7s per query due to model loading every invocation
