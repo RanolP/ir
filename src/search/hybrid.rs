@@ -518,6 +518,7 @@ mod tests {
             snippet: None,
             hash: "h".into(),
             doc_id: "#h".into(),
+            content: None,
         };
 
         // Below floor → not strong
@@ -555,6 +556,7 @@ mod tests {
             snippet: None,
             hash: "h".into(),
             doc_id: "#h".into(),
+            content: None,
         };
 
         // Below floor → not strong
@@ -588,6 +590,7 @@ mod tests {
             snippet: None,
             hash: "h".into(),
             doc_id: "#h".into(),
+            content: None,
         };
         let results = vec![make(0.9), make(0.5), make(0.3)];
         let filtered = apply_min_score(results, Some(0.6), 10);

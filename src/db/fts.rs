@@ -212,6 +212,7 @@ fn collect_search_rows(
             snippet,
             hash,
             doc_id,
+            content: None,
         });
     }
     Ok(results)

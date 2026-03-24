@@ -14,9 +14,9 @@ pub enum Format {
     Files,
 }
 
-pub fn print_results(results: &[SearchResult], fmt: Format, full: bool) {
+pub fn print_results(results: &[SearchResult], fmt: Format) {
     match fmt {
-        Format::Pretty => pretty(results, full),
+        Format::Pretty => pretty(results),
         Format::Json => json(results),
         Format::Csv => csv_fmt(results),
         Format::Markdown => markdown(results),
@@ -24,7 +24,7 @@ pub fn print_results(results: &[SearchResult], fmt: Format, full: bool) {
     }
 }
 
-fn pretty(results: &[SearchResult], full: bool) {
+fn pretty(results: &[SearchResult]) {
     if results.is_empty() {
         println!("{}", "no results".dimmed());
         return;
@@ -45,10 +45,9 @@ fn pretty(results: &[SearchResult], full: bool) {
         if r.title != filename {
             println!("    {}", r.title.italic());
         }
-        // Content
-        if full {
-            // Full content not yet available (would need db lookup)
-            println!("    {}", "[full content: use ir get]".dimmed());
+        // Content: full text if fetched, else snippet
+        if let Some(content) = &r.content {
+            println!("{content}");
         } else if let Some(snippet) = &r.snippet {
             let cleaned = snippet.replace("<b>", "").replace("</b>", "");
             println!("    {}", cleaned.dimmed());

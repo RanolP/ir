@@ -123,6 +123,37 @@ impl CollectionDb {
     }
 }
 
+// ── content helpers ───────────────────────────────────────────────────────────
+
+/// Batch-lookup document text by content hashes.
+pub fn fetch_content_batch(conn: &Connection, hashes: &[&str]) -> HashMap<String, String> {
+    if hashes.is_empty() {
+        return HashMap::new();
+    }
+    let placeholders: Vec<&str> = hashes.iter().map(|_| "?").collect();
+    let sql = format!(
+        "SELECT hash, doc FROM content WHERE hash IN ({})",
+        placeholders.join(",")
+    );
+    let mut stmt = match conn.prepare(&sql) {
+        Ok(s) => s,
+        Err(_) => return HashMap::new(),
+    };
+    let params: Vec<&dyn rusqlite::types::ToSql> =
+        hashes.iter().map(|h| &*h as &dyn rusqlite::types::ToSql).collect();
+    let rows = match stmt.query_map(params.as_slice(), |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    }) {
+        Ok(r) => r,
+        Err(_) => return HashMap::new(),
+    };
+    let mut map = HashMap::new();
+    for row in rows.flatten() {
+        map.insert(row.0, row.1);
+    }
+    map
+}
+
 // ── llm_cache helpers ─────────────────────────────────────────────────────────
 
 /// Batch-lookup reranker scores from llm_cache.

@@ -132,6 +132,7 @@ pub fn search(
                     snippet: None,
                     hash: hash.to_string(),
                     doc_id: format!("#{}", &hash[..6.min(hash.len())]),
+                    content: None,
                 });
             }
         }

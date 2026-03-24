@@ -66,6 +66,7 @@ mod tests {
             snippet: None,
             hash: "abc".into(),
             doc_id: "#abc".into(),
+            content: None,
         }
     }
 

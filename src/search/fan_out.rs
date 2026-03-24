@@ -54,6 +54,7 @@ mod tests {
             snippet: None,
             hash: "h".into(),
             doc_id: "#h".into(),
+            content: None,
         }
     }
 

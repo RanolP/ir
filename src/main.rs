@@ -236,13 +236,13 @@ fn handle_search(
 
     // Tier-0: BM25 in-process, no model needed.
     let bm25_req = search::fan_out::SearchRequest { query: &query, limit, min_score };
-    let bm25_results = search::fan_out::bm25(&dbs, &bm25_req)?;
+    let mut bm25_results = search::fan_out::bm25(&dbs, &bm25_req)?;
 
     // Mode dispatch before going to daemon.
     match search_mode {
         // bm25 mode: return BM25 results directly, no daemon needed.
         SearchMode::Bm25 => {
-            output::print_results(&bm25_results, fmt, full);
+            output_results(&mut bm25_results, &dbs, fmt, full);
             return Ok(());
         }
         // vector mode: skip BM25 shortcut — go straight to daemon.
@@ -251,7 +251,7 @@ fn handle_search(
         SearchMode::Hybrid => {
             if search::hybrid::is_bm25_strong_signal(&bm25_results) {
                 if !daemon::is_running() { let _ = daemon::start_in_background(); }
-                output::print_results(&bm25_results, fmt, full);
+                output_results(&mut bm25_results, &dbs, fmt, full);
                 return Ok(());
             }
         }
@@ -261,7 +261,7 @@ fn handle_search(
     if !daemon::is_running() {
         if let Err(e) = daemon::start_in_background() {
             eprintln!("note: could not start daemon ({e})");
-            output::print_results(&bm25_results, fmt, full);
+            output_results(&mut bm25_results, &dbs, fmt, full);
             return Ok(());
         }
     }
@@ -278,7 +278,7 @@ fn handle_search(
     eprint!("searching...");
     if !daemon::wait_ready(3_000) {
         eprintln!();
-        output::print_results(&bm25_results, fmt, full);
+        output_results(&mut bm25_results, &dbs, fmt, full);
         return Ok(());
     }
 
@@ -289,7 +289,7 @@ fn handle_search(
         Ok(r) => r,
         Err(e) => {
             eprintln!("\nnote: daemon query error: {e}");
-            output::print_results(&bm25_results, fmt, full);
+            output_results(&mut bm25_results, &dbs, fmt, full);
             return Ok(());
         }
     };
@@ -298,7 +298,7 @@ fn handle_search(
     if tier2_before || search_mode != SearchMode::Hybrid {
         eprintln!();
         for line in &tier1.log { eprintln!("{line}"); }
-        output::print_results(&to_search_results(tier1.results), fmt, full);
+        output_results(&mut to_search_results(tier1.results), &dbs, fmt, full);
         return Ok(());
     }
 
@@ -310,7 +310,7 @@ fn handle_search(
     {
         eprintln!();
         for line in &tier1.log { eprintln!("{line}"); }
-        output::print_results(&to_search_results(tier1.results), fmt, full);
+        output_results(&mut to_search_results(tier1.results), &dbs, fmt, full);
         return Ok(());
     }
 
@@ -319,7 +319,7 @@ fn handle_search(
     if !daemon::wait_tier2(7_000) {
         eprintln!();
         for line in &tier1.log { eprintln!("{line}"); }
-        output::print_results(&to_search_results(tier1.results), fmt, full);
+        output_results(&mut to_search_results(tier1.results), &dbs, fmt, full);
         return Ok(());
     }
 
@@ -327,12 +327,12 @@ fn handle_search(
         Ok(tier2) => {
             eprintln!();
             for line in &tier2.log { eprintln!("{line}"); }
-            output::print_results(&to_search_results(tier2.results), fmt, full);
+            output_results(&mut to_search_results(tier2.results), &dbs, fmt, full);
         }
         Err(_) => {
             eprintln!();
             for line in &tier1.log { eprintln!("{line}"); }
-            output::print_results(&to_search_results(tier1.results), fmt, full);
+            output_results(&mut to_search_results(tier1.results), &dbs, fmt, full);
         }
     }
     Ok(())
@@ -348,8 +348,51 @@ fn to_search_results(daemon_results: Vec<daemon::DaemonResult>) -> Vec<types::Se
             snippet: if r.snippet.is_empty() { None } else { Some(r.snippet) },
             hash: r.hash,
             doc_id: r.doc_id,
+            content: None,
         })
         .collect()
+}
+
+fn fill_content(results: &mut [types::SearchResult], dbs: &[db::CollectionDb]) {
+    let db_map: std::collections::HashMap<&str, &db::CollectionDb> =
+        dbs.iter().map(|d| (d.name.as_str(), d)).collect();
+
+    // Group unique hashes by collection for batch queries.
+    let mut per_col: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    for r in results.iter() {
+        if db_map.contains_key(r.collection.as_str()) {
+            per_col.entry(r.collection.clone()).or_default().push(r.hash.clone());
+        }
+    }
+
+    // One SELECT ... IN (...) per collection.
+    let mut content_cache: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for (col_name, hashes) in &per_col {
+        let mut unique: Vec<&str> = hashes.iter().map(String::as_str).collect();
+        unique.sort_unstable();
+        unique.dedup();
+        if let Some(db) = db_map.get(col_name.as_str()) {
+            content_cache.extend(db::fetch_content_batch(db.conn(), &unique));
+        }
+    }
+
+    for r in results.iter_mut() {
+        r.content = content_cache.get(&r.hash).cloned();
+    }
+}
+
+fn output_results(
+    results: &mut [types::SearchResult],
+    dbs: &[db::CollectionDb],
+    fmt: output::Format,
+    full: bool,
+) {
+    if full {
+        fill_content(results, dbs);
+    }
+    output::print_results(results, fmt);
 }
 
 fn resolve_collections(config: &Config, filter: &[String]) -> Result<Vec<String>> {

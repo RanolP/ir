@@ -25,6 +25,8 @@ pub struct SearchResult {
     pub snippet: Option<String>,
     pub hash: String,
     pub doc_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
 }
 
 impl SearchResult {
