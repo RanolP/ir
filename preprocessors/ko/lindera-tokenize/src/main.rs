@@ -45,14 +45,13 @@ fn main() -> lindera::LinderaResult<()> {
         }
         match tokenizer.tokenize(&line) {
             Ok(mut tokens) => {
-                let mut parts: Vec<String> = Vec::new();
-                for t in tokens.iter_mut() {
-                    let tag = t.get("part_of_speech_tag").unwrap_or("*");
-                    if is_content(tag) {
-                        parts.push(t.surface.to_string());
-                    }
-                }
-                let parts: Vec<&str> = parts.iter().map(String::as_str).collect();
+                let parts: Vec<&str> = tokens
+                    .iter_mut()
+                    .filter_map(|t| {
+                        let tag = t.get("part_of_speech_tag").unwrap_or("*");
+                        is_content(tag).then_some(t.surface.as_ref())
+                    })
+                    .collect();
                 writeln!(out, "{}", parts.join(" ")).unwrap();
             }
             Err(_) => {
