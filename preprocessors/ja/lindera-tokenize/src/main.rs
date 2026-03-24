@@ -1,6 +1,6 @@
 // Japanese morphological tokenizer using lindera + ipadic (embedded).
 // Protocol: reads lines from stdin, writes one tokenized line per input line to stdout.
-// Outputs content morphemes only — filters 助詞 (particles), 助動詞 (aux verbs), 記号 (symbols).
+// Outputs content morphemes only — filters 助詞 (particles), 助動詞 (aux verbs), 記号 (symbols), フィラー (fillers).
 // Mode::Decompose with default penalties decomposes kanji compound nouns (threshold=2 for kanji).
 use std::io::{self, BufRead, Write};
 
@@ -10,7 +10,7 @@ use lindera::segmenter::Segmenter;
 use lindera::tokenizer::Tokenizer;
 
 fn is_content(pos: &str) -> bool {
-    !matches!(pos, "助詞" | "助動詞" | "記号" | "接続詞" | "感動詞")
+    !matches!(pos, "助詞" | "助動詞" | "記号" | "接続詞" | "感動詞" | "フィラー")
 }
 
 fn main() -> lindera::LinderaResult<()> {
@@ -32,14 +32,13 @@ fn main() -> lindera::LinderaResult<()> {
         }
         match tokenizer.tokenize(&line) {
             Ok(mut tokens) => {
-                let mut parts: Vec<String> = Vec::new();
-                for t in tokens.iter_mut() {
-                    let pos = t.get("part_of_speech").unwrap_or("*");
-                    if is_content(pos) {
-                        parts.push(t.surface.to_string());
-                    }
-                }
-                let parts: Vec<&str> = parts.iter().map(String::as_str).collect();
+                let parts: Vec<&str> = tokens
+                    .iter_mut()
+                    .filter_map(|t| {
+                        let pos = t.get("part_of_speech").unwrap_or("*");
+                        is_content(pos).then_some(t.surface.as_ref())
+                    })
+                    .collect();
                 writeln!(out, "{}", parts.join(" ")).unwrap();
             }
             Err(_) => {

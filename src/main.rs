@@ -500,8 +500,8 @@ fn known_preprocessors() -> &'static [KnownPreprocessor] {
         },
         KnownPreprocessor {
             alias: "ja",
-            description: "Japanese tokenization (MeCab)",
-            kind: PreprocessorKind::Script { repo_subdir: "ja", script_name: "mecab-tokenize" },
+            description: "Japanese morphological analysis (Lindera + ipadic)",
+            kind: PreprocessorKind::Binary { binary_name: "lindera-tokenize-ja" },
         },
         KnownPreprocessor {
             alias: "zh",
