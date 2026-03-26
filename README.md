@@ -31,8 +31,7 @@ Search quality benchmarked on 4 BEIR datasets; reranking adds up to +14.5% nDCG@
 **Homebrew (macOS):**
 
 ```bash
-brew tap vlwkaos/tap
-brew install ir
+brew install vlwkaos/tap/ir
 ```
 
 **From source:**
