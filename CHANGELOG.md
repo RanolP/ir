@@ -1,3 +1,14 @@
+## [0.6.7] - 2026-03-30
+
+### Bug Fixes
+
+- Switching embedding models (e.g. EmbeddingGemma 768d to BGE-M3 1024d) no longer silently corrupts vectors; `ir embed --force` auto-detects dimension mismatch and rebuilds the vector table ([`3d7d211`](https://github.com/vlwkaos/ir/commit/3d7d211))
+
+### Docs
+
+- Korean embedding model guide: BGE-M3 setup, comparison table, KURE-v1 experimental note, expander degradation warning ([`9cfa6ee`](https://github.com/vlwkaos/ir/commit/9cfa6ee))
+- Universal binary builds enforced in release scripts ([`5576911`](https://github.com/vlwkaos/ir/commit/5576911))
+
 ## [0.6.6] - 2026-03-24
 
 ### Features
