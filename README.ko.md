@@ -80,6 +80,7 @@ ir search "서울 지하철" -c wiki
 | [Qwen3.5-2B](https://huggingface.co/unsloth/Qwen3.5-2B-GGUF) | `unsloth/Qwen3.5-2B-GGUF` | 통합 확장+재순위 (선택) |
 | [Qwen3-Reranker 0.6B](https://huggingface.co/ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF) | `ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF` | 재순위화 전용 (선택) |
 | [qmd-query-expansion 1.7B](https://huggingface.co/tobil/qmd-query-expansion-1.7B) | `tobil/qmd-query-expansion-1.7B` | 쿼리 확장 전용 (선택) |
+| [BGE-M3 568M](https://huggingface.co/ggml-org/bge-m3-Q8_0-GGUF) | `ggml-org/bge-m3-Q8_0-GGUF` | 한국어 임베딩 대안 (선택) |
 
 BM25 검색은 모델 없이 동작합니다. `IR_QWEN_MODEL`이 설정되거나 `~/local-models/`에 Qwen3.5 GGUF가 있으면 확장기와 재순위기를 대체합니다.
 
@@ -101,6 +102,39 @@ export IR_EXPANDER_MODEL="$HOME/my-models/qmd-query-expansion-1.7B-q4_k_m.gguf"
 IR_GPU_LAYERS=0 ir search "쿼리"    # CPU 강제
 IR_GPU_LAYERS=32 ir search "쿼리"   # 부분 오프로드
 ```
+
+</details>
+
+<details>
+<summary><strong>한국어 임베딩 모델</strong></summary>
+
+기본 EmbeddingGemma (300M, 768d)로 하이브리드+재순위 시 MIRACL-Korean nDCG@10 = 0.8411.
+한국어 특화 dense retrieval이 필요하면 BGE-M3를 대체 모델로 사용할 수 있습니다.
+
+| | EmbeddingGemma | BGE-M3 |
+|---|---|---|
+| 파라미터 | ~150M | ~570M |
+| 차원 | 768 | 1024 |
+| GGUF (Q8_0) | ~300MB | ~600MB |
+| 자동 감지 | 파일명 "embeddinggemma" | 파일명 "bge-m3" |
+
+```bash
+# HuggingFace에서 자동 다운로드
+export IR_EMBEDDING_MODEL="ggml-org/bge-m3-Q8_0-GGUF"
+
+# 또는 로컬 파일 (파일명에 "bge-m3" 포함 필수)
+export IR_EMBEDDING_MODEL="$HOME/local-models/bge-m3-Q8_0.gguf"
+
+# 기존 컬렉션 재임베딩 (차원 자동 변환)
+ir embed <collection> --force
+```
+
+파일명에 "bge-m3"가 포함되면 CLS 풀링 및 쿼리 프리픽스가 자동 적용됩니다.
+모델 변경 후 `ir embed --force`를 실행하면 벡터 테이블 차원이 자동으로 조정됩니다.
+
+**KURE-v1 (실험적):** MTEB-ko Recall@1 = 0.5264 (dense only). BGE-M3 기반이지만 GGUF 변환이 검증되지 않았습니다. llama.cpp의 `convert_hf_to_gguf.py`로 직접 변환이 필요합니다.
+
+**참고:** 한국어 쿼리 확장(expander)은 비권장 -- 영어 SFT 모델이라 MIRACL-Korean에서 -0.4% 성능 저하.
 
 </details>
 

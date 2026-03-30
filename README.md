@@ -65,6 +65,7 @@ Models are downloaded automatically from HuggingFace Hub on first use and cached
 | [Qwen3.5-2B](https://huggingface.co/unsloth/Qwen3.5-2B-GGUF) | `unsloth/Qwen3.5-2B-GGUF` | unified expand + rerank (optional) |
 | [Qwen3-Reranker 0.6B](https://huggingface.co/ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF) | `ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF` | reranking only (optional) |
 | [qmd-query-expansion 1.7B](https://huggingface.co/tobil/qmd-query-expansion-1.7B) | `tobil/qmd-query-expansion-1.7B` | expansion only (optional) |
+| [BGE-M3 568M](https://huggingface.co/ggml-org/bge-m3-Q8_0-GGUF) | `ggml-org/bge-m3-Q8_0-GGUF` | Korean embedding alternative (optional) |
 
 BM25 search works without any models. When `IR_QWEN_MODEL` is set (or a Qwen3.5 GGUF is found in `~/local-models/`), it replaces both the expander and reranker.
 
@@ -193,6 +194,8 @@ Compound decompounding benchmark (50 queries targeting compound sub-components):
 | lindera | **0.6326** | Mode::Decompose splits compounds |
 
 See [research/experiment.md](research/experiment.md) for full results and rationale.
+
+**Korean embedding models**: For Korean-optimized dense retrieval, [BGE-M3](https://huggingface.co/ggml-org/bge-m3-Q8_0-GGUF) can replace the default embedding model via `IR_EMBEDDING_MODEL`. Filename auto-detection handles pooling and formatting. See [README.ko.md](README.ko.md) for setup. Switching models requires `ir embed --force` (vector dimensions auto-adapt).
 
 </details>
 
