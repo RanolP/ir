@@ -1,7 +1,7 @@
 // Embedding pipeline: load un-embedded documents → chunk → embed → store.
 // Runs after `ir update`. Safe to re-run: skips already-embedded hashes.
 
-use crate::db::{CollectionDb, vectors};
+use crate::db::{self, CollectionDb, vectors};
 use crate::error::Result;
 use crate::index::{chunker, new_progress_bar};
 use crate::llm::embedding::Embedder;
@@ -21,6 +21,9 @@ pub fn embed(
     model_name: &str,
 ) -> Result<(usize, usize)> {
     let conn = db.conn();
+
+    // Adapt vector table dimension to match the loaded model.
+    db::ensure_vector_dimension(conn, embedder.embedding_dim())?;
 
     // Clean up embeddings for hashes no longer referenced by any active document.
     cleanup_orphaned(conn)?;

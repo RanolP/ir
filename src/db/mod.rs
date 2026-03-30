@@ -212,6 +212,55 @@ pub fn put_rerank_scores(conn: &Connection, entries: &[(String, f64)]) {
 }
 
 
+// ── vector dimension helpers ──────────────────────────────────────────────────
+
+/// Read the current embedding dimension from the vectors_vec virtual table DDL.
+fn current_vector_dim(conn: &Connection) -> Option<usize> {
+    let ddl: String = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='vectors_vec'",
+            [],
+            |row| row.get(0),
+        )
+        .ok()?;
+    let marker = "float[";
+    let start = ddl.find(marker)? + marker.len();
+    let rest = &ddl[start..];
+    let end = rest.find(']')?;
+    rest[..end].trim().parse::<usize>().ok()
+}
+
+/// Ensure vectors_vec matches the given dimension. Rebuilds the table on mismatch.
+pub fn ensure_vector_dimension(conn: &Connection, dim: usize) -> Result<()> {
+    if dim == 0 {
+        return Err(crate::error::Error::Other(
+            "embedding dimension resolved to 0".into(),
+        ));
+    }
+    match current_vector_dim(conn) {
+        Some(existing) if existing == dim => return Ok(()),
+        Some(existing) => {
+            eprintln!(
+                "  vector dimension mismatch ({existing} -> {dim}), rebuilding vector table"
+            );
+            conn.execute_batch(
+                "DROP TABLE IF EXISTS vectors_vec;
+                 DELETE FROM content_vectors;",
+            )?;
+        }
+        None => {
+            conn.execute_batch("DROP TABLE IF EXISTS vectors_vec;")?;
+        }
+    }
+    conn.execute_batch(&format!(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS vectors_vec USING vec0(
+            hash_seq TEXT PRIMARY KEY,
+            embedding float[{dim}] distance_metric=cosine
+        );"
+    ))?;
+    Ok(())
+}
+
 fn configure(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "PRAGMA journal_mode = WAL;
