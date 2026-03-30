@@ -60,3 +60,10 @@ ir-0.6.4-darwin-arm64.tar.gz.sha256
 ir-0.6.5-darwin-arm64.tar.gz.asc
 ir-0.6.5-darwin-arm64.tar.gz
 ir-0.6.5-darwin-arm64.tar.gz.sha256
+ir-0.6.6-darwin-arm64.tar.gz.asc
+ir-0.6.6-darwin-universal.tar.gz.asc
+ir-0.6.6-darwin-arm64.tar.gz
+ir-0.6.6-darwin-universal.tar.gz
+*.bottle.tar.gz
+ir-0.6.6-darwin-arm64.tar.gz.sha256
+ir-0.6.6-darwin-universal.tar.gz.sha256
