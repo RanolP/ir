@@ -92,6 +92,12 @@ pub enum Command {
         #[command(subcommand)]
         cmd: PreprocessorCmd,
     },
+    /// Start an MCP server for Claude Desktop / Claude Code integration
+    Mcp {
+        /// Serve over HTTP on the given port instead of stdio (e.g. --http 3620)
+        #[arg(long)]
+        http: Option<u16>,
+    },
 }
 
 #[derive(Subcommand, Debug)]

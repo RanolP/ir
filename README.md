@@ -143,6 +143,57 @@ The daemon keeps models warm in memory. Subsequent queries over the Unix socket 
 </details>
 
 <details>
+<summary><strong>MCP server — Claude Desktop / Claude Code</strong></summary>
+
+`ir mcp` runs a Model Context Protocol server so Claude can search your indexed documents directly.
+
+**Claude Desktop** (`~/.config/claude/claude_desktop_config.json`):
+
+```json
+{
+  "mcpServers": {
+    "ir": {
+      "command": "ir",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+**Claude Code** (`.mcp.json` in project root or `~/.claude/mcp.json`):
+
+```json
+{
+  "mcpServers": {
+    "ir": {
+      "command": "ir",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+Three tools are exposed:
+
+| Tool | Description |
+|------|-------------|
+| `search` | Hybrid BM25+vector search. Returns path, title, score, snippet. Supports `mode`, `limit`, `min_score`, `collections` params. |
+| `status` | Index health — collection names, doc counts, DB sizes, daemon status. |
+| `update` | Re-index collections after file changes. Accepts `collection` and `force` params. |
+
+**HTTP mode** (for remote access or multi-client setups):
+
+```bash
+ir mcp --http 3620    # serve on all interfaces, port 3620
+```
+
+Configure clients to point at `http://<host>:3620/mcp`. The daemon starts automatically on first search tool call.
+
+> **Security note:** HTTP mode is unauthenticated and binds to all interfaces. Only expose it on trusted networks. The `update` tool can trigger re-indexing, so treat it like any other local write-access service.
+
+</details>
+
+<details>
 <summary><strong>Preprocessors — Korean / Japanese / Chinese</strong></summary>
 
 Preprocessors tokenize text before BM25 indexing. Without one, agglutinated words ("이스탄불의", "東京都") are treated as single FTS tokens and never match morpheme-level queries. The same preprocessor runs at index time and query time.

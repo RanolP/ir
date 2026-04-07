@@ -5,6 +5,7 @@ mod db;
 mod error;
 mod index;
 mod llm;
+mod mcp;
 mod preprocess;
 mod search;
 mod types;
@@ -65,6 +66,13 @@ fn run() -> Result<()> {
             DaemonCmd::Status => daemon::status(),
         },
         Command::Preprocessor { cmd } => handle_preprocessor(cmd),
+        Command::Mcp { http } => {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| error::Error::Other(e.to_string()))?;
+            rt.block_on(mcp::run(http))
+        }
     }
 }
 
@@ -192,6 +200,114 @@ fn handle_update(collection: Option<String>, force: bool) -> Result<()> {
     Ok(())
 }
 
+/// Search core: runs the tier-0/1/2 pipeline and returns ranked results.
+/// Used by both `ir search` and `ir mcp`. Does not print to stdout.
+pub(crate) fn search_core(
+    query: &str,
+    mode: &str,
+    limit: usize,
+    min_score: Option<f64>,
+    collection_filter: &[String],
+    verbose: bool,
+) -> Result<Vec<types::SearchResult>> {
+    let config = Config::load()?;
+    let collection_names = resolve_collections(&config, collection_filter)?;
+    let search_mode: SearchMode = mode.parse().map_err(error::Error::Other)?;
+
+    let cols: Vec<_> = collection_names.iter()
+        .filter_map(|name| config.get_collection(name))
+        .collect();
+    let dbs: Vec<db::CollectionDb> = cols.iter()
+        .map(|c| {
+            let pp_aliases = c.preprocessor.as_deref().unwrap_or(&[]);
+            let pp_commands = config.resolve_preprocessor_commands(pp_aliases);
+            db::CollectionDb::open_rw(&c.name, &collection_db_path(&c.name), pp_commands)
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let bm25_req = search::fan_out::SearchRequest { query, limit, min_score };
+    let bm25_results = search::fan_out::bm25(&dbs, &bm25_req)?;
+
+    match search_mode {
+        SearchMode::Bm25 => return Ok(bm25_results),
+        SearchMode::Vector => {}
+        SearchMode::Hybrid => {
+            if search::hybrid::is_bm25_strong_signal(&bm25_results) {
+                if !daemon::is_running() { let _ = daemon::start_in_background(); }
+                return Ok(bm25_results);
+            }
+        }
+    }
+
+    if !daemon::is_running() {
+        if let Err(e) = daemon::start_in_background() {
+            eprintln!("note: could not start daemon ({e})");
+            return Ok(bm25_results);
+        }
+    }
+
+    let req = daemon::DaemonRequest {
+        query: query.to_string(),
+        collections: collection_names,
+        limit,
+        min_score,
+        mode: mode.to_string(),
+        verbose,
+    };
+
+    eprint!("searching...");
+    if !daemon::wait_ready(3_000) {
+        eprintln!();
+        return Ok(bm25_results);
+    }
+
+    let tier2_before = daemon::is_tier2_ready();
+
+    let tier1 = match daemon::query(&req) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("\nnote: daemon query error: {e}");
+            return Ok(bm25_results);
+        }
+    };
+
+    if tier2_before || search_mode != SearchMode::Hybrid {
+        eprintln!();
+        for line in &tier1.log { eprintln!("{line}"); }
+        return Ok(to_search_results(tier1.results));
+    }
+
+    let top = tier1.results.first().map(|r| r.score).unwrap_or(0.0);
+    let gap = tier1.results.get(1).map(|r| top - r.score).unwrap_or(top);
+    if top >= search::hybrid::STRONG_SIGNAL_FLOOR
+        && top * gap >= search::hybrid::STRONG_SIGNAL_PRODUCT
+    {
+        eprintln!();
+        for line in &tier1.log { eprintln!("{line}"); }
+        return Ok(to_search_results(tier1.results));
+    }
+
+    eprint!(" enhancing...");
+    if !daemon::wait_tier2(7_000) {
+        eprintln!();
+        for line in &tier1.log { eprintln!("{line}"); }
+        return Ok(to_search_results(tier1.results));
+    }
+
+    match daemon::query(&req) {
+        Ok(tier2) => {
+            eprintln!();
+            for line in &tier2.log { eprintln!("{line}"); }
+            Ok(to_search_results(tier2.results))
+        }
+        Err(_) => {
+            eprintln!();
+            for line in &tier1.log { eprintln!("{line}"); }
+            Ok(to_search_results(tier1.results))
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn handle_search(
     query: String,
@@ -218,123 +334,27 @@ fn handle_search(
         output::Format::Pretty
     };
 
-    let config = Config::load()?;
-    let collection_names = resolve_collections(&config, &collection_filter)?;
-    let search_mode: SearchMode = mode.parse().map_err(error::Error::Other)?;
+    let mut results = search_core(&query, &mode, limit, min_score, &collection_filter, verbose)?;
 
-    // Open DBs for in-process BM25 (tier-0; also used as fallback).
-    let cols: Vec<_> = collection_names.iter()
-        .filter_map(|name| config.get_collection(name))
-        .collect();
-    let dbs: Vec<db::CollectionDb> = cols.iter()
-        .map(|c| {
-            let pp_aliases = c.preprocessor.as_deref().unwrap_or(&[]);
-            let pp_commands = config.resolve_preprocessor_commands(pp_aliases);
-            db::CollectionDb::open_rw(&c.name, &collection_db_path(&c.name), pp_commands)
-        })
-        .collect::<Result<Vec<_>>>()?;
-
-    // Tier-0: BM25 in-process, no model needed.
-    let bm25_req = search::fan_out::SearchRequest { query: &query, limit, min_score };
-    let mut bm25_results = search::fan_out::bm25(&dbs, &bm25_req)?;
-
-    // Mode dispatch before going to daemon.
-    match search_mode {
-        // bm25 mode: return BM25 results directly, no daemon needed.
-        SearchMode::Bm25 => {
-            output_results(&mut bm25_results, &dbs, fmt, full);
-            return Ok(());
-        }
-        // vector mode: skip BM25 shortcut — go straight to daemon.
-        SearchMode::Vector => {}
-        // hybrid mode: strong BM25 signal shortcuts LLM work.
-        SearchMode::Hybrid => {
-            if search::hybrid::is_bm25_strong_signal(&bm25_results) {
-                if !daemon::is_running() { let _ = daemon::start_in_background(); }
-                output_results(&mut bm25_results, &dbs, fmt, full);
-                return Ok(());
-            }
-        }
+    if full {
+        let config = Config::load()?;
+        let cols: Vec<_> = results.iter()
+            .map(|r| r.collection.as_str())
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .filter_map(|name| config.get_collection(name))
+            .collect();
+        let dbs: Vec<db::CollectionDb> = cols.iter()
+            .map(|c| {
+                let pp_aliases = c.preprocessor.as_deref().unwrap_or(&[]);
+                let pp_commands = config.resolve_preprocessor_commands(pp_aliases);
+                db::CollectionDb::open_rw(&c.name, &collection_db_path(&c.name), pp_commands)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        fill_content(&mut results, &dbs);
     }
 
-    // Need better results — ensure daemon is running.
-    if !daemon::is_running() {
-        if let Err(e) = daemon::start_in_background() {
-            eprintln!("note: could not start daemon ({e})");
-            output_results(&mut bm25_results, &dbs, fmt, full);
-            return Ok(());
-        }
-    }
-
-    let req = daemon::DaemonRequest {
-        query: query.clone(),
-        collections: collection_names.clone(),
-        limit,
-        min_score,
-        mode: mode.clone(),
-        verbose,
-    };
-
-    eprint!("searching...");
-    if !daemon::wait_ready(3_000) {
-        eprintln!();
-        output_results(&mut bm25_results, &dbs, fmt, full);
-        return Ok(());
-    }
-
-    // If tier-2 was ready before connecting, this query gets full hybrid.
-    let tier2_before = daemon::is_tier2_ready();
-
-    let tier1 = match daemon::query(&req) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("\nnote: daemon query error: {e}");
-            output_results(&mut bm25_results, &dbs, fmt, full);
-            return Ok(());
-        }
-    };
-
-    // Daemon already had full hybrid, or non-hybrid mode — tier-1 result is final.
-    if tier2_before || search_mode != SearchMode::Hybrid {
-        eprintln!();
-        for line in &tier1.log { eprintln!("{line}"); }
-        output_results(&mut to_search_results(tier1.results), &dbs, fmt, full);
-        return Ok(());
-    }
-
-    // Check if tier-1 result is strong enough to skip tier-2.
-    let top = tier1.results.first().map(|r| r.score).unwrap_or(0.0);
-    let gap = tier1.results.get(1).map(|r| top - r.score).unwrap_or(top);
-    if top >= search::hybrid::STRONG_SIGNAL_FLOOR
-        && top * gap >= search::hybrid::STRONG_SIGNAL_PRODUCT
-    {
-        eprintln!();
-        for line in &tier1.log { eprintln!("{line}"); }
-        output_results(&mut to_search_results(tier1.results), &dbs, fmt, full);
-        return Ok(());
-    }
-
-    // Tier-2: wait for expander+reranker, then re-query for full hybrid.
-    eprint!(" enhancing...");
-    if !daemon::wait_tier2(7_000) {
-        eprintln!();
-        for line in &tier1.log { eprintln!("{line}"); }
-        output_results(&mut to_search_results(tier1.results), &dbs, fmt, full);
-        return Ok(());
-    }
-
-    match daemon::query(&req) {
-        Ok(tier2) => {
-            eprintln!();
-            for line in &tier2.log { eprintln!("{line}"); }
-            output_results(&mut to_search_results(tier2.results), &dbs, fmt, full);
-        }
-        Err(_) => {
-            eprintln!();
-            for line in &tier1.log { eprintln!("{line}"); }
-            output_results(&mut to_search_results(tier1.results), &dbs, fmt, full);
-        }
-    }
+    output::print_results(&mut results, fmt);
     Ok(())
 }
 
@@ -381,18 +401,6 @@ fn fill_content(results: &mut [types::SearchResult], dbs: &[db::CollectionDb]) {
     for r in results.iter_mut() {
         r.content = content_cache.get(&r.hash).cloned();
     }
-}
-
-fn output_results(
-    results: &mut [types::SearchResult],
-    dbs: &[db::CollectionDb],
-    fmt: output::Format,
-    full: bool,
-) {
-    if full {
-        fill_content(results, dbs);
-    }
-    output::print_results(results, fmt);
 }
 
 fn resolve_collections(config: &Config, filter: &[String]) -> Result<Vec<String>> {
