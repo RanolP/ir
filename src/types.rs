@@ -39,6 +39,33 @@ impl SearchResult {
     }
 }
 
+/// Controls stderr output from `search_core`.
+/// - `Quiet`: no stderr at all (MCP stdio transport)
+/// - `Normal`: progress indicators + daemon decision logs
+/// - `Verbose`: Normal + daemon timing lines
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Verbosity {
+    Quiet,
+    #[default]
+    Normal,
+    Verbose,
+}
+
+impl Verbosity {
+    /// True when progress indicators ("searching...", "enhancing...") should print.
+    pub fn show_progress(self) -> bool {
+        self != Self::Quiet
+    }
+    /// True when daemon log lines (decisions, errors) should print.
+    pub fn show_logs(self) -> bool {
+        self != Self::Quiet
+    }
+    /// True when the daemon should include timing lines in its log.
+    pub fn daemon_verbose(self) -> bool {
+        self == Self::Verbose
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SearchMode {
     Bm25,

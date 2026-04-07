@@ -202,13 +202,14 @@ fn handle_update(collection: Option<String>, force: bool) -> Result<()> {
 
 /// Search core: runs the tier-0/1/2 pipeline and returns ranked results.
 /// Used by both `ir search` and `ir mcp`. Does not print to stdout.
+/// `verbosity` controls stderr output -- see `types::Verbosity`.
 pub(crate) fn search_core(
     query: &str,
     mode: &str,
     limit: usize,
     min_score: Option<f64>,
     collection_filter: &[String],
-    verbose: bool,
+    verbosity: types::Verbosity,
 ) -> Result<Vec<types::SearchResult>> {
     let config = Config::load()?;
     let collection_names = resolve_collections(&config, collection_filter)?;
@@ -241,7 +242,7 @@ pub(crate) fn search_core(
 
     if !daemon::is_running() {
         if let Err(e) = daemon::start_in_background() {
-            eprintln!("note: could not start daemon ({e})");
+            if verbosity.show_progress() { eprintln!("note: could not start daemon ({e})"); }
             return Ok(bm25_results);
         }
     }
@@ -252,12 +253,18 @@ pub(crate) fn search_core(
         limit,
         min_score,
         mode: mode.to_string(),
-        verbose,
+        verbose: verbosity.daemon_verbose(),
     };
 
-    eprint!("searching...");
+    let log_lines = |lines: &[String]| {
+        if verbosity.show_logs() {
+            for line in lines { eprintln!("{line}"); }
+        }
+    };
+
+    if verbosity.show_progress() { eprint!("searching..."); }
     if !daemon::wait_ready(3_000) {
-        eprintln!();
+        if verbosity.show_progress() { eprintln!(); }
         return Ok(bm25_results);
     }
 
@@ -266,44 +273,42 @@ pub(crate) fn search_core(
     let tier1 = match daemon::query(&req) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("\nnote: daemon query error: {e}");
+            if verbosity.show_progress() { eprintln!("\nnote: daemon query error: {e}"); }
             return Ok(bm25_results);
         }
     };
 
     if tier2_before || search_mode != SearchMode::Hybrid {
-        eprintln!();
-        for line in &tier1.log { eprintln!("{line}"); }
+        if verbosity.show_progress() { eprintln!(); }
+        log_lines(&tier1.log);
         return Ok(to_search_results(tier1.results));
     }
 
-    let top = tier1.results.first().map(|r| r.score).unwrap_or(0.0);
-    let gap = tier1.results.get(1).map(|r| top - r.score).unwrap_or(top);
-    if top >= search::hybrid::STRONG_SIGNAL_FLOOR
-        && top * gap >= search::hybrid::STRONG_SIGNAL_PRODUCT
-    {
-        eprintln!();
-        for line in &tier1.log { eprintln!("{line}"); }
-        return Ok(to_search_results(tier1.results));
+    let tier1_log = tier1.log;
+    let tier1_results = to_search_results(tier1.results);
+    if search::hybrid::is_strong_signal(&tier1_results) {
+        if verbosity.show_progress() { eprintln!(); }
+        log_lines(&tier1_log);
+        return Ok(tier1_results);
     }
 
-    eprint!(" enhancing...");
+    if verbosity.show_progress() { eprint!(" enhancing..."); }
     if !daemon::wait_tier2(7_000) {
-        eprintln!();
-        for line in &tier1.log { eprintln!("{line}"); }
-        return Ok(to_search_results(tier1.results));
+        if verbosity.show_progress() { eprintln!(); }
+        log_lines(&tier1_log);
+        return Ok(tier1_results);
     }
 
     match daemon::query(&req) {
         Ok(tier2) => {
-            eprintln!();
-            for line in &tier2.log { eprintln!("{line}"); }
+            if verbosity.show_progress() { eprintln!(); }
+            log_lines(&tier2.log);
             Ok(to_search_results(tier2.results))
         }
         Err(_) => {
-            eprintln!();
-            for line in &tier1.log { eprintln!("{line}"); }
-            Ok(to_search_results(tier1.results))
+            if verbosity.show_progress() { eprintln!(); }
+            log_lines(&tier1_log);
+            Ok(tier1_results)
         }
     }
 }
@@ -334,7 +339,8 @@ fn handle_search(
         output::Format::Pretty
     };
 
-    let mut results = search_core(&query, &mode, limit, min_score, &collection_filter, verbose)?;
+    let verbosity = if verbose { types::Verbosity::Verbose } else { types::Verbosity::Normal };
+    let mut results = search_core(&query, &mode, limit, min_score, &collection_filter, verbosity)?;
 
     if full {
         let config = Config::load()?;

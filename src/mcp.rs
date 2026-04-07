@@ -95,47 +95,28 @@ impl IrMcpServer {
     #[tool(description = "Hybrid BM25+vector search over indexed document collections. \
         Returns ranked results with file path, title, relevance score, and a text snippet. \
         Use the file path with a file-read tool to retrieve full document content.")]
-    async fn search(&self, params: Parameters<SearchInput>) -> String {
-        let input = params.0;
-        let query = input.query.clone();
-        let mode = input.mode.clone().unwrap_or_else(|| "hybrid".to_string());
-        let limit = input.limit.unwrap_or(10);
-        let min_score = input.min_score;
-        let collections = input.collections.clone().unwrap_or_default();
-
-        match tokio::task::spawn_blocking(move || {
-            crate::search_core(&query, &mode, limit, min_score, &collections, false)
-        })
-        .await
-        {
-            Ok(Ok(results)) => tool_ok_json(&results),
-            Ok(Err(e)) => tool_err(e.to_string()),
-            Err(e) => tool_err(format!("internal: {e}")),
-        }
+    async fn search(&self, params: Parameters<SearchInput>) -> Result<String, String> {
+        let SearchInput { query, mode, limit, min_score, collections } = params.0;
+        let mode = mode.unwrap_or_else(|| "hybrid".to_string());
+        let limit = limit.unwrap_or(10);
+        let collections = collections.unwrap_or_default();
+        spawn_tool(move || {
+            crate::search_core(&query, &mode, limit, min_score, &collections, crate::types::Verbosity::Quiet)
+        }).await
     }
 
     #[tool(description = "Show index health: collection names, paths, document counts, \
         DB sizes, and whether the search daemon is running.")]
-    async fn status(&self) -> String {
-        match tokio::task::spawn_blocking(build_status).await {
-            Ok(Ok(out)) => tool_ok_json(&out),
-            Ok(Err(e)) => tool_err(e.to_string()),
-            Err(e) => tool_err(format!("internal: {e}")),
-        }
+    async fn status(&self) -> Result<String, String> {
+        spawn_tool(build_status).await
     }
 
     #[tool(description = "Re-index document collections so newly added or changed files \
         become searchable. Runs synchronously — may take seconds to minutes for large collections.")]
-    async fn update(&self, params: Parameters<UpdateInput>) -> String {
-        let input = params.0;
-        let collection = input.collection.clone();
-        let force = input.force.unwrap_or(false);
-
-        match tokio::task::spawn_blocking(move || run_update(collection.as_deref(), force)).await {
-            Ok(Ok(results)) => tool_ok_json(&results),
-            Ok(Err(e)) => tool_err(e.to_string()),
-            Err(e) => tool_err(format!("internal: {e}")),
-        }
+    async fn update(&self, params: Parameters<UpdateInput>) -> Result<String, String> {
+        let UpdateInput { collection, force } = params.0;
+        let force = force.unwrap_or(false);
+        spawn_tool(move || run_update(collection.as_deref(), force)).await
     }
 }
 
@@ -152,33 +133,32 @@ impl ServerHandler for IrMcpServer {
 
 // ── tool response helpers ─────────────────────────────────────────────────────
 
-/// Serialize a value to pretty JSON; propagate serialization failures as errors.
-fn tool_ok_json(v: &impl Serialize) -> String {
-    match serde_json::to_string_pretty(v) {
-        Ok(s) => s,
-        Err(e) => tool_err(format!("serialization failed: {e}")),
+/// Run a blocking function on a thread pool and return its result as JSON.
+async fn spawn_tool<F, T>(f: F) -> Result<String, String>
+where
+    F: FnOnce() -> IrResult<T> + Send + 'static,
+    T: Serialize + Send + 'static,
+{
+    match tokio::task::spawn_blocking(f).await {
+        Ok(Ok(v)) => ok_json(&v),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(e) => Err(format!("internal: {e}")),
     }
 }
 
-/// Produce a safe JSON error object (escapes all user-controlled content).
-fn tool_err(msg: String) -> String {
-    // ^ use serde_json to avoid JSON injection from error messages containing quotes
-    serde_json::json!({"error": msg}).to_string()
+fn ok_json(v: &impl Serialize) -> Result<String, String> {
+    serde_json::to_string_pretty(v).map_err(|e| format!("serialization failed: {e}"))
 }
 
 // ── server instructions ───────────────────────────────────────────────────────
 
 fn build_instructions() -> String {
-    let Ok(config) = Config::load() else {
+    let config = Config::load().ok().filter(|c| !c.collections.is_empty());
+    let Some(config) = config else {
         return "ir local search engine. No collections configured. \
                 Run `ir collection add <name> <path>` to add one."
             .to_string();
     };
-    if config.collections.is_empty() {
-        return "ir local search engine. No collections configured. \
-                Run `ir collection add <name> <path>` to add one."
-            .to_string();
-    }
 
     let cols: Vec<String> = config
         .collections
@@ -227,12 +207,9 @@ fn build_status() -> IrResult<StatusOutput> {
     let mut collections = Vec::new();
     for col in &config.collections {
         let db_path = collection_db_path(&col.name);
-        let indexed = db_path.exists();
-        let size_mb = if indexed {
-            std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0) as f64 / 1_048_576.0
-        } else {
-            0.0
-        };
+        let size_bytes = std::fs::metadata(&db_path).ok().map(|m| m.len());
+        let indexed = size_bytes.is_some();
+        let size_mb = size_bytes.unwrap_or(0) as f64 / 1_048_576.0;
         let doc_count = if indexed { count_docs(&db_path) } else { None };
         collections.push(CollectionStatus {
             name: col.name.clone(),
