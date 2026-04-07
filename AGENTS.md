@@ -83,6 +83,8 @@ Idle timeout: 3600s (configurable via `ir daemon start --timeout`).
 
 ## Release
 
+release.flow: rust
+
 ```bash
 # Homebrew + crates.io
 ~/.claude/skills/rust-release/release.sh "$VERSION" "ir" "vlwkaos/ir" "$HOME/ws-ps/homebrew-tap"

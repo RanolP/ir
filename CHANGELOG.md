@@ -1,3 +1,9 @@
+## [0.7.0] - 2026-04-07
+
+### Features
+
+- `ir mcp` subcommand: native Model Context Protocol server for Claude Desktop and Claude Code integration; exposes `search`, `status`, and `update` tools; supports stdio (default) and HTTP (`--http <port>`) transports ([`f76c98c`](https://github.com/vlwkaos/ir/commit/f76c98c7a3a7c990e3fec7dd4c22f3b33510a042))
+
 ## [0.6.7] - 2026-03-30
 
 ### Bug Fixes
