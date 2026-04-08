@@ -1,3 +1,18 @@
+## [0.7.1] - 2026-04-08
+
+### Bug Fixes
+
+- `ir preprocessor install` now works on all supported platforms: macOS universal binary (`darwin-universal`) is fetched for both Apple Silicon and Intel; Linux x86\_64 and aarch64 are also supported. Previously the CLI constructed `darwin-arm64` / `darwin-x86\_64` URLs that never existed in the release assets, causing a 404 for every user ([`src/main.rs`](https://github.com/vlwkaos/ir/blob/main/src/main.rs))
+- Corrupt or failed tar extraction during preprocessor install now returns a clear error and cleans up the downloaded tarball instead of silently continuing with a missing binary
+
+### Docs
+
+- Preprocessor install section now lists supported platforms: macOS (universal, Intel + Apple Silicon) and Linux (x86\_64, aarch64)
+
+### Build
+
+- `scripts/release-extras.sh`: Linux preprocessor cross-compilation added via `cross` (x86\_64-unknown-linux-musl, aarch64-unknown-linux-musl); skips gracefully with install hint if `cross` is not available
+
 ## [0.7.0] - 2026-04-07
 
 ### Features
