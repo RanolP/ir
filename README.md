@@ -208,7 +208,7 @@ ir preprocessor bind ko wiki        # wire "ko" to collection and re-index
 ir search "서울 지하철" -c wiki
 ```
 
-`ir preprocessor install ko` downloads a pre-built binary from the GitHub release — embedded ko-dic dictionary, no system deps, no Rust toolchain required. The install step shows an interactive picker so you can bind to collections right away.
+`ir preprocessor install ko` downloads a pre-built binary from the GitHub release — embedded ko-dic dictionary, no system deps, no Rust toolchain required. Supported platforms: **macOS** (universal binary, Intel + Apple Silicon) and **Linux** (x86\_64, aarch64). The install step shows an interactive picker so you can bind to collections right away.
 
 **Other languages:**
 

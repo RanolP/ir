@@ -613,12 +613,17 @@ fn install_preprocessor(config: &mut Config, lang: &str) -> Result<()> {
     let cmd_str = match &entry.kind {
         PreprocessorKind::Binary { binary_name } => {
             let bin_path = install_dir.join(binary_name);
-            #[cfg(target_arch = "aarch64")]
-            let arch = "darwin-arm64";
-            #[cfg(target_arch = "x86_64")]
-            let arch = "darwin-x86_64";
-            #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-            let arch = "darwin-arm64";
+            let arch = if cfg!(target_os = "macos") {
+                "darwin-universal"
+            } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+                "linux-x86_64"
+            } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+                "linux-aarch64"
+            } else {
+                return Err(error::Error::Other(
+                    "preprocessor install is only supported on macOS and Linux (x86_64/aarch64)".into()
+                ));
+            };
             let tarball = format!("{binary_name}-{arch}.tar.gz");
             let url = format!(
                 "https://github.com/vlwkaos/ir/releases/latest/download/{tarball}"
@@ -633,10 +638,16 @@ fn install_preprocessor(config: &mut Config, lang: &str) -> Result<()> {
                     "download failed: {url}"
                 )));
             }
-            std::process::Command::new("tar")
+            let tar_status = std::process::Command::new("tar")
                 .args(["-xzf", &tar_path.to_string_lossy(), "-C", &install_dir.to_string_lossy()])
                 .status()
                 .map_err(|e| error::Error::Other(format!("tar: {e}")))?;
+            if !tar_status.success() {
+                std::fs::remove_file(&tar_path).ok();
+                return Err(error::Error::Other(format!(
+                    "failed to extract {tarball}: tar exited with {}", tar_status
+                )));
+            }
             std::fs::remove_file(&tar_path).ok();
             #[cfg(unix)]
             {
