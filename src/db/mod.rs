@@ -30,7 +30,7 @@ pub fn ensure_sqlite_vec() {
         // *const () — if the signature changes, mismatched sizes fail at compile time.
         type ExtInit = unsafe extern "C" fn(
             *mut sqlite3,
-            *mut *mut i8,
+            *mut *mut std::ffi::c_char,
             *const sqlite3_api_routines,
         ) -> i32;
         unsafe {
