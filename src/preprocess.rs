@@ -161,10 +161,20 @@ mod tests {
         assert_eq!(out, input);
     }
 
+    // Tests use awk instead of tr because tr uses full stdio buffering on
+    // pipes, causing deadlocks with the line-by-line preprocessor protocol.
+    // awk with fflush() guarantees line-buffered output on all platforms.
+    // Commands must avoid spaces in awk programs since spawn() splits on whitespace.
+
+    /// Lowercase via awk — no spaces in program text.
+    const AWK_LOWER: &str = "awk {print(tolower($0));fflush()}";
+    /// Replace 'o' with '0' — used as a second stage in chain tests.
+    const AWK_O_TO_ZERO: &str = "awk {gsub(/o/,\"0\");print;fflush()}";
+
     #[cfg(unix)]
     #[test]
-    fn tr_transforms_text() {
-        let mut chain = PreprocessChain::spawn(&["tr A-Z a-z".to_string()]);
+    fn awk_transforms_text() {
+        let mut chain = PreprocessChain::spawn(&[AWK_LOWER.to_string()]);
         assert!(chain.is_active());
         let out = chain.process_text("HELLO WORLD").unwrap();
         assert_eq!(out, "hello world");
@@ -173,17 +183,18 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn chain_pipes_through_multiple() {
-        let cmds = vec!["tr A-Z a-z".to_string(), "tr ' ' '_'".to_string()];
+        // lowercase then o→0: "HELLO WORLD" → "hello world" → "hell0 w0rld"
+        let cmds = vec![AWK_LOWER.to_string(), AWK_O_TO_ZERO.to_string()];
         let mut chain = PreprocessChain::spawn(&cmds);
         assert!(chain.is_active());
         let out = chain.process_text("HELLO WORLD").unwrap();
-        assert_eq!(out, "hello_world");
+        assert_eq!(out, "hell0 w0rld");
     }
 
     #[cfg(unix)]
     #[test]
     fn preprocess_query_applies_transformation() {
-        let cmds = vec!["tr A-Z a-z".to_string()];
+        let cmds = vec![AWK_LOWER.to_string()];
         let out = preprocess_query("HELLO WORLD", &cmds);
         assert_eq!(out, "hello world");
     }
@@ -206,7 +217,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn chain_skips_invalid_handles() {
-        let cmds = vec!["__nonexistent_command_xyz__".to_string(), "tr A-Z a-z".to_string()];
+        let cmds = vec!["__nonexistent_command_xyz__".to_string(), AWK_LOWER.to_string()];
         let mut chain = PreprocessChain::spawn(&cmds);
         // One valid handle should remain active
         assert!(chain.is_active());
@@ -217,7 +228,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn multiline_with_transformation() {
-        let mut chain = PreprocessChain::spawn(&["tr A-Z a-z".to_string()]);
+        let mut chain = PreprocessChain::spawn(&[AWK_LOWER.to_string()]);
         assert!(chain.is_active());
         let out = chain.process_text("HELLO\nWORLD").unwrap();
         assert_eq!(out, "hello\nworld");
