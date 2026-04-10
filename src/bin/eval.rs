@@ -24,13 +24,13 @@ use std::path::{Path, PathBuf};
 use ir_search::db::{fts, schema, vectors};
 use ir_search::error::{Error, Result};
 use ir_search::index::{chunker, hasher};
-use ir_search::preprocess::PreprocessChain;
 use ir_search::llm::{
     embedding::{Embedder, EmbeddingPooling},
     expander::{Expander, SubQueryKind},
     models,
     reranker::Reranker,
 };
+use ir_search::preprocess::PreprocessChain;
 use ir_search::types::SearchResult;
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
@@ -529,7 +529,8 @@ fn index_corpus(
 
         // When chain is active, FTS triggers are disabled — insert preprocessed text explicitly.
         if let Some(ch) = chain.as_deref_mut()
-            && ch.is_active() && n_changed > 0
+            && ch.is_active()
+            && n_changed > 0
         {
             let rowid = conn.last_insert_rowid();
             let processed = ch.process_text(&text)?;
@@ -627,7 +628,11 @@ fn embed_corpus(conn: &Connection, docs: &[CorpusDoc], embedder: &Embedder) -> R
     }
 
     let total_chunks: usize = pending.iter().map(|d| d.chunks.len()).sum();
-    println!("  embedding {} chunks from {} documents...", total_chunks, pending.len());
+    println!(
+        "  embedding {} chunks from {} documents...",
+        total_chunks,
+        pending.len()
+    );
 
     let inputs: Vec<(String, String)> = pending
         .iter()
@@ -679,7 +684,10 @@ fn embed_queries(
         }
     }
 
-    let pending: Vec<&Query> = queries.iter().filter(|q| !cached.contains_key(&q.id)).collect();
+    let pending: Vec<&Query> = queries
+        .iter()
+        .filter(|q| !cached.contains_key(&q.id))
+        .collect();
     let n_cached = cached.len();
     let n_pending = pending.len();
     let total = queries.len();
@@ -779,9 +787,7 @@ fn bm25_search(
     chain: Option<&mut PreprocessChain>,
 ) -> Vec<SearchResult> {
     let effective_query = match chain {
-        Some(ch) if ch.is_active() => {
-            ch.process_text(query).unwrap_or_else(|_| query.to_string())
-        }
+        Some(ch) if ch.is_active() => ch.process_text(query).unwrap_or_else(|_| query.to_string()),
         _ => query.to_string(),
     };
     let fts_query = fts::build_query(&effective_query);
@@ -792,7 +798,11 @@ fn bm25_search(
         fts_query,
         collection: "eval",
         limit,
-        title_weight: if title_weight == 1.0 { None } else { Some(title_weight) },
+        title_weight: if title_weight == 1.0 {
+            None
+        } else {
+            Some(title_weight)
+        },
     };
     fts::search(conn, &q).unwrap_or_default()
 }
@@ -990,7 +1000,13 @@ fn expanded_fusion(
                 };
 
                 let results = match sub.kind {
-                    SubQueryKind::Lex => bm25_search(conn, &sub.text, fetch_n, cfg.title_weight, chain.as_deref_mut()),
+                    SubQueryKind::Lex => bm25_search(
+                        conn,
+                        &sub.text,
+                        fetch_n,
+                        cfg.title_weight,
+                        chain.as_deref_mut(),
+                    ),
                     SubQueryKind::Vec | SubQueryKind::Hyde => {
                         if let Ok(embedding) = embedder.embed_query(&sub.text) {
                             vector_search_from_embedding(conn, &embedding, fetch_n)
@@ -1022,7 +1038,13 @@ fn expanded_fusion(
                 };
                 match sub.kind {
                     SubQueryKind::Lex => {
-                        let mut results = bm25_search(conn, &sub.text, fetch_n, cfg.title_weight, chain.as_deref_mut());
+                        let mut results = bm25_search(
+                            conn,
+                            &sub.text,
+                            fetch_n,
+                            cfg.title_weight,
+                            chain.as_deref_mut(),
+                        );
                         results.iter_mut().for_each(|r| r.score *= weight);
                         bm25_pool.extend(results);
                     }
@@ -1175,20 +1197,18 @@ fn tokenize_terms(text: &str, chain: Option<&mut PreprocessChain>) -> Vec<String
     if let Some(ch) = chain
         && ch.is_active()
     {
-            let processed = ch.process_text(text).unwrap_or_else(|_| text.to_string());
-            return processed
-                .split_whitespace()
-                .filter_map(|token| {
-                    let term = token.trim().to_lowercase();
-                    if term.is_empty()
-                        || (term.is_ascii() && (term.len() < 2 || is_stopword(&term)))
-                    {
-                        None
-                    } else {
-                        Some(term)
-                    }
-                })
-                .collect();
+        let processed = ch.process_text(text).unwrap_or_else(|_| text.to_string());
+        return processed
+            .split_whitespace()
+            .filter_map(|token| {
+                let term = token.trim().to_lowercase();
+                if term.is_empty() || (term.is_ascii() && (term.len() < 2 || is_stopword(&term))) {
+                    None
+                } else {
+                    Some(term)
+                }
+            })
+            .collect();
     }
     text.split(|c: char| !c.is_ascii_alphanumeric())
         .filter_map(|token| {
@@ -1438,7 +1458,11 @@ fn load_cached_results(
         Err(_) => return map,
     };
     let rows = stmt.query_map(params![run_key, mode], |r| {
-        Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?, r.get::<_, f64>(2)?))
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, f64>(1)?,
+            r.get::<_, f64>(2)?,
+        ))
     });
     if let Ok(rows) = rows {
         for row in rows.flatten() {
@@ -1448,7 +1472,14 @@ fn load_cached_results(
     map
 }
 
-fn save_query_result(conn: &Connection, run_key: &str, query_id: &str, mode: &str, ndcg: f64, recall: f64) {
+fn save_query_result(
+    conn: &Connection,
+    run_key: &str,
+    query_id: &str,
+    mode: &str,
+    ndcg: f64,
+    recall: f64,
+) {
     if let Err(e) = conn.execute(
         "INSERT OR REPLACE INTO eval_run_results (run_key, query_id, mode, ndcg, recall)
          VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -1479,16 +1510,25 @@ fn evaluate_bm25(
         n += 1;
     }
 
-    let pending: Vec<&Query> = queries.iter().filter(|q| !cached.contains_key(&q.id)).collect();
+    let pending: Vec<&Query> = queries
+        .iter()
+        .filter(|q| !cached.contains_key(&q.id))
+        .collect();
     if n_cached > 0 && pending.is_empty() {
         println!("  all bm25 results cached ({n_cached})");
     } else if n_cached > 0 {
-        println!("  {n_cached}/{} bm25 results cached, computing {} new...", queries.len(), pending.len());
+        println!(
+            "  {n_cached}/{} bm25 results cached, computing {} new...",
+            queries.len(),
+            pending.len()
+        );
     }
 
     for (i, q) in pending.iter().enumerate() {
         maybe_log_query_progress("bm25", i + n_cached, queries.len());
-        let Some(relevant) = qrels.get(&q.id) else { continue; };
+        let Some(relevant) = qrels.get(&q.id) else {
+            continue;
+        };
         let results = bm25_search(conn, &q.text, k, 1.0, chain.as_deref_mut());
         let ranked: Vec<String> = results.iter().map(|r| r.path.clone()).collect();
         let ndcg = ndcg_at_k(&ranked, relevant, k);
@@ -1528,17 +1568,28 @@ fn evaluate_vector(
         n += 1;
     }
 
-    let pending: Vec<&Query> = queries.iter().filter(|q| !cached.contains_key(&q.id)).collect();
+    let pending: Vec<&Query> = queries
+        .iter()
+        .filter(|q| !cached.contains_key(&q.id))
+        .collect();
     if n_cached > 0 && pending.is_empty() {
         println!("  all vector results cached ({n_cached})");
     } else if n_cached > 0 {
-        println!("  {n_cached}/{} vector results cached, computing {} new...", queries.len(), pending.len());
+        println!(
+            "  {n_cached}/{} vector results cached, computing {} new...",
+            queries.len(),
+            pending.len()
+        );
     }
 
     for (i, q) in pending.iter().enumerate() {
         maybe_log_query_progress("vector", i + n_cached, queries.len());
-        let Some(relevant) = qrels.get(&q.id) else { continue; };
-        let Some(embedding) = query_embeddings.get(&q.id) else { continue; };
+        let Some(relevant) = qrels.get(&q.id) else {
+            continue;
+        };
+        let Some(embedding) = query_embeddings.get(&q.id) else {
+            continue;
+        };
         let results = vector_search_from_embedding(conn, embedding, k);
         let ranked: Vec<String> = results.iter().map(|r| r.path.clone()).collect();
         let ndcg = ndcg_at_k(&ranked, relevant, k);
@@ -1589,18 +1640,29 @@ fn evaluate_hybrid(
         n += 1;
     }
 
-    let pending: Vec<&Query> = queries.iter().filter(|q| !cached.contains_key(&q.id)).collect();
+    let pending: Vec<&Query> = queries
+        .iter()
+        .filter(|q| !cached.contains_key(&q.id))
+        .collect();
     if n_cached > 0 && pending.is_empty() {
         println!("  all {mode_name} results cached ({n_cached})");
     } else if n_cached > 0 {
-        println!("  {n_cached}/{} {mode_name} results cached, computing {} new...", queries.len(), pending.len());
+        println!(
+            "  {n_cached}/{} {mode_name} results cached, computing {} new...",
+            queries.len(),
+            pending.len()
+        );
     }
 
     let mut rerank_cache: HashMap<(String, String), f64> = HashMap::new();
     for (i, q) in pending.iter().enumerate() {
         maybe_log_query_progress(mode_name, i + n_cached, queries.len());
-        let Some(relevant) = qrels.get(&q.id) else { continue; };
-        let Some(embedding) = query_embeddings.get(&q.id) else { continue; };
+        let Some(relevant) = qrels.get(&q.id) else {
+            continue;
+        };
+        let Some(embedding) = query_embeddings.get(&q.id) else {
+            continue;
+        };
         let fusion_limit = if reranker.is_some() {
             (k * 2).max(rerank_top_n)
         } else {
@@ -1864,7 +1926,10 @@ fn main() -> Result<()> {
             )));
         }
         if !matches!(args.mode, EvalMode::Hybrid | EvalMode::All) {
-            eprintln!("warning: --compare-alpha has no effect with --mode {:?}", args.mode);
+            eprintln!(
+                "warning: --compare-alpha has no effect with --mode {:?}",
+                args.mode
+            );
         }
     }
     if !(0.0..=1.0).contains(&args.rerank_weight) {
@@ -1939,7 +2004,10 @@ fn main() -> Result<()> {
     if let Some(ref ch) = preprocess_chain
         && ch.is_active()
     {
-        println!("preprocessor: {}", args.preprocessor.as_deref().unwrap_or(""));
+        println!(
+            "preprocessor: {}",
+            args.preprocessor.as_deref().unwrap_or("")
+        );
     }
 
     println!("loading corpus...");
@@ -1953,7 +2021,11 @@ fn main() -> Result<()> {
     // Only run corpus through the preprocessor for term stats when PRF is active.
     // Without PRF, term stats are unused for BM25 and running 9k+ docs through the
     // chain would exhaust the subprocess before indexing.
-    let prf_chain = if args.use_prf { preprocess_chain.as_mut() } else { None };
+    let prf_chain = if args.use_prf {
+        preprocess_chain.as_mut()
+    } else {
+        None
+    };
     let term_stats = build_term_stats(&doc_texts, prf_chain);
 
     println!("loading queries...");
@@ -2155,7 +2227,14 @@ fn main() -> Result<()> {
     if matches!(args.mode, EvalMode::Bm25 | EvalMode::All) {
         print!("evaluating bm25 ({} queries)... ", queries.len());
         let _ = std::io::stdout().flush();
-        results.push(evaluate_bm25(&conn, &queries, &qrels, k, &run_key, preprocess_chain.as_mut()));
+        results.push(evaluate_bm25(
+            &conn,
+            &queries,
+            &qrels,
+            k,
+            &run_key,
+            preprocess_chain.as_mut(),
+        ));
         println!("done");
     }
 
@@ -2212,7 +2291,10 @@ fn main() -> Result<()> {
             println!("done");
 
             if let Some(cmp_alpha) = args.compare_alpha {
-                print!("evaluating hybrid α={cmp_alpha} ({} queries)... ", queries.len());
+                print!(
+                    "evaluating hybrid α={cmp_alpha} ({} queries)... ",
+                    queries.len()
+                );
                 let _ = std::io::stdout().flush();
                 let mut cmp_cfg = hybrid_cfg;
                 cmp_cfg.alpha = cmp_alpha;
@@ -2250,14 +2332,7 @@ fn main() -> Result<()> {
                         println!(
                             "  α={cmp_alpha:.2} vs α={:.2}  nDCG: {:.4} vs {:.4}  \
                              Δ={:+.4}  SE={:.4}  t={:+.2}  95%CI=[{:+.4},{:+.4}]  ({sig})",
-                            args.alpha,
-                            cmp_result.ndcg,
-                            base_result.ndcg,
-                            mean,
-                            se,
-                            t,
-                            lo,
-                            hi
+                            args.alpha, cmp_result.ndcg, base_result.ndcg, mean, se, t, lo, hi
                         );
                     }
                 }

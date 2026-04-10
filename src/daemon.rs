@@ -18,11 +18,11 @@ use crate::types::SearchMode;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::os::unix::{fs::PermissionsExt, io::AsRawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::{fs::PermissionsExt, io::AsRawFd};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Per-collection routing information kept in DaemonState.
@@ -46,8 +46,12 @@ pub struct DaemonRequest {
     pub verbose: bool,
 }
 
-fn default_limit() -> usize { 10 }
-fn default_mode() -> String { "hybrid".into() }
+fn default_limit() -> usize {
+    10
+}
+fn default_mode() -> String {
+    "hybrid".into()
+}
 
 #[derive(Serialize)]
 struct DaemonResponse {
@@ -195,36 +199,34 @@ struct Tier2 {
 /// Send a search request to the daemon and return parsed results + pipeline log.
 pub fn query(req: &DaemonRequest) -> Result<QueryResponse> {
     let sock = config::daemon_socket_path();
-    let stream = UnixStream::connect(&sock)
-        .map_err(|e| Error::Other(format!("daemon connect: {e}")))?;
+    let stream =
+        UnixStream::connect(&sock).map_err(|e| Error::Other(format!("daemon connect: {e}")))?;
 
     let mut writer = stream.try_clone().map_err(Error::Io)?;
     let reader = BufReader::new(stream);
 
-    let payload = serde_json::to_string(req)
-        .map_err(|e| Error::Other(format!("serialize: {e}")))?;
+    let payload =
+        serde_json::to_string(req).map_err(|e| Error::Other(format!("serialize: {e}")))?;
     writer.write_all(payload.as_bytes()).map_err(Error::Io)?;
     writer.write_all(b"\n").map_err(Error::Io)?;
 
-    let line = reader.lines()
+    let line = reader
+        .lines()
         .next()
         .ok_or_else(|| Error::Other("daemon closed connection".into()))?
         .map_err(Error::Io)?;
 
-    let resp: serde_json::Value = serde_json::from_str(&line)
-        .map_err(|e| Error::Other(format!("parse response: {e}")))?;
+    let resp: serde_json::Value =
+        serde_json::from_str(&line).map_err(|e| Error::Other(format!("parse response: {e}")))?;
 
     if resp["ok"].as_bool().unwrap_or(false) {
-        let results: Vec<DaemonResult> = serde_json::from_value(
-            resp["results"].clone()
-        ).map_err(|e| Error::Other(format!("parse results: {e}")))?;
-        let log: Vec<String> = serde_json::from_value(
-            resp["log"].clone()
-        ).unwrap_or_default();
+        let results: Vec<DaemonResult> = serde_json::from_value(resp["results"].clone())
+            .map_err(|e| Error::Other(format!("parse results: {e}")))?;
+        let log: Vec<String> = serde_json::from_value(resp["log"].clone()).unwrap_or_default();
         Ok(QueryResponse { results, log })
     } else {
         Err(Error::Other(
-            resp["error"].as_str().unwrap_or("daemon error").to_string()
+            resp["error"].as_str().unwrap_or("daemon error").to_string(),
         ))
     }
 }
@@ -256,7 +258,10 @@ impl DaemonState {
             })
             .collect();
         let config_mtime = config_mtime();
-        Ok(Self { collections, config_mtime })
+        Ok(Self {
+            collections,
+            config_mtime,
+        })
     }
 
     /// Reload if config.yml has been modified since last load.
@@ -302,11 +307,16 @@ pub fn start_server(timeout_secs: u64) -> Result<()> {
     }
 
     // Remove stale files; safe — we hold the lock.
-    if sock_path.exists() { std::fs::remove_file(&sock_path).map_err(Error::Io)?; }
+    if sock_path.exists() {
+        std::fs::remove_file(&sock_path).map_err(Error::Io)?;
+    }
     let _ = std::fs::remove_file(&tier2_path);
 
     let gpu_on = crate::llm::gpu_layers() > 0;
-    eprintln!("loading models (Metal: {})...", if gpu_on { "on" } else { "off" });
+    eprintln!(
+        "loading models (Metal: {})...",
+        if gpu_on { "on" } else { "off" }
+    );
 
     // Tier-1: load embedder only.
     let embedder = crate::llm::embedding::Embedder::load_default()
@@ -334,8 +344,16 @@ pub fn start_server(timeout_secs: u64) -> Result<()> {
     // proceed (is_running() will now return true, preventing duplicate spawns).
     drop(startup_lock);
 
-    let timeout_msg = if timeout_secs > 0 { format!("  timeout={}s", timeout_secs) } else { "  timeout=never".into() };
-    eprintln!("daemon ready (tier 1)  socket={}{}", sock_path.display(), timeout_msg);
+    let timeout_msg = if timeout_secs > 0 {
+        format!("  timeout={}s", timeout_secs)
+    } else {
+        "  timeout=never".into()
+    };
+    eprintln!(
+        "daemon ready (tier 1)  socket={}{}",
+        sock_path.display(),
+        timeout_msg
+    );
 
     // Tier-2: load expander+reranker in background; signal readiness via tier2_path.
     // Race-free: send to channel BEFORE writing tier2_path. Main thread's try_recv()
@@ -344,9 +362,14 @@ pub fn start_server(timeout_secs: u64) -> Result<()> {
     let tier2_path_bg = tier2_path.clone();
     std::thread::spawn(move || {
         let qwen = std::env::var_os("IR_QWEN_MODEL")
-            .and_then(|_| crate::llm::qwen::Qwen35::load_default()
-                .map_err(|e| { eprintln!("  note: qwen unavailable ({e})"); e })
-                .ok())
+            .and_then(|_| {
+                crate::llm::qwen::Qwen35::load_default()
+                    .map_err(|e| {
+                        eprintln!("  note: qwen unavailable ({e})");
+                        e
+                    })
+                    .ok()
+            })
             .map(std::sync::Arc::new);
 
         let (expander, scorer) = if let Some(q) = qwen {
@@ -359,11 +382,17 @@ pub fn start_server(timeout_secs: u64) -> Result<()> {
             let exp = crate::llm::expander::Expander::load_default()
                 .map_err(|e| eprintln!("  note: expander unavailable ({e})"))
                 .ok()
-                .map(|e| { eprintln!("  expander ready"); Box::new(e) as Box<dyn crate::llm::expander::QueryExpander> });
+                .map(|e| {
+                    eprintln!("  expander ready");
+                    Box::new(e) as Box<dyn crate::llm::expander::QueryExpander>
+                });
             let rer = crate::llm::reranker::Reranker::load_default()
                 .map_err(|e| eprintln!("  note: reranker unavailable ({e})"))
                 .ok()
-                .map(|r| { eprintln!("  reranker ready"); Box::new(r) as Box<dyn crate::llm::scoring::Scorer> });
+                .map(|r| {
+                    eprintln!("  reranker ready");
+                    Box::new(r) as Box<dyn crate::llm::scoring::Scorer>
+                });
             (exp, rer)
         };
 
@@ -453,12 +482,21 @@ fn handle_connection(
     }
 
     let resp = match handle_request(line.trim_end(), hybrid, state) {
-        Ok((results, log)) => DaemonResponse { ok: true, error: None, results: Some(results), log },
-        Err(e) => DaemonResponse { ok: false, error: Some(e.to_string()), results: None, log: vec![] },
+        Ok((results, log)) => DaemonResponse {
+            ok: true,
+            error: None,
+            results: Some(results),
+            log,
+        },
+        Err(e) => DaemonResponse {
+            ok: false,
+            error: Some(e.to_string()),
+            results: None,
+            log: vec![],
+        },
     };
 
-    let json = serde_json::to_string(&resp)
-        .map_err(|e| Error::Other(format!("serialize: {e}")))?;
+    let json = serde_json::to_string(&resp).map_err(|e| Error::Other(format!("serialize: {e}")))?;
     writer.write_all(json.as_bytes()).map_err(Error::Io)?;
     writer.write_all(b"\n").map_err(Error::Io)?;
     writer.flush().map_err(Error::Io)?;
@@ -470,23 +508,27 @@ fn handle_request(
     hybrid: &search::hybrid::HybridSearch,
     state: &DaemonState,
 ) -> Result<(Vec<DaemonResult>, Vec<String>)> {
-    let req: DaemonRequest = serde_json::from_str(line)
-        .map_err(|e| Error::Other(format!("parse request: {e}")))?;
+    let req: DaemonRequest =
+        serde_json::from_str(line).map_err(|e| Error::Other(format!("parse request: {e}")))?;
 
     let mode: SearchMode = req.mode.parse().map_err(Error::Other)?;
 
-    let selected: Vec<(&String, &CollectionInfo)> = req.collections.iter()
+    let selected: Vec<(&String, &CollectionInfo)> = req
+        .collections
+        .iter()
         .filter_map(|name| state.collections.get(name).map(|info| (name, info)))
         .collect();
 
     if selected.is_empty() {
         return Err(Error::Other(format!(
-            "no matching collections for {:?}", req.collections
+            "no matching collections for {:?}",
+            req.collections
         )));
     }
 
     // Fresh RW connections per query — sees live index updates, enables cache writes.
-    let dbs: Vec<CollectionDb> = selected.iter()
+    let dbs: Vec<CollectionDb> = selected
+        .iter()
         .map(|(name, info)| {
             CollectionDb::open_rw(
                 name.as_str(),
@@ -525,15 +567,21 @@ fn handle_request(
         }
     };
 
-    Ok((results.into_iter().map(|r| DaemonResult {
-        collection: r.collection,
-        path: r.path,
-        title: r.title,
-        score: r.score,
-        snippet: r.snippet.unwrap_or_default(),
-        hash: r.hash,
-        doc_id: r.doc_id,
-    }).collect(), log))
+    Ok((
+        results
+            .into_iter()
+            .map(|r| DaemonResult {
+                collection: r.collection,
+                path: r.path,
+                title: r.title,
+                score: r.score,
+                snippet: r.snippet.unwrap_or_default(),
+                hash: r.hash,
+                doc_id: r.doc_id,
+            })
+            .collect(),
+        log,
+    ))
 }
 
 // ── Stop / status ─────────────────────────────────────────────────────────────
@@ -555,10 +603,14 @@ pub fn stop() -> Result<()> {
     }
 
     let pid_str = std::fs::read_to_string(&pid_path).map_err(Error::Io)?;
-    let pid: i32 = pid_str.trim().parse()
+    let pid: i32 = pid_str
+        .trim()
+        .parse()
         .map_err(|_| Error::Other(format!("invalid pid file: {pid_str:?}")))?;
 
-    unsafe extern "C" { fn kill(pid: i32, sig: i32) -> i32; }
+    unsafe extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
     // Probe first (sig=0): verifies the process exists without sending a signal.
     if unsafe { kill(pid, 0) } != 0 {
         eprintln!("warning: pid {pid} not found — removing stale pid file");
@@ -579,8 +631,7 @@ pub fn stop() -> Result<()> {
 
 pub fn status() -> Result<()> {
     if is_running() {
-        let pid = std::fs::read_to_string(config::daemon_pid_path())
-            .unwrap_or_else(|_| "?".into());
+        let pid = std::fs::read_to_string(config::daemon_pid_path()).unwrap_or_else(|_| "?".into());
         println!("running  pid={}", pid.trim());
     } else {
         println!("not running");

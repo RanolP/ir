@@ -44,14 +44,18 @@ struct Logger {
 
 impl Logger {
     fn new(verbose: bool) -> Self {
-        Self { log: Vec::new(), verbose }
+        Self {
+            log: Vec::new(),
+            verbose,
+        }
     }
     fn info(&mut self, msg: impl Into<String>) {
         self.log.push(msg.into());
     }
     fn timing(&mut self, stage: &str, d: std::time::Duration) {
         if self.verbose {
-            self.log.push(format!("[timing] {:<14} {}ms", stage, d.as_millis()));
+            self.log
+                .push(format!("[timing] {:<14} {}ms", stage, d.as_millis()));
         }
     }
 }
@@ -88,13 +92,21 @@ impl HybridSearch {
 
         if fused.is_empty() {
             log.timing("total", t_total.elapsed());
-            return Ok(SearchOutput { results: vec![], log: log.log });
+            return Ok(SearchOutput {
+                results: vec![],
+                log: log.log,
+            });
         }
 
         // Log fused score distribution for threshold calibration.
         if log.verbose {
-            let scores: Vec<String> = fused.iter().take(5).map(|r| format!("{:.3}", r.score)).collect();
-            log.log.push(format!("[fused] top-5 scores: [{}]", scores.join(", ")));
+            let scores: Vec<String> = fused
+                .iter()
+                .take(5)
+                .map(|r| format!("{:.3}", r.score))
+                .collect();
+            log.log
+                .push(format!("[fused] top-5 scores: [{}]", scores.join(", ")));
         }
 
         // 2. Shortcut: fused results show clear winner → skip LLM enhancement.
@@ -117,7 +129,9 @@ impl HybridSearch {
         let enhanced = if self.scorer.is_some() {
             if let Some(exp) = &self.expander {
                 let t0 = Instant::now();
-                let cached = self.expander_cache.as_ref()
+                let cached = self
+                    .expander_cache
+                    .as_ref()
                     .and_then(|c| c.get(exp.model_id(), req.query));
                 let subs = if let Some(subs) = cached {
                     log.info("Expanding query (cached)...");
@@ -135,9 +149,17 @@ impl HybridSearch {
                     subs
                 };
 
-                let n_vec = subs.iter().filter(|s| matches!(s.kind, SubQueryKind::Vec | SubQueryKind::Hyde)).count();
+                let n_vec = subs
+                    .iter()
+                    .filter(|s| matches!(s.kind, SubQueryKind::Vec | SubQueryKind::Hyde))
+                    .count();
                 let n_lex = subs.iter().filter(|s| s.kind == SubQueryKind::Lex).count();
-                log.info(format!("Searching {} sub-queries ({} lex, {} vec/hyde)...", subs.len(), n_lex, n_vec));
+                log.info(format!(
+                    "Searching {} sub-queries ({} lex, {} vec/hyde)...",
+                    subs.len(),
+                    n_lex,
+                    n_vec
+                ));
 
                 rrf_from_subqueries(dbs, &self.embedder, &subs, req, fused, &mut log)?
             } else {
@@ -152,7 +174,10 @@ impl HybridSearch {
 
         if enhanced.is_empty() {
             log.timing("total", t_total.elapsed());
-            return Ok(SearchOutput { results: vec![], log: log.log });
+            return Ok(SearchOutput {
+                results: vec![],
+                log: log.log,
+            });
         }
 
         // 4. Rerank top-20 if scorer available.
@@ -160,7 +185,14 @@ impl HybridSearch {
             let n = enhanced.len().min(20);
             log.info(format!("Reranking {n} chunks..."));
             let t0 = Instant::now();
-            let result = rerank(scorer.as_ref(), req.query, enhanced, dbs, req.limit, &mut log)?;
+            let result = rerank(
+                scorer.as_ref(),
+                req.query,
+                enhanced,
+                dbs,
+                req.limit,
+                &mut log,
+            )?;
             log.timing("rerank", t0.elapsed());
             result
         } else {
@@ -340,7 +372,6 @@ fn bm25_across(dbs: &[CollectionDb], query: &str, limit: usize) -> Result<Vec<Se
         .map(|vv| vv.into_iter().flatten().collect())
 }
 
-
 fn vec_across(dbs: &[CollectionDb], embedding: &[f32], limit: usize) -> Result<Vec<SearchResult>> {
     dbs.iter()
         .map(|db| vectors::search(db.conn(), embedding, &db.name, limit))
@@ -437,7 +468,8 @@ fn rerank(
 
     let n_cached = top_n - uncached_indices.len();
     if n_cached > 0 && log.verbose {
-        log.log.push(format!("[timing] rerank_cached  {n_cached}/{top_n} hits"));
+        log.log
+            .push(format!("[timing] rerank_cached  {n_cached}/{top_n} hits"));
     }
 
     // Score only uncached candidates
@@ -446,10 +478,7 @@ fn rerank(
             .iter()
             .map(|&i| fetch_doc_text(dbs, &to_rerank[i].hash, &to_rerank[i].collection))
             .collect();
-        let doc_refs: Vec<&str> = texts
-            .iter()
-            .map(|t| t.as_deref().unwrap_or(""))
-            .collect();
+        let doc_refs: Vec<&str> = texts.iter().map(|t| t.as_deref().unwrap_or("")).collect();
         let scores = scorer.score_batch(query, &doc_refs).unwrap_or_default();
 
         // Collect new entries to write to cache, grouped by collection
@@ -523,7 +552,10 @@ mod tests {
 
         // Below floor → not strong
         let r = vec![make(0.39), make(0.10)];
-        assert!(!is_strong_signal(&r), "score below floor should not be strong");
+        assert!(
+            !is_strong_signal(&r),
+            "score below floor should not be strong"
+        );
 
         // At floor, product below threshold (0.40 * 0.10 = 0.04 < 0.06) → not strong
         let r = vec![make(0.40), make(0.30)];
@@ -543,7 +575,10 @@ mod tests {
 
         // Single result above floor → strong
         let r = vec![make(0.50)];
-        assert!(is_strong_signal(&r), "single result above floor should be strong");
+        assert!(
+            is_strong_signal(&r),
+            "single result above floor should be strong"
+        );
     }
 
     #[test]
@@ -561,7 +596,10 @@ mod tests {
 
         // Below floor → not strong
         let r = vec![make(0.74), make(0.60)];
-        assert!(!is_bm25_strong_signal(&r), "score below BM25 floor should not be strong");
+        assert!(
+            !is_bm25_strong_signal(&r),
+            "score below BM25 floor should not be strong"
+        );
 
         // At floor, gap below threshold → not strong
         let r = vec![make(0.75), make(0.66)];
@@ -573,11 +611,17 @@ mod tests {
 
         // High score, large gap → strong
         let r = vec![make(0.90), make(0.70)];
-        assert!(is_bm25_strong_signal(&r), "high score + large gap should be strong");
+        assert!(
+            is_bm25_strong_signal(&r),
+            "high score + large gap should be strong"
+        );
 
         // Single result above floor → strong
         let r = vec![make(0.80)];
-        assert!(is_bm25_strong_signal(&r), "single result above floor should be strong");
+        assert!(
+            is_bm25_strong_signal(&r),
+            "single result above floor should be strong"
+        );
     }
 
     #[test]

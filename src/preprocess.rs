@@ -47,7 +47,11 @@ impl PreprocessHandle {
             Ok(mut child) => {
                 let stdin = BufWriter::new(child.stdin.take()?);
                 let stdout = BufReader::new(child.stdout.take()?);
-                Some(Self { child, stdin, stdout })
+                Some(Self {
+                    child,
+                    stdin,
+                    stdout,
+                })
             }
             Err(e) => {
                 eprintln!("warning: failed to spawn preprocessor '{cmd_str}': {e}");
@@ -130,7 +134,9 @@ pub fn preprocess_query(query: &str, commands: &[String]) -> String {
         );
         return query.to_string();
     }
-    chain.process_text(query).unwrap_or_else(|_| query.to_string())
+    chain
+        .process_text(query)
+        .unwrap_or_else(|_| query.to_string())
 }
 
 #[cfg(test)]
@@ -217,7 +223,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn chain_skips_invalid_handles() {
-        let cmds = vec!["__nonexistent_command_xyz__".to_string(), AWK_LOWER.to_string()];
+        let cmds = vec![
+            "__nonexistent_command_xyz__".to_string(),
+            AWK_LOWER.to_string(),
+        ];
         let mut chain = PreprocessChain::spawn(&cmds);
         // One valid handle should remain active
         assert!(chain.is_active());

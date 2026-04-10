@@ -39,7 +39,6 @@ pub fn bm25(dbs: &[CollectionDb], req: &SearchRequest) -> Result<Vec<SearchResul
     merge_and_filter(results, req)
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

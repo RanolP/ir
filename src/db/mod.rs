@@ -71,7 +71,12 @@ impl CollectionDb {
         let name = name.into();
         schema::init(&conn, &name, has_preprocessor)?;
 
-        Ok(Self { name, preprocessor_commands: vec![], conn, preprocess_chain: RefCell::new(None) })
+        Ok(Self {
+            name,
+            preprocessor_commands: vec![],
+            conn,
+            preprocess_chain: RefCell::new(None),
+        })
     }
 
     /// Open an existing collection DB with read-write access (no schema init).
@@ -84,10 +89,7 @@ impl CollectionDb {
     ) -> Result<Self> {
         ensure_sqlite_vec();
 
-        let conn = Connection::open_with_flags(
-            db_path,
-            OpenFlags::SQLITE_OPEN_READ_WRITE,
-        )?;
+        let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
 
         configure(&conn)?;
 
@@ -111,7 +113,8 @@ impl CollectionDb {
             return query.to_string();
         }
         let mut chain_ref = self.preprocess_chain.borrow_mut();
-        let chain = chain_ref.get_or_insert_with(|| PreprocessChain::spawn(&self.preprocessor_commands));
+        let chain =
+            chain_ref.get_or_insert_with(|| PreprocessChain::spawn(&self.preprocessor_commands));
         if !chain.is_active() {
             eprintln!(
                 "warning: preprocessor ({}) failed to start; using raw query",
@@ -119,7 +122,9 @@ impl CollectionDb {
             );
             return query.to_string();
         }
-        chain.process_text(query).unwrap_or_else(|_| query.to_string())
+        chain
+            .process_text(query)
+            .unwrap_or_else(|_| query.to_string())
     }
 }
 
@@ -139,8 +144,10 @@ pub fn fetch_content_batch(conn: &Connection, hashes: &[&str]) -> HashMap<String
         Ok(s) => s,
         Err(_) => return HashMap::new(),
     };
-    let params: Vec<&dyn rusqlite::types::ToSql> =
-        hashes.iter().map(|h| h as &dyn rusqlite::types::ToSql).collect();
+    let params: Vec<&dyn rusqlite::types::ToSql> = hashes
+        .iter()
+        .map(|h| h as &dyn rusqlite::types::ToSql)
+        .collect();
     let rows = match stmt.query_map(params.as_slice(), |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
     }) {
@@ -170,8 +177,10 @@ pub fn get_rerank_scores(conn: &Connection, keys: &[String]) -> HashMap<String, 
         Ok(s) => s,
         Err(_) => return HashMap::new(),
     };
-    let params: Vec<&dyn rusqlite::types::ToSql> =
-        keys.iter().map(|k| k as &dyn rusqlite::types::ToSql).collect();
+    let params: Vec<&dyn rusqlite::types::ToSql> = keys
+        .iter()
+        .map(|k| k as &dyn rusqlite::types::ToSql)
+        .collect();
     let rows = match stmt.query_map(params.as_slice(), |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
     }) {
@@ -211,7 +220,6 @@ pub fn put_rerank_scores(conn: &Connection, entries: &[(String, f64)]) {
     let _ = tx.commit();
 }
 
-
 // ── vector dimension helpers ──────────────────────────────────────────────────
 
 /// Read the current embedding dimension from the vectors_vec virtual table DDL.
@@ -240,9 +248,7 @@ pub fn ensure_vector_dimension(conn: &Connection, dim: usize) -> Result<()> {
     match current_vector_dim(conn) {
         Some(existing) if existing == dim => return Ok(()),
         Some(existing) => {
-            eprintln!(
-                "  vector dimension mismatch ({existing} -> {dim}), rebuilding vector table"
-            );
+            eprintln!("  vector dimension mismatch ({existing} -> {dim}), rebuilding vector table");
             conn.execute_batch(
                 "DROP TABLE IF EXISTS vectors_vec;
                  DELETE FROM content_vectors;",

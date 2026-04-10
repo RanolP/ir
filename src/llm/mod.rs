@@ -53,14 +53,8 @@ pub mod hf_repos {
         // ! uppercase on HF; local name uses lowercase q4_k_m
         "qmd-query-expansion-1.7B-Q4_K_M.gguf",
     );
-    pub const QWEN35_0_8B: (&str, &str) = (
-        "unsloth/Qwen3.5-0.8B-GGUF",
-        "Qwen3.5-0.8B-Q8_0.gguf",
-    );
-    pub const QWEN35_2B: (&str, &str) = (
-        "unsloth/Qwen3.5-2B-GGUF",
-        "Qwen3.5-2B-Q4_K_M.gguf",
-    );
+    pub const QWEN35_0_8B: (&str, &str) = ("unsloth/Qwen3.5-0.8B-GGUF", "Qwen3.5-0.8B-Q8_0.gguf");
+    pub const QWEN35_2B: (&str, &str) = ("unsloth/Qwen3.5-2B-GGUF", "Qwen3.5-2B-Q4_K_M.gguf");
 
     /// Returns `(repo_id, hf_filename)` for a local model filename, or `None`.
     pub fn for_filename(filename: &str) -> Option<(&'static str, &'static str)> {

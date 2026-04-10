@@ -77,15 +77,20 @@ impl Config {
 
     pub fn add_preprocessor(&mut self, alias: &str, command: &str) -> Result<()> {
         if alias.is_empty() || alias.contains(' ') {
-            return Err(Error::Other(format!("invalid preprocessor alias: {alias:?}")));
+            return Err(Error::Other(format!(
+                "invalid preprocessor alias: {alias:?}"
+            )));
         }
-        self.preprocessors.insert(alias.to_string(), command.to_string());
+        self.preprocessors
+            .insert(alias.to_string(), command.to_string());
         Ok(())
     }
 
     pub fn remove_preprocessor(&mut self, alias: &str) -> Result<()> {
         if self.preprocessors.remove(alias).is_none() {
-            return Err(Error::Other(format!("preprocessor alias not found: {alias:?}")));
+            return Err(Error::Other(format!(
+                "preprocessor alias not found: {alias:?}"
+            )));
         }
         Ok(())
     }
@@ -95,13 +100,11 @@ impl Config {
     pub fn resolve_preprocessor_commands(&self, aliases: &[String]) -> Vec<String> {
         aliases
             .iter()
-            .filter_map(|alias| {
-                match self.preprocessors.get(alias) {
-                    Some(cmd) => Some(cmd.clone()),
-                    None => {
-                        eprintln!("warning: preprocessor alias '{alias}' not found — skipping");
-                        None
-                    }
+            .filter_map(|alias| match self.preprocessors.get(alias) {
+                Some(cmd) => Some(cmd.clone()),
+                None => {
+                    eprintln!("warning: preprocessor alias '{alias}' not found — skipping");
+                    None
                 }
             })
             .collect()
