@@ -240,11 +240,11 @@ pub(crate) fn search_core(
         }
     }
 
-    if !daemon::is_running() {
-        if let Err(e) = daemon::start_in_background() {
-            if verbosity.show_progress() { eprintln!("note: could not start daemon ({e})"); }
-            return Ok(bm25_results);
-        }
+    if !daemon::is_running()
+        && let Err(e) = daemon::start_in_background()
+    {
+        if verbosity.show_progress() { eprintln!("note: could not start daemon ({e})"); }
+        return Ok(bm25_results);
     }
 
     let req = daemon::DaemonRequest {
@@ -360,7 +360,7 @@ fn handle_search(
         fill_content(&mut results, &dbs);
     }
 
-    output::print_results(&mut results, fmt);
+    output::print_results(&results, fmt);
     Ok(())
 }
 
@@ -520,16 +520,16 @@ fn handle_preprocessor(cmd: PreprocessorCmd) -> Result<()> {
             let cmd = config.preprocessors.get(&alias).cloned();
             config.remove_preprocessor(&alias)?;
             config.save()?;
-            if delete {
-                if let Some(cmd_str) = cmd {
-                    let path = std::path::Path::new(&cmd_str);
-                    let preprocess_dir = config::ir_dir().join("preprocessors");
-                    if path.starts_with(&preprocess_dir) && path.is_file() {
-                        std::fs::remove_file(path).map_err(error::Error::Io)?;
-                        println!("deleted {}", path.display());
-                    } else {
-                        println!("note: '{cmd_str}' is outside the ir preprocessors dir, not deleted");
-                    }
+            if delete
+                && let Some(cmd_str) = cmd
+            {
+                let path = std::path::Path::new(&cmd_str);
+                let preprocess_dir = config::ir_dir().join("preprocessors");
+                if path.starts_with(&preprocess_dir) && path.is_file() {
+                    std::fs::remove_file(path).map_err(error::Error::Io)?;
+                    println!("deleted {}", path.display());
+                } else {
+                    println!("note: '{cmd_str}' is outside the ir preprocessors dir, not deleted");
                 }
             }
             println!("removed preprocessor '{alias}'");
@@ -540,6 +540,7 @@ fn handle_preprocessor(cmd: PreprocessorCmd) -> Result<()> {
 
 enum PreprocessorKind {
     Binary { binary_name: &'static str },
+    #[allow(dead_code)]
     Script { repo_subdir: &'static str, script_name: &'static str },
 }
 struct KnownPreprocessor {

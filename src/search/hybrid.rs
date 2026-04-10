@@ -456,14 +456,14 @@ fn rerank(
         let mut new_entries: HashMap<&str, Vec<(String, f64)>> = HashMap::new();
 
         for (j, &i) in uncached_indices.iter().enumerate() {
-            if texts[j].is_some() {
-                if let Some(&score) = scores.get(j) {
-                    rerank_scores[i] = Some(score);
-                    new_entries
-                        .entry(to_rerank[i].collection.as_str())
-                        .or_default()
-                        .push((cache_keys[i].clone(), score));
-                }
+            if texts[j].is_some()
+                && let Some(&score) = scores.get(j)
+            {
+                rerank_scores[i] = Some(score);
+                new_entries
+                    .entry(to_rerank[i].collection.as_str())
+                    .or_default()
+                    .push((cache_keys[i].clone(), score));
             }
         }
 

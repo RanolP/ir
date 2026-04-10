@@ -31,7 +31,7 @@ unsafe impl Sync for Reranker {}
 impl Reranker {
     pub fn load(model_path: &Path) -> Result<Self> {
         let backend = crate::llm::init_backend()?;
-        let model = LlamaModel::load_from_file(&backend, model_path, &model_load_params())
+        let model = LlamaModel::load_from_file(backend, model_path, &model_load_params())
             .map_err(|e| Error::Other(format!("load reranker: {e}")))?;
         let (yes_token_id, no_token_id) = scoring::resolve_yes_no_tokens(&model)?;
         Ok(Self {

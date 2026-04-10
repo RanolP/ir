@@ -528,15 +528,15 @@ fn index_corpus(
         )?;
 
         // When chain is active, FTS triggers are disabled — insert preprocessed text explicitly.
-        if let Some(ch) = chain.as_deref_mut() {
-            if ch.is_active() && n_changed > 0 {
-                let rowid = conn.last_insert_rowid();
-                let processed = ch.process_text(&text)?;
-                conn.execute(
-                    "INSERT INTO documents_fts(rowid, path, title, body) VALUES (?1, ?2, ?3, ?4)",
-                    rusqlite::params![rowid, doc.id, doc.title, processed],
-                )?;
-            }
+        if let Some(ch) = chain.as_deref_mut()
+            && ch.is_active() && n_changed > 0
+        {
+            let rowid = conn.last_insert_rowid();
+            let processed = ch.process_text(&text)?;
+            conn.execute(
+                "INSERT INTO documents_fts(rowid, path, title, body) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![rowid, doc.id, doc.title, processed],
+            )?;
         }
     }
 
@@ -855,6 +855,7 @@ struct TermStats {
     n_docs: usize,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn hybrid_search(
     conn: &Connection,
     query: &str,
@@ -960,6 +961,7 @@ fn score_fusion_from_lists(
     merged
 }
 
+#[allow(clippy::too_many_arguments)]
 fn expanded_fusion(
     conn: &Connection,
     query: &str,
@@ -1170,8 +1172,9 @@ fn build_term_stats(
 }
 
 fn tokenize_terms(text: &str, chain: Option<&mut PreprocessChain>) -> Vec<String> {
-    if let Some(ch) = chain {
-        if ch.is_active() {
+    if let Some(ch) = chain
+        && ch.is_active()
+    {
             let processed = ch.process_text(text).unwrap_or_else(|_| text.to_string());
             return processed
                 .split_whitespace()
@@ -1186,7 +1189,6 @@ fn tokenize_terms(text: &str, chain: Option<&mut PreprocessChain>) -> Vec<String
                     }
                 })
                 .collect();
-        }
     }
     text.split(|c: char| !c.is_ascii_alphanumeric())
         .filter_map(|token| {
@@ -1307,6 +1309,7 @@ fn prf_expand_query(
     Some(format!("{query} {}", expansion_terms.join(" ")))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_prf(
     conn: &Connection,
     query: &str,
@@ -1343,6 +1346,7 @@ fn apply_prf(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn rerank_with_blend(
     conn: &Connection,
     query: &str,
@@ -1406,7 +1410,7 @@ fn rerank_with_blend(
 
 fn maybe_log_query_progress(phase: &str, index: usize, total: usize) {
     let done = index + 1;
-    if done % 50 == 0 || done == total {
+    if done.is_multiple_of(50) || done == total {
         println!("  {phase}: {done}/{total}");
     }
 }
@@ -1554,6 +1558,7 @@ fn evaluate_vector(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn evaluate_hybrid(
     conn: &Connection,
     queries: &[Query],
@@ -1659,6 +1664,7 @@ fn evaluate_hybrid(
 }
 
 /// Grid search over score-fusion alpha values and report best.
+#[allow(clippy::too_many_arguments)]
 fn tune_score_fusion(
     conn: &Connection,
     queries: &[Query],
@@ -1721,6 +1727,7 @@ fn tune_score_fusion(
 
 /// Grid search over reranker blend:
 /// final_score = fusion_weight * fusion + (1-fusion_weight) * rerank
+#[allow(clippy::too_many_arguments)]
 fn tune_rerank_blend(
     conn: &Connection,
     queries: &[Query],
@@ -1894,7 +1901,7 @@ fn main() -> Result<()> {
 
     // If cache_db was not explicitly set, derive from corpus name.
     // Each preprocessor gets its own DB — mixing them contaminates FTS via INSERT OR IGNORE.
-    let cache_db = if args.cache_db == PathBuf::from("test-data/nfcorpus-eval.sqlite") {
+    let cache_db = if args.cache_db == Path::new("test-data/nfcorpus-eval.sqlite") {
         match &args.preprocessor {
             Some(pp) => {
                 let pp_name = Path::new(pp)
@@ -1928,11 +1935,11 @@ fn main() -> Result<()> {
     let mut preprocess_chain: Option<PreprocessChain> = args
         .preprocessor
         .as_ref()
-        .map(|cmd| PreprocessChain::spawn(&[cmd.clone()]));
-    if let Some(ref ch) = preprocess_chain {
-        if ch.is_active() {
-            println!("preprocessor: {}", args.preprocessor.as_deref().unwrap_or(""));
-        }
+        .map(|cmd| PreprocessChain::spawn(std::slice::from_ref(cmd)));
+    if let Some(ref ch) = preprocess_chain
+        && ch.is_active()
+    {
+        println!("preprocessor: {}", args.preprocessor.as_deref().unwrap_or(""));
     }
 
     println!("loading corpus...");
@@ -2018,7 +2025,7 @@ fn main() -> Result<()> {
          PRAGMA cache_size   = -64000;
          PRAGMA foreign_keys = ON;",
     )?;
-    let has_preprocessor = preprocess_chain.as_ref().map_or(false, |ch| ch.is_active());
+    let has_preprocessor = preprocess_chain.as_ref().is_some_and(|ch| ch.is_active());
     schema::init(&conn, &corpus_name, has_preprocessor)?;
     ensure_eval_cache_schema(&conn)?;
     index_corpus(&conn, &corpus, preprocess_chain.as_mut())?;

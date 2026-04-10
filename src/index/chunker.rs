@@ -226,8 +226,8 @@ pub fn extract_title(doc: &str, path_hint: &str) -> String {
 
     for line in lines {
         let trimmed = line.trim();
-        if trimmed.starts_with("# ") {
-            return trimmed[2..].trim().to_string();
+        if let Some(heading) = trimmed.strip_prefix("# ") {
+            return heading.trim().to_string();
         }
         if !trimmed.is_empty() {
             return trimmed.to_string();

@@ -56,7 +56,7 @@ pub struct Expander {
 impl Expander {
     pub fn load(model_path: &Path) -> Result<Self> {
         let backend = crate::llm::init_backend()?;
-        let model = LlamaModel::load_from_file(&backend, model_path, &model_load_params())
+        let model = LlamaModel::load_from_file(backend, model_path, &model_load_params())
             .map_err(|e| Error::Other(format!("load expander model: {e}")))?;
         Ok(Self { backend, model })
     }
@@ -132,13 +132,11 @@ pub fn parse_output(raw: &str) -> Vec<SubQuery> {
                     kind: SubQueryKind::Vec,
                     text: text.trim().to_string(),
                 })
-            } else if let Some(text) = line.strip_prefix("hyde:") {
-                Some(SubQuery {
+            } else {
+                line.strip_prefix("hyde:").map(|text| SubQuery {
                     kind: SubQueryKind::Hyde,
                     text: text.trim().to_string(),
                 })
-            } else {
-                None
             }
         })
         .filter(|s| !s.text.is_empty())

@@ -106,7 +106,7 @@ impl Embedder {
         } else {
             model_load_params()
         };
-        let model = LlamaModel::load_from_file(&backend, model_path, &params)
+        let model = LlamaModel::load_from_file(backend, model_path, &params)
             .map_err(|e| Error::Other(format!("load embedding model: {e}")))?;
         let profile = profile_for_model_path(model_path);
         Ok(Self {
@@ -212,7 +212,7 @@ impl Embedder {
         }
 
         self.model
-            .new_context(&self.backend, ctx_params)
+            .new_context(self.backend, ctx_params)
             .map_err(|e| Error::Other(format!("embedding context: {e}")))
     }
 

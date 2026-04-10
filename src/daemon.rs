@@ -86,6 +86,7 @@ pub fn is_running() -> bool {
 fn open_lock_file() -> Result<std::fs::File> {
     std::fs::OpenOptions::new()
         .create(true)
+        .truncate(true)
         .write(true)
         .open(config::daemon_lock_path())
         .map_err(Error::Io)
@@ -343,10 +344,9 @@ pub fn start_server(timeout_secs: u64) -> Result<()> {
     let tier2_path_bg = tier2_path.clone();
     std::thread::spawn(move || {
         let qwen = std::env::var_os("IR_QWEN_MODEL")
-            .map(|_| crate::llm::qwen::Qwen35::load_default()
+            .and_then(|_| crate::llm::qwen::Qwen35::load_default()
                 .map_err(|e| { eprintln!("  note: qwen unavailable ({e})"); e })
                 .ok())
-            .flatten()
             .map(std::sync::Arc::new);
 
         let (expander, scorer) = if let Some(q) = qwen {
@@ -546,7 +546,7 @@ pub fn stop() -> Result<()> {
         // Tier-1 may be up (socket bound) but tier-2 still loading (no PID yet).
         if sock_path.exists() {
             let _ = std::fs::remove_file(&sock_path);
-            let _ = std::fs::remove_file(&config::daemon_tier2_path());
+            let _ = std::fs::remove_file(config::daemon_tier2_path());
             eprintln!("daemon stopping (tier-2 still loading, socket removed)");
         } else {
             eprintln!("daemon not running (no pid file)");
@@ -572,7 +572,7 @@ pub fn stop() -> Result<()> {
 
     let _ = std::fs::remove_file(&pid_path);
     let _ = std::fs::remove_file(&sock_path);
-    let _ = std::fs::remove_file(&config::daemon_tier2_path());
+    let _ = std::fs::remove_file(config::daemon_tier2_path());
     eprintln!("daemon stopped (pid {pid})");
     Ok(())
 }

@@ -24,10 +24,10 @@ pub fn ensure_model(filename: &str) -> Result<PathBuf> {
 
     // If a case-variant file already exists (e.g. q4_k_m vs Q4_K_M), reuse it
     // and place a stable alias at ~/.cache/ir/models/{filename}.
-    if hf_filename != filename {
-        if let Some(existing) = find_model(hf_filename) {
-            return Ok(with_local_alias(filename, existing));
-        }
+    if hf_filename != filename
+        && let Some(existing) = find_model(hf_filename)
+    {
+        return Ok(with_local_alias(filename, existing));
     }
 
     eprintln!("downloading {filename} from {repo_id}/{hf_filename}...");

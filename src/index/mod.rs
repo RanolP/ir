@@ -204,6 +204,7 @@ pub fn update(
     Ok((n_add, n_update, n_deactivate))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn store_document(
     conn: &rusqlite::Connection,
     rel_path: &str,
@@ -227,15 +228,15 @@ fn store_document(
     )?;
 
     // When chain is active, triggers are disabled — explicitly insert preprocessed text into FTS.
-    if let Some(chain) = chain {
-        if chain.is_active() {
-            let rowid = conn.last_insert_rowid();
-            let processed = chain.process_text(text)?;
-            conn.execute(
-                "INSERT INTO documents_fts(rowid, path, title, body) VALUES (?1, ?2, ?3, ?4)",
-                rusqlite::params![rowid, rel_path, title, processed],
-            )?;
-        }
+    if let Some(chain) = chain
+        && chain.is_active()
+    {
+        let rowid = conn.last_insert_rowid();
+        let processed = chain.process_text(text)?;
+        conn.execute(
+            "INSERT INTO documents_fts(rowid, path, title, body) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![rowid, rel_path, title, processed],
+        )?;
     }
 
     Ok(())

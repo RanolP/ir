@@ -140,7 +140,7 @@ pub fn fetch_content_batch(conn: &Connection, hashes: &[&str]) -> HashMap<String
         Err(_) => return HashMap::new(),
     };
     let params: Vec<&dyn rusqlite::types::ToSql> =
-        hashes.iter().map(|h| &*h as &dyn rusqlite::types::ToSql).collect();
+        hashes.iter().map(|h| h as &dyn rusqlite::types::ToSql).collect();
     let rows = match stmt.query_map(params.as_slice(), |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
     }) {
