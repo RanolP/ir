@@ -15,7 +15,7 @@
 
 - **하이브리드 검색** — BM25 탐색 → 점수 융합 (0.80·벡터 + 0.20·BM25) → LLM 재순위화
 - **쿼리 확장** — 확장기 모델 존재 시 lex/vec/hyde 타입 서브쿼리 생성
-- **강신호 단축** — BM25 최고점 ≥ 0.85 AND 차이 ≥ 0.15이면 즉시 반환
+- **강신호 단축** — BM25 최고점 ≥ 0.75 AND 차이 ≥ 0.10이면 즉시 반환
 - **데몬 모드** — 쿼리 사이에 모델 상주; 첫 검색 시 자동 시작
 - **이중 LLM 캐시** — 확장기 출력 전역 캐시; 재순위 점수 컬렉션별 캐시
 - **컬렉션별 SQLite** — 독립 WAL 저널, 격리 백업, 컬렉션 간 경합 없음
@@ -189,6 +189,57 @@ ir daemon status
 </details>
 
 <details>
+<summary><strong>MCP 서버 — Claude Desktop / Claude Code</strong></summary>
+
+`ir mcp`는 Model Context Protocol 서버를 실행하여 Claude가 인덱싱된 문서를 직접 검색할 수 있게 합니다.
+
+**Claude Desktop** (`~/.config/claude/claude_desktop_config.json`):
+
+```json
+{
+  "mcpServers": {
+    "ir": {
+      "command": "ir",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+**Claude Code** (프로젝트 루트의 `.mcp.json` 또는 `~/.claude/mcp.json`):
+
+```json
+{
+  "mcpServers": {
+    "ir": {
+      "command": "ir",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+세 가지 도구가 제공됩니다:
+
+| 도구 | 설명 |
+|------|------|
+| `search` | 하이브리드 BM25+벡터 검색. 경로, 제목, 점수, 스니펫 반환. `mode`, `limit`, `min_score`, `collections` 파라미터 지원. |
+| `status` | 인덱스 상태 — 컬렉션 이름, 문서 수, DB 크기, 데몬 상태. |
+| `update` | 파일 변경 후 컬렉션 재인덱싱. `collection`과 `force` 파라미터 지원. |
+
+**HTTP 모드** (원격 접속 또는 멀티 클라이언트):
+
+```bash
+ir mcp --http 3620    # 전체 인터페이스, 포트 3620
+```
+
+클라이언트를 `http://<host>:3620/mcp`로 설정합니다. 첫 검색 도구 호출 시 데몬이 자동 시작됩니다.
+
+> **보안 주의:** HTTP 모드는 인증 없이 전체 인터페이스에 바인딩됩니다. 신뢰할 수 있는 네트워크에서만 노출하세요. `update` 도구는 재인덱싱을 유발할 수 있으므로 로컬 쓰기 권한 서비스로 취급하세요.
+
+</details>
+
+<details>
 <summary><strong>전처리기 — 한국어 / 일본어 / 중국어</strong></summary>
 
 전처리기는 BM25 인덱싱 전에 텍스트를 형태소 분석합니다. 전처리기 없이는 교착어 형식("이스탄불의", "東京都")이 하나의 FTS 토큰으로 처리되어 형태소 단위 쿼리와 매칭되지 않습니다. 인덱싱 시와 쿼리 시 동일한 전처리기가 적용됩니다.
@@ -255,7 +306,7 @@ lindera 처리 속도: M-시리즈 Mac 기준 약 5,600 문서/초 · 1.8 MB/초
 ```
 쿼리
   │
-  ├─ BM25 탐색 ──► 점수 ≥ 0.85 AND 차이 ≥ 0.15? ──► 즉시 반환
+  ├─ BM25 탐색 ──► 점수 ≥ 0.75 AND 차이 ≥ 0.10? ──► 즉시 반환
   │
   ├─ 확장기 있음:  확장 → lex/vec/hyde 서브쿼리 → RRF 융합
   ├─ 확장기 없음:  BM25 + 벡터 → 점수 융합 (0.80·벡터 + 0.20·BM25)

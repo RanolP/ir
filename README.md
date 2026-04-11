@@ -15,7 +15,7 @@ Search quality benchmarked on 4 BEIR datasets; reranking adds up to +14.5% nDCG@
 
 - **Hybrid search** — BM25 probe → score fusion (0.80·vec + 0.20·bm25) → LLM reranking
 - **Query expansion** — typed sub-queries (lex/vec/hyde) when expander model is present
-- **Strong-signal shortcut** — skips expansion when top BM25 score ≥ 0.85 with gap ≥ 0.15
+- **Strong-signal shortcut** — skips expansion when top BM25 score ≥ 0.75 with gap ≥ 0.10
 - **Daemon mode** — keeps models warm between queries; auto-starts on first search
 - **Dual LLM cache** — expander outputs cached globally; reranker scores cached per-collection
 - **Per-collection SQLite** — independent WAL journals, isolated backup, zero cross-collection contention
@@ -257,7 +257,7 @@ See [research/experiment.md](research/experiment.md) for full results and ration
 Query → BM25 probe → score fusion (0.80·vec + 0.20·bm25) → reranking
 ```
 
-Strong-signal shortcut (BM25 score ≥ 0.85, gap ≥ 0.10) skips all LLM work.
+Strong-signal shortcut (BM25 score ≥ 0.75, gap ≥ 0.10) skips all LLM work.
 With expander: expand → lex/vec/hyde sub-queries → RRF → rerank top-20.
 All LLM outputs cached in SQLite — repeated queries skip inference entirely.
 
