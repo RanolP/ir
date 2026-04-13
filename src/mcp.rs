@@ -16,6 +16,8 @@ use rmcp::{
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use rusqlite::{Connection, OpenFlags};
+
 use crate::{
     config::{Config, collection_db_path},
     db,
@@ -48,6 +50,39 @@ struct UpdateInput {
     collection: Option<String>,
     /// Force full re-index from scratch (default: false)
     force: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct GetInput {
+    /// File path to retrieve. Exact match first, then suffix match, then substring.
+    path: String,
+    /// Restrict lookup to these collection names (default: all)
+    collections: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct MultiGetInput {
+    /// List of file paths to retrieve.
+    paths: Vec<String>,
+    /// Restrict lookup to these collection names (default: all)
+    collections: Option<Vec<String>>,
+}
+
+// ── get / multi_get output types ─────────────────────────────────────────────
+
+#[derive(Serialize)]
+struct DocContent {
+    collection: String,
+    path: String,
+    title: String,
+    content: String,
+}
+
+#[derive(Serialize)]
+struct MultiGetResult {
+    found: Vec<DocContent>,
+    /// Paths that had no match in any collection
+    not_found: Vec<String>,
 }
 
 // ── status / update output types ──────────────────────────────────────────────
@@ -118,6 +153,38 @@ impl IrMcpServer {
         let force = force.unwrap_or(false);
         spawn_tool(move || run_update(collection.as_deref(), force)).await
     }
+
+    #[tool(description = "Retrieve the full text of a single document by file path. \
+        Tries exact match first, then suffix match, then substring match across all collections. \
+        Use this when search returns a path you want to read in full.")]
+    async fn get(&self, params: Parameters<GetInput>) -> Result<String, String> {
+        let GetInput { path, collections } = params.0;
+        let collections = collections.unwrap_or_default();
+        spawn_tool(move || {
+            fetch_document(&path, &collections)?
+                .ok_or_else(|| crate::error::Error::Other(format!("not found: {path}")))
+        }).await
+    }
+
+    #[tool(description = "Retrieve the full text of multiple documents by file path in one call. \
+        Each path is resolved independently (exact → suffix → substring match). \
+        Returns found documents and a list of unmatched paths.")]
+    async fn multi_get(&self, params: Parameters<MultiGetInput>) -> Result<String, String> {
+        let MultiGetInput { paths, collections } = params.0;
+        let collections = collections.unwrap_or_default();
+        spawn_tool(move || {
+            let config = Config::load()?;
+            let mut found = Vec::new();
+            let mut not_found = Vec::new();
+            for path in &paths {
+                match fetch_document_with_config(path, &collections, &config)? {
+                    Some(doc) => found.push(doc),
+                    None => not_found.push(path.clone()),
+                }
+            }
+            Ok(MultiGetResult { found, not_found })
+        }).await
+    }
 }
 
 #[tool_handler]
@@ -178,9 +245,9 @@ fn build_instructions() -> String {
 
     format!(
         "ir local search engine. Collections: {}. \
-        Use `search` for hybrid BM25+vector retrieval, `status` for index health, \
-        `update` to re-index after file changes. \
-        Results include file paths — use a file-read tool to fetch full document content.",
+        Use `search` for hybrid BM25+vector retrieval, `get` or `multi_get` to retrieve \
+        full document text by path, `status` for index health, \
+        `update` to re-index after file changes.",
         cols.join("; ")
     )
 }
@@ -189,11 +256,7 @@ fn build_instructions() -> String {
 
 fn count_docs(db_path: &std::path::Path) -> Option<usize> {
     db::ensure_sqlite_vec();
-    let conn = rusqlite::Connection::open_with_flags(
-        db_path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
-    .ok()?;
+    let conn = open_readonly(db_path).ok()?;
     conn.query_row(
         "SELECT COUNT(*) FROM documents WHERE active = 1",
         [],
@@ -253,6 +316,87 @@ fn run_update(collection: Option<&str>, force: bool) -> IrResult<Vec<UpdateResul
         });
     }
     Ok(results)
+}
+
+// ── helpers ───────────────────────────────────────────────────────────────────
+
+fn open_readonly(path: &std::path::Path) -> std::result::Result<Connection, rusqlite::Error> {
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let _ = conn.execute_batch("PRAGMA busy_timeout = 5000;");
+    Ok(conn)
+}
+
+const SQL_EXACT: &str = "SELECT d.path, d.title, c.doc \
+    FROM documents d JOIN content c ON d.hash = c.hash \
+    WHERE d.path = ?1 AND d.active = 1 LIMIT 1";
+const SQL_LIKE: &str = "SELECT d.path, d.title, c.doc \
+    FROM documents d JOIN content c ON d.hash = c.hash \
+    WHERE d.path LIKE ?1 AND d.active = 1 LIMIT 1";
+
+fn fetch_document(path: &str, collection_filter: &[String]) -> IrResult<Option<DocContent>> {
+    let config = Config::load()?;
+    fetch_document_with_config(path, collection_filter, &config)
+}
+
+fn fetch_document_with_config(
+    path: &str,
+    collection_filter: &[String],
+    config: &Config,
+) -> IrResult<Option<DocContent>> {
+    let cols: Vec<_> = if collection_filter.is_empty() {
+        config.collections.iter().collect()
+    } else {
+        config.collections.iter().filter(|c| collection_filter.contains(&c.name)).collect()
+    };
+
+    db::ensure_sqlite_vec();
+
+    for col in cols {
+        let db_path = collection_db_path(&col.name);
+        let conn = match open_readonly(&db_path) {
+            Ok(c) => c,
+            Err(rusqlite::Error::SqliteFailure(e, _))
+                if e.code == rusqlite::ErrorCode::CannotOpen => continue,
+            Err(e) => return Err(e.into()),
+        };
+        if let Some(doc) = lookup_in_conn(&conn, &col.name, path)? {
+            return Ok(Some(doc));
+        }
+    }
+    Ok(None)
+}
+
+/// Try exact, suffix, then substring path match. Stops at first hit.
+fn lookup_in_conn(conn: &Connection, collection: &str, path: &str) -> IrResult<Option<DocContent>> {
+    let suffix = format!("%/{path}");
+    let substr = format!("%{path}%");
+    let queries: &[(&str, &str)] = &[
+        (SQL_EXACT, path),
+        (SQL_LIKE, &suffix),
+        (SQL_LIKE, &substr),
+    ];
+    for (sql, param) in queries {
+        let row = conn.query_row(sql, rusqlite::params![param], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        });
+        match row {
+            Ok((doc_path, title, content)) => {
+                return Ok(Some(DocContent {
+                    collection: collection.to_string(),
+                    path: doc_path,
+                    title,
+                    content,
+                }));
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(None)
 }
 
 // ── entry point ───────────────────────────────────────────────────────────────
