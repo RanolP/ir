@@ -1,3 +1,9 @@
+## [0.7.2] - 2026-04-13
+
+### Features
+
+- `ir mcp`: added `get` and `multi_get` tools for full document retrieval by path — enables Claude Desktop and claude.ai to read document content without a separate filesystem MCP server. `get(path)` resolves via exact → suffix → substring match; `multi_get(paths[])` batches multiple lookups and returns found documents with a list of unmatched paths ([`5541b79`](https://github.com/vlwkaos/ir/commit/5541b79fc1f12ee6344d2ce68a60354bbeb76cda))
+
 ## [0.7.1] - 2026-04-08
 
 ### Bug Fixes
