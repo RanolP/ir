@@ -173,11 +173,13 @@ The daemon keeps models warm in memory. Subsequent queries over the Unix socket 
 }
 ```
 
-Three tools are exposed:
+Five tools are exposed:
 
 | Tool | Description |
 |------|-------------|
 | `search` | Hybrid BM25+vector search. Returns path, title, score, snippet. Supports `mode`, `limit`, `min_score`, `collections` params. |
+| `get` | Retrieve full text of a document by path. Tries exact → suffix → substring match. Returns `collection`, `path`, `title`, `content`. |
+| `multi_get` | Batch document retrieval. Accepts a `paths` array; returns `found` documents and `not_found` paths in one call. |
 | `status` | Index health — collection names, doc counts, DB sizes, daemon status. |
 | `update` | Re-index collections after file changes. Accepts `collection` and `force` params. |
 

@@ -219,11 +219,13 @@ ir daemon status
 }
 ```
 
-세 가지 도구가 제공됩니다:
+다섯 가지 도구가 제공됩니다:
 
 | 도구 | 설명 |
 |------|------|
 | `search` | 하이브리드 BM25+벡터 검색. 경로, 제목, 점수, 스니펫 반환. `mode`, `limit`, `min_score`, `collections` 파라미터 지원. |
+| `get` | 경로로 문서 전문 조회. 정확 일치 → 접미 일치 → 부분 문자열 순으로 검색. `collection`, `path`, `title`, `content` 반환. |
+| `multi_get` | 문서 일괄 조회. `paths` 배열을 받아 `found` 문서와 `not_found` 경로를 한 번에 반환. |
 | `status` | 인덱스 상태 — 컬렉션 이름, 문서 수, DB 크기, 데몬 상태. |
 | `update` | 파일 변경 후 컬렉션 재인덱싱. `collection`과 `force` 파라미터 지원. |
 
