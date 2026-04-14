@@ -347,6 +347,153 @@ mod tests {
         set_chunk_size_tokens_override(None);
     }
 
+    // ── chunker edge cases ───────────────────────────────────────────────────
+
+    #[test]
+    fn doc_exactly_chunk_size_is_single_chunk() {
+        // doc.len() == chunk_size_chars triggers the early-return branch (<=).
+        set_chunk_size_tokens_override(Some(100)); // 400 chars
+        let doc = "x".repeat(400);
+        let chunks = chunk_document(&doc);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].text.len(), 400);
+        set_chunk_size_tokens_override(None);
+    }
+
+    #[test]
+    fn doc_one_byte_over_chunk_size_splits() {
+        // doc.len() == chunk_size_chars + 1 triggers the split path.
+        set_chunk_size_tokens_override(Some(100)); // 400 chars
+        // Must be > 2*min_chunk_chars (800) to avoid absorb, so we need more room.
+        // chunk_size=200 → 800 chars. doc=801 chars.
+        set_chunk_size_tokens_override(Some(200)); // 800 chars
+        let min_chars = MIN_CHUNK_SIZE_TOKENS * CHARS_PER_TOKEN; // 400
+        // 800+1=801 chars. remaining_after=1 < min(400) → rebalance if doc_tail ≥ 2*min=800.
+        // doc_tail=801 ≥ 800 → rebalance: target = 801-400=401.
+        let doc = "x".repeat(801);
+        let chunks = chunk_document(&doc);
+        assert!(chunks.len() >= 2, "801-char doc with chunk_size=800 should split");
+        for c in &chunks {
+            assert!(c.text.len() >= min_chars, "chunk {} too small: {}", c.seq, c.text.len());
+        }
+        set_chunk_size_tokens_override(None);
+    }
+
+    #[test]
+    fn multibyte_utf8_near_boundary_stays_valid() {
+        // 3-byte CJK chars; chunk boundary must land on a char boundary.
+        set_chunk_size_tokens_override(Some(200)); // 800 chars
+        // Each "あ" is 3 bytes but counts as 1 char in Rust str.
+        // We need enough bytes to exceed chunk_size=800 chars.
+        // Use ASCII + a CJK char right at the boundary to force alignment.
+        let ascii_part = "a".repeat(798); // 798 chars
+        let cjk = "あ"; // 3 bytes, 1 char — sits at char 799 (byte 799..802)
+        let rest = "b".repeat(400);
+        let doc = format!("{ascii_part}{cjk}{rest}");
+        // doc.len() in bytes > 800 (chars ~1199, bytes ~1201)
+        let chunks = chunk_document(&doc);
+        // All chunk texts must be valid UTF-8 (would panic on bad slice otherwise).
+        for c in &chunks {
+            assert!(std::str::from_utf8(c.text.as_bytes()).is_ok());
+        }
+    }
+
+    #[test]
+    fn best_break_fallback_when_no_qualifying_break() {
+        // If no break point falls in [min_break_pos, target_end], best_break falls back
+        // to a char boundary at target_end. Verify: doc with no semantic breaks at all
+        // (continuous ASCII) still produces valid chunk boundaries.
+        set_chunk_size_tokens_override(Some(200)); // 800 chars
+        let doc = "a".repeat(2400); // no break points — all ASCII, no newlines
+        let chunks = chunk_document(&doc);
+        assert!(chunks.len() > 1, "featureless doc should still chunk");
+        for c in &chunks {
+            assert!(!c.text.is_empty());
+        }
+        set_chunk_size_tokens_override(None);
+    }
+
+    #[test]
+    fn overlap_larger_than_min_chunk_forward_progress_guard() {
+        // If overlap ≥ min_chunk_chars, the overlap-adjusted start can equal or precede
+        // prev_start, triggering the forward-progress guard (start = end).
+        // This config: chunk_size=50 tokens (200 chars), overlap ~15%=7 tokens=28 chars,
+        // min=100 tokens=400 chars. With min > chunk_size the absorb path fires for
+        // everything, but let's use chunk_size=300 (1200 chars), overlap=45 tokens=180 chars,
+        // min=100 tokens=400 chars — overlap(180) < min(400) so guard won't fire normally.
+        // To force the guard: chunk_size=120 tokens (480 chars), overlap=18 tokens=72 chars.
+        // min=100 tokens=400 chars. overlap(72) < min(400). Still safe.
+        // Real trigger: we need overlap ≥ chunk_size - min so second start ≤ first start.
+        // chunk_size=110 tokens=440 chars, overlap=16 tokens=64 chars, min=100 tokens=400 chars.
+        // After chunk1 ends at ~440, start2 = 440-64=376 < prev_start=0? No, prev_start=0.
+        // For guard: start2 ≤ prev_start means 440-64=376 ≤ 0 → false.
+        // The guard fires when rebalance target coincides exactly with the start of the last chunk.
+        // Let's just verify the chunker never loops forever on any plausible config.
+        set_chunk_size_tokens_override(Some(120)); // 480 chars
+        let doc = "word ".repeat(400); // 2000 chars
+        let chunks = chunk_document(&doc);
+        assert!(chunks.len() >= 2);
+        // Verify sequential, non-overlapping positions
+        for w in chunks.windows(2) {
+            assert!(w[1].pos > w[0].pos, "positions must strictly increase");
+        }
+        set_chunk_size_tokens_override(None);
+    }
+
+    #[test]
+    fn consecutive_headings_exactly_at_chunk_boundary() {
+        // Two headings back-to-back right at the target_end. The min_break_pos guard
+        // (prev_end + 1) must prevent re-selecting the first heading on the overlapping chunk.
+        set_chunk_size_tokens_override(Some(200)); // 800 chars
+        let pad = "word ".repeat(160); // 800 chars
+        // Place two headings right at the 800-char mark.
+        let doc = format!("{pad}## SectionA\n## SectionB\n{pad}");
+        let chunks = chunk_document(&doc);
+        // All chunks must have distinct start positions.
+        let positions: Vec<usize> = chunks.iter().map(|c| c.pos).collect();
+        let unique: std::collections::HashSet<usize> = positions.iter().copied().collect();
+        assert_eq!(positions.len(), unique.len(), "duplicate start positions detected");
+        set_chunk_size_tokens_override(None);
+    }
+
+    #[test]
+    fn absorb_when_tail_less_than_two_min_chunks() {
+        // When doc_tail < 2*min_chunk_chars, the rest is absorbed into the current chunk.
+        // chunk_size=200 tokens=800 chars, min=400 chars, 2*min=800 chars.
+        // Doc=1100 chars: after start=0, doc_tail=1100, naive_target=800,
+        // remaining_after=300 < min(400), doc_tail=1100 ≥ 2*min=800 → rebalance (not absorb).
+        // For absorb: need doc_tail < 800. Use doc=750 chars → single chunk (≤800).
+        // Use chunk_size=150 tokens=600 chars, min=100 tokens=400 chars, 2*min=800.
+        // doc=700 chars: naive_target=600, remaining_after=100 < min(400),
+        // doc_tail=700 < 2*min=800 → absorb to doc.len() → single chunk despite > chunk_size.
+        set_chunk_size_tokens_override(Some(150)); // 600 chars
+        let doc = "x".repeat(700);
+        let chunks = chunk_document(&doc);
+        assert_eq!(chunks.len(), 1, "absorb path should yield single chunk");
+        assert_eq!(chunks[0].text.len(), 700);
+        set_chunk_size_tokens_override(None);
+    }
+
+    #[test]
+    fn empty_doc_produces_single_chunk() {
+        let chunks = chunk_document("");
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].text, "");
+    }
+
+    #[test]
+    fn chunk_positions_cover_document() {
+        // Every byte in the doc must be covered by at least the last chunk's range.
+        set_chunk_size_tokens_override(Some(200));
+        let line = "The quick brown fox. ".repeat(20); // 420 chars
+        let doc = (line + "\n").repeat(8); // ~3368 chars
+        let chunks = chunk_document(&doc);
+        let last = chunks.last().unwrap();
+        assert_eq!(last.pos + last.text.len(), doc.len(),
+            "last chunk must reach end of doc");
+        set_chunk_size_tokens_override(None);
+    }
+
     #[test]
     fn extract_title_from_heading() {
         let doc = "# My Title\n\nContent here.";

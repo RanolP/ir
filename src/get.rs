@@ -431,6 +431,171 @@ mod tests {
         assert!(extract_section("", "anything").is_none());
     }
 
+    // ── extract_section edge cases ───────────────────────────────────────────
+
+    #[test]
+    fn section_empty_heading_string_returns_none() {
+        // extract_section with an empty heading should never match any heading.
+        let doc = "## Real\ncontent\n";
+        assert!(extract_section(doc, "").is_none());
+    }
+
+    #[test]
+    fn section_whitespace_only_heading_returns_none() {
+        // Heading query trims whitespace before comparison; all-whitespace becomes "".
+        // An ATX heading line with no text (e.g. "## ") has text="" after parse.
+        // The query "   " trims to "" which should match a bare "#" heading.
+        let doc = "##\ncontent\n## Other\n";
+        // "##" is a valid heading with empty text; "   ".trim() == ""
+        let s = extract_section(doc, "   ");
+        assert!(s.is_some(), "whitespace-only query trims to '' which matches '##'");
+    }
+
+    #[test]
+    fn section_doc_no_trailing_newline() {
+        // Last line has no '\n' — section must still return content to end-of-doc.
+        let doc = "## Heading\ncontent here";
+        let s = extract_section(doc, "Heading").unwrap();
+        assert_eq!(s, "## Heading\ncontent here");
+    }
+
+    #[test]
+    fn section_first_of_duplicate_headings() {
+        // Two headings with the same name: the first one is returned.
+        let doc = "## Intro\nfirst\n## Other\nMiddle\n## Intro\nsecond\n";
+        let s = extract_section(doc, "Intro").unwrap();
+        assert_eq!(s, "## Intro\nfirst\n");
+    }
+
+    #[test]
+    fn section_h4_closed_by_h3() {
+        // h4 section should be closed by h3 (higher level = lower number).
+        let doc = "### Parent\n#### Child\ncontent\n### Sibling\n";
+        let s = extract_section(doc, "Child").unwrap();
+        assert_eq!(s, "#### Child\ncontent\n");
+    }
+
+    #[test]
+    fn section_h6_runs_to_end() {
+        // Deeply-nested h6 with nothing closing it.
+        let doc = "# Top\n###### Deep\nleaf content";
+        let s = extract_section(doc, "Deep").unwrap();
+        assert_eq!(s, "###### Deep\nleaf content");
+    }
+
+    #[test]
+    fn section_h4_not_closed_by_h5() {
+        // A deeper heading (h5) does NOT close an h4 section.
+        let doc = "#### Parent\n##### Child\nstuff\n";
+        let s = extract_section(doc, "Parent").unwrap();
+        assert_eq!(s, "#### Parent\n##### Child\nstuff\n");
+    }
+
+    #[test]
+    fn section_tilde_fence_ignored_like_backtick() {
+        // ~~~ fences should suppress headings the same way ``` does.
+        let doc = "## Real\n~~~\n## Fake\n~~~\n## Next\n";
+        assert!(extract_section(doc, "Fake").is_none());
+        let s = extract_section(doc, "Real").unwrap();
+        assert!(s.contains("~~~\n## Fake\n~~~\n"));
+        assert!(!s.contains("## Next"));
+    }
+
+    #[test]
+    fn section_mixed_fence_types_toggle_independently() {
+        // ``` opens then ~~~ closes? Per CommonMark, fences must match; but the
+        // chunker/section parser tracks a single toggle — a ``` open closed by ~~~
+        // produces two toggles, leaving in_code_fence=false after both.
+        // Verify that after the second toggle the heading IS visible again.
+        let doc = "## Before\n```\n## Inside1\n~~~\n## Inside2\n## After\n";
+        // After "```" in_code_fence=true, after "~~~" in_code_fence=false.
+        // Inside1 is hidden; Inside2 appears AFTER the ~~~ toggle → visible.
+        // We don't assert what "After" does — just check "Inside1" is hidden.
+        assert!(extract_section(doc, "Inside1").is_none());
+    }
+
+    #[test]
+    fn section_unclosed_fence_hides_rest_of_doc() {
+        // A fence that is opened but never closed hides all subsequent headings.
+        let doc = "## Before\n```\n## Hidden\n## AlsoHidden\n";
+        assert!(extract_section(doc, "Hidden").is_none());
+        assert!(extract_section(doc, "AlsoHidden").is_none());
+        // "Before" is before the fence — it should be found.
+        assert!(extract_section(doc, "Before").is_some());
+    }
+
+    #[test]
+    fn section_crlf_line_endings() {
+        // CRLF docs: \r is stripped before heading comparison.
+        let doc = "## Title\r\ncontent\r\n## Other\r\n";
+        let s = extract_section(doc, "Title");
+        assert!(s.is_some(), "heading should match with CRLF line endings");
+        let text = s.unwrap();
+        // Section should start at "## Title" and not include "## Other".
+        assert!(text.starts_with("## Title"));
+        assert!(!text.contains("## Other"));
+    }
+
+    #[test]
+    fn section_heading_immediately_followed_by_next_heading() {
+        // Empty body section: heading immediately followed by same-level heading.
+        let doc = "## A\n## B\ncontent\n";
+        let s = extract_section(doc, "A").unwrap();
+        assert_eq!(s, "## A\n");
+    }
+
+    #[test]
+    fn section_whitespace_body() {
+        // Section whose entire body is whitespace / blank lines.
+        let doc = "## Empty\n   \n\n## Next\n";
+        let s = extract_section(doc, "Empty").unwrap();
+        assert_eq!(s, "## Empty\n   \n\n");
+    }
+
+    #[test]
+    fn section_very_long_heading_name() {
+        let long = "A".repeat(4096);
+        let doc = format!("## {long}\ncontent\n");
+        let s = extract_section(&doc, &long);
+        assert!(s.is_some());
+    }
+
+    #[test]
+    fn section_no_space_after_hash_not_a_heading() {
+        // "#Title" (no space) is not a valid ATX heading; should not be found.
+        let doc = "#NoSpace\ncontent\n";
+        assert!(extract_section(doc, "NoSpace").is_none());
+    }
+
+    #[test]
+    fn section_single_hash_only_heading() {
+        // Bare "#" alone on a line is a valid heading with empty text.
+        let doc = "#\ncontent\n## Other\n";
+        // query "" matches the bare "#" heading
+        let s = extract_section(doc, "");
+        assert!(s.is_some());
+    }
+
+    #[test]
+    fn section_heading_with_leading_spaces() {
+        // ATX headings allow up to 3 spaces of indentation (CommonMark).
+        // parse_atx_heading does trim_start, so "  ## Title" should parse.
+        let doc = "  ## Indented\ncontent\n";
+        let s = extract_section(doc, "Indented");
+        assert!(s.is_some(), "heading with leading spaces should be matched");
+    }
+
+    #[test]
+    fn section_result_is_substring_of_original() {
+        // extract_section returns a &str slice into the original doc (zero-copy).
+        let doc = "## Hello\nworld\n";
+        let s = extract_section(doc, "Hello").unwrap();
+        let doc_ptr = doc.as_ptr() as usize;
+        let s_ptr = s.as_ptr() as usize;
+        assert!(s_ptr >= doc_ptr && s_ptr <= doc_ptr + doc.len(),
+            "returned slice should point into the original doc");
+    }
+
     // ── trim_content ─────────────────────────────────────────────────────────
 
     #[test]

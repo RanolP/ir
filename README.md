@@ -139,6 +139,7 @@ ir get "2026/Daily/04/2026-04-07.md"           # collection-relative path
 ir get "Notes/2026/Daily/04/2026-04-07.md"     # vault-root path (strips collection dir prefix)
 ir get "2026-04-07" -c periodic                # substring match, scoped to collection
 ir get "some/path.md" --json                   # full metadata as JSON
+ir get "some/path.md" --section "Installation" # extract named heading section only
 ir get "some/path.md" --max-chars 3000         # first 3000 chars
 ir get "some/path.md" --offset 1000 --max-chars 2000  # chars 1000–3000
 
@@ -198,7 +199,7 @@ Five tools are exposed:
 | Tool | Description |
 |------|-------------|
 | `search` | Hybrid BM25+vector search. Returns path, title, score, snippet. Params: `mode`, `limit`, `min_score`, `collections`, `full` (include full doc text), `include_chunk` (include best-matching chunk text). |
-| `get` | Retrieve document text by path (exact → suffix → substring match). Params: `collections`, `offset` (char offset), `max_chars` (truncate). |
+| `get` | Retrieve document text by path (exact → suffix → substring match). Params: `collections`, `section` (heading text, case-insensitive), `offset` (char offset), `max_chars` (truncate). |
 | `multi_get` | Batch document retrieval. Params: `paths[]`, `collections`, `max_chars` (truncate each doc). Returns `found` and `not_found`. |
 | `status` | Index health — collection names, doc counts, DB sizes, daemon status. |
 | `update` | Re-index collections after file changes. Accepts `collection` and `force` params. |
