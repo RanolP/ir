@@ -60,8 +60,8 @@ fn run() -> Result<()> {
             files,
             verbose,
         ),
-        Command::Get { target, collections, offset, max_chars, json } => {
-            handle_get(target, collections, offset, max_chars, json)
+        Command::Get { target, collections, section, offset, max_chars, json } => {
+            handle_get(target, collections, section, offset, max_chars, json)
         }
         Command::MultiGet { targets, collections, max_chars, json, files } => {
             handle_multi_get(targets, collections, max_chars, json, files)
@@ -85,6 +85,7 @@ fn run() -> Result<()> {
 fn handle_get(
     target: String,
     collections: Vec<String>,
+    section: Option<String>,
     offset: Option<usize>,
     max_chars: Option<usize>,
     json: bool,
@@ -93,6 +94,12 @@ fn handle_get(
     let filter = resolve_collections(&config, &collections)?;
     match get::fetch_document_with_config(&target, &filter, &config)? {
         Some(mut doc) => {
+            if let Some(ref heading) = section {
+                let extracted = get::extract_section(&doc.content, heading)
+                    .unwrap_or("")
+                    .to_string();
+                doc.content = extracted;
+            }
             if offset.is_some() || max_chars.is_some() {
                 doc.content = get::trim_content(&doc.content, offset, max_chars).to_string();
             }

@@ -62,6 +62,8 @@ struct GetInput {
     path: String,
     /// Restrict lookup to these collection names (default: all)
     collections: Option<Vec<String>>,
+    /// Return only the named section (heading text match, case-insensitive; default: full document)
+    section: Option<String>,
     /// Start output at this character offset into the document (default: 0)
     offset: Option<usize>,
     /// Truncate output to this many characters (default: no limit)
@@ -160,13 +162,19 @@ impl IrMcpServer {
     #[tool(description = "Retrieve the full text of a single document by file path. \
         Tries exact match first, then suffix match, then substring match across all collections. \
         Also accepts vault-root paths (e.g. 'Notes/2026/file.md' where 'Notes' is the collection dir). \
+        Use section to retrieve a named heading section only (e.g. section='Installation'). \
         Returns a tool error if not found — use multi_get if you need a non-error response for misses.")]
     async fn get(&self, params: Parameters<GetInput>) -> Result<String, String> {
-        let GetInput { path, collections, offset, max_chars } = params.0;
+        let GetInput { path, collections, section, offset, max_chars } = params.0;
         let collections = collections.unwrap_or_default();
         spawn_tool(move || {
             let mut doc = fetch_document(&path, &collections)?
                 .ok_or_else(|| crate::error::Error::Other(format!("not found: {path}")))?;
+            if let Some(ref heading) = section {
+                doc.content = crate::get::extract_section(&doc.content, heading)
+                    .unwrap_or("")
+                    .to_string();
+            }
             if offset.is_some() || max_chars.is_some() {
                 doc.content = crate::get::trim_content(&doc.content, offset, max_chars).to_string();
             }

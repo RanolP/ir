@@ -79,6 +79,9 @@ pub enum Command {
         /// Restrict to collection(s)
         #[arg(short = 'c', long = "collection")]
         collections: Vec<String>,
+        /// Return only the named section (heading text, case-insensitive)
+        #[arg(long)]
+        section: Option<String>,
         /// Start output at this character offset into the document
         #[arg(long)]
         offset: Option<usize>,

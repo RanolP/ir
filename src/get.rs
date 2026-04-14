@@ -265,6 +265,72 @@ pub fn fetch_chunk_text(hash: &str, seq: usize, collection: &str) -> Result<Opti
     fetch_chunk_from_conn(&conn, hash, seq)
 }
 
+// ── section extraction ───────────────────────────────────────────────────────
+
+/// Parse an ATX heading line (e.g. `## Title` or `### Title ###`).
+/// Returns `(level, heading_text)` or `None` if not a heading.
+fn parse_atx_heading(line: &str) -> Option<(usize, &str)> {
+    let trimmed = line.trim_start();
+    let level = trimmed.bytes().take_while(|&b| b == b'#').count();
+    if level == 0 || level > 6 {
+        return None;
+    }
+    let rest = &trimmed[level..];
+    if rest.is_empty() {
+        return Some((level, ""));
+    }
+    // CommonMark: must be followed by a space/tab or end of line.
+    if rest.as_bytes()[0] != b' ' && rest.as_bytes()[0] != b'\t' {
+        return None;
+    }
+    // Strip optional ATX closing sequence and surrounding whitespace.
+    let text = rest.trim().trim_end_matches('#').trim_end();
+    Some((level, text))
+}
+
+/// Extract the section whose heading text matches `heading` (case-insensitive).
+/// Returns the slice from the heading line through the last line before the
+/// next heading of the same or higher level (or end of document).
+/// Headings inside fenced code blocks are ignored.
+pub fn extract_section<'a>(doc: &'a str, heading: &str) -> Option<&'a str> {
+    let query = heading.trim().to_lowercase();
+    let mut in_code_fence = false;
+    let mut found_start: Option<usize> = None;
+    let mut found_level: usize = 0;
+    let mut pos: usize = 0;
+
+    for raw_line in doc.split('\n') {
+        let line_start = pos;
+        pos += raw_line.len() + 1; // +1 for the '\n' split on
+        pos = pos.min(doc.len()); // clamp: last line may have no trailing \n
+        let line = raw_line.trim_end_matches('\r');
+
+        let trimmed = line.trim();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_code_fence = !in_code_fence;
+            continue;
+        }
+        if in_code_fence {
+            continue;
+        }
+
+        if let Some((level, text)) = parse_atx_heading(line) {
+            if let Some(start) = found_start {
+                if level <= found_level {
+                    // Next same-or-higher heading closes the section.
+                    return Some(&doc[start..line_start]);
+                }
+            } else if text.to_lowercase() == query {
+                found_start = Some(line_start);
+                found_level = level;
+            }
+        }
+    }
+
+    // Heading found but no closing heading — section runs to end of doc.
+    found_start.map(|start| &doc[start..])
+}
+
 // ── content trimming ─────────────────────────────────────────────────────────
 
 /// Trim document content by char offset and max length.
@@ -297,6 +363,73 @@ pub fn trim_content<'a>(content: &'a str, offset: Option<usize>, max_chars: Opti
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── extract_section ──────────────────────────────────────────────────────
+
+    #[test]
+    fn section_basic() {
+        let doc = "# Doc\n\n## Installation\nstuff\n\n## Usage\nother\n";
+        let s = extract_section(doc, "Installation").unwrap();
+        assert_eq!(s, "## Installation\nstuff\n\n");
+    }
+
+    #[test]
+    fn section_case_insensitive() {
+        let doc = "## Installation\ncontent\n## Other\n";
+        assert!(extract_section(doc, "installation").is_some());
+        assert!(extract_section(doc, "INSTALLATION").is_some());
+    }
+
+    #[test]
+    fn section_last_in_doc() {
+        let doc = "## First\nfoo\n## Last\nbar";
+        let s = extract_section(doc, "Last").unwrap();
+        assert_eq!(s, "## Last\nbar");
+    }
+
+    #[test]
+    fn section_not_found_returns_none() {
+        let doc = "## Existing\ncontent\n";
+        assert!(extract_section(doc, "Missing").is_none());
+    }
+
+    #[test]
+    fn section_includes_subsections() {
+        let doc = "## A\n### Sub\ntext\n## B\n";
+        let s = extract_section(doc, "A").unwrap();
+        assert_eq!(s, "## A\n### Sub\ntext\n");
+    }
+
+    #[test]
+    fn section_h1_closes_h2() {
+        let doc = "# Root\n## Section\ncontent\n# Other\n";
+        let s = extract_section(doc, "Section").unwrap();
+        assert_eq!(s, "## Section\ncontent\n");
+    }
+
+    #[test]
+    fn section_ignores_heading_in_code_fence() {
+        let doc = "## Real\n```\n## Fake\n```\n## Next\n";
+        // "Fake" is inside a code fence — should not be found.
+        assert!(extract_section(doc, "Fake").is_none());
+        // "Real" should be found and end at "Next".
+        let s = extract_section(doc, "Real").unwrap();
+        assert!(s.contains("```\n## Fake\n```\n"));
+        assert!(!s.contains("## Next"));
+    }
+
+    #[test]
+    fn section_atx_closing_stripped() {
+        // ATX headings may have trailing # markers: `## Title ##`
+        let doc = "## Title ##\ncontent\n## Other\n";
+        let s = extract_section(doc, "Title").unwrap();
+        assert_eq!(s, "## Title ##\ncontent\n");
+    }
+
+    #[test]
+    fn section_empty_doc_returns_none() {
+        assert!(extract_section("", "anything").is_none());
+    }
 
     // ── trim_content ─────────────────────────────────────────────────────────
 
@@ -402,18 +535,20 @@ mod tests {
     #[test]
     fn chunk_from_conn_multi_chunk_doc_seq1() {
         use crate::index::chunker::{chunk_document, set_chunk_size_tokens_override};
-        // Force tiny chunks so a short doc produces multiple chunks.
-        set_chunk_size_tokens_override(Some(4)); // 4 tokens = 16 chars
-        let doc = "aaaa bbbb cccc dddd eeee ffff gggg hhhh iiii jjjj"; // 50 chars > 16
-        let chunks = chunk_document(doc);
+        // chunk_size=200 tokens=800 chars, min=100 tokens=400 chars.
+        // A 1000-char doc triggers rebalance (remaining_after=200 < min, doc_tail=1000 ≥ 2*min=800)
+        // → split at 600, producing ≥2 chunks both ≥ min.
+        set_chunk_size_tokens_override(Some(200));
+        let doc: String = "word ".repeat(200); // 1000 chars
+        let chunks = chunk_document(&doc);
         assert!(chunks.len() >= 2, "expected multiple chunks");
 
         let conn = open_chunk_test_db();
-        insert_content(&conn, "h3", doc);
+        insert_content(&conn, "h3", &doc);
         let chunk1 = fetch_chunk_from_conn(&conn, "h3", 1).unwrap();
         assert_eq!(chunk1.as_deref(), Some(chunks[1].text.as_str()));
 
-        set_chunk_size_tokens_override(None); // restore default
+        set_chunk_size_tokens_override(None);
     }
 
     // ── apply_chunks_from_conn ───────────────────────────────────────────────
