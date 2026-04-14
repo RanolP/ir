@@ -130,6 +130,21 @@ ir search "ownership" --md
 ir search "ownership" --files   # paths only
 ```
 
+**Retrieve documents:**
+
+```bash
+ir get "2026/Daily/04/2026-04-07.md"           # collection-relative path
+ir get "Notes/2026/Daily/04/2026-04-07.md"     # vault-root path (strips collection dir prefix)
+ir get "2026-04-07" -c periodic                # substring match, scoped to collection
+ir get "some/path.md" --json                   # full metadata as JSON
+
+ir multi-get "file1.md" "file2.md" "file3.md"  # batch fetch
+ir multi-get "file1.md" "file2.md" --json       # {found: [...], not_found: [...]}
+ir multi-get "file1.md" "file2.md" --files      # paths only (found ones)
+```
+
+Path matching order: exact → suffix (`%/path`) → substring. Vault-root paths (where the first component matches the collection's directory name) are resolved before the normal match.
+
 **Daemon:**
 
 ```bash

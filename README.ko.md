@@ -176,6 +176,21 @@ ir search "소유권" --md
 ir search "소유권" --files   # 경로만
 ```
 
+**문서 조회:**
+
+```bash
+ir get "2026/Daily/04/2026-04-07.md"            # 컬렉션 상대 경로
+ir get "Notes/2026/Daily/04/2026-04-07.md"      # 볼트 루트 경로 (컬렉션 디렉토리명 접두사 자동 제거)
+ir get "2026-04-07" -c periodic                  # 부분 일치, 컬렉션 지정
+ir get "some/path.md" --json                     # JSON으로 전체 메타데이터 출력
+
+ir multi-get "file1.md" "file2.md" "file3.md"   # 일괄 조회
+ir multi-get "file1.md" "file2.md" --json        # {found: [...], not_found: [...]}
+ir multi-get "file1.md" "file2.md" --files       # 찾은 경로만 출력
+```
+
+경로 매칭 순서: 정확 일치 → 접미 일치(`%/path`) → 부분 문자열. 볼트 루트 경로(첫 번째 구성 요소가 컬렉션 디렉토리명과 일치하는 경우)는 일반 매칭 전에 먼저 처리됩니다.
+
 **데몬:**
 
 ```bash
