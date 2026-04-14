@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     config::{Config, collection_db_path},
     db,
-    get::{DocContent, MultiGetResult, fetch_document, fetch_document_with_config, open_readonly},
+    get::{MultiGetResult, fetch_document, fetch_document_with_config, open_readonly},
     index,
 };
 
