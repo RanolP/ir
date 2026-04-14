@@ -122,7 +122,9 @@ impl IrMcpServer {
 impl IrMcpServer {
     #[tool(description = "Hybrid BM25+vector search over indexed document collections. \
         Returns ranked results with file path, title, relevance score, and a text snippet. \
-        Use the file path with a file-read tool to retrieve full document content.")]
+        Set full=true to include full document text inline. \
+        Set include_chunk=true to include the best-matching chunk text inline (vector results only). \
+        Use get or multi_get to retrieve full document text by path.")]
     async fn search(&self, params: Parameters<SearchInput>) -> Result<String, String> {
         let SearchInput { query, mode, limit, min_score, collections, full, include_chunk } = params.0;
         let mode = mode.unwrap_or_else(|| "hybrid".to_string());
