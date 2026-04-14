@@ -1,3 +1,18 @@
+## [0.8.0] - 2026-04-14
+
+### Features
+
+- `ir get` and `ir multi-get` CLI commands: retrieve full document text by path from any registered collection. Accepts collection-relative paths (`2026/file.md`), vault-root paths (`Notes/2026/file.md`), suffix matches, and substring matches — same matching rules as the MCP tools. `ir get` exits 1 on miss; `ir multi-get` reports all misses to stderr and exits 1 if any path was not found ([`8c30d84`](https://github.com/vlwkaos/ir/commit/8c30d849139371832c6402dba63d7313cc804fab))
+- Vault-root path resolution: when the first component of a path matches the directory name of a collection's root (e.g. `Notes` for a collection at `~/Notes`), `ir` now strips the prefix and resolves against the matching collection before falling back to a global search. Fixes silent not-found for paths like `0. PeriodicNotes/2026/Daily/2026-04-07.md` ([`8c30d84`](https://github.com/vlwkaos/ir/commit/8c30d849139371832c6402dba63d7313cc804fab))
+
+### Bug Fixes
+
+- LIKE injection: `%` and `_` in file paths were treated as SQLite wildcards in suffix/substring lookup tiers, causing false-positive matches. All user-supplied paths are now escaped with an `ESCAPE '\\'` clause before binding. Fix applies to both CLI and MCP ([`8c30d84`](https://github.com/vlwkaos/ir/commit/8c30d849139371832c6402dba63d7313cc804fab))
+
+### Docs
+
+- README: added "Retrieve documents" section with `ir get` / `ir multi-get` examples including vault-root paths and output format flags ([`9c0cb4a`](https://github.com/vlwkaos/ir/commit/9c0cb4a6355352eddd5aa351ccf66e81d3aae260))
+
 ## [0.7.2] - 2026-04-13
 
 ### Features
