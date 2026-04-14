@@ -68,12 +68,33 @@ pub enum Command {
         #[arg(long, short = 'v')]
         verbose: bool,
     },
-    /// Retrieve a document by path or docid
+    /// Retrieve a document by path
     Get {
+        /// Path to retrieve. Accepts collection-relative ("2026/file.md"), vault-root
+        /// ("Notes/2026/file.md"), or partial paths (suffix/substring match).
         target: String,
+        /// Restrict to collection(s)
+        #[arg(short = 'c', long = "collection")]
+        collections: Vec<String>,
         /// JSON output
         #[arg(long)]
         json: bool,
+    },
+    /// Retrieve multiple documents by path
+    #[command(name = "multi-get")]
+    MultiGet {
+        /// Paths to retrieve (same matching rules as get)
+        #[arg(required = false)]
+        targets: Vec<String>,
+        /// Restrict to collection(s)
+        #[arg(short = 'c', long = "collection")]
+        collections: Vec<String>,
+        /// JSON output
+        #[arg(long)]
+        json: bool,
+        /// Print matched paths only (one per line)
+        #[arg(long)]
+        files: bool,
     },
     /// Manage collections
     Collection {

@@ -16,11 +16,10 @@ use rmcp::{
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use rusqlite::{Connection, OpenFlags};
-
 use crate::{
     config::{Config, collection_db_path},
     db,
+    get::{DocContent, MultiGetResult, fetch_document, fetch_document_with_config, open_readonly},
     index,
 };
 
@@ -66,23 +65,6 @@ struct MultiGetInput {
     paths: Vec<String>,
     /// Restrict lookup to these collection names (default: all)
     collections: Option<Vec<String>>,
-}
-
-// ── get / multi_get output types ─────────────────────────────────────────────
-
-#[derive(Serialize)]
-struct DocContent {
-    collection: String,
-    path: String,
-    title: String,
-    content: String,
-}
-
-#[derive(Serialize)]
-struct MultiGetResult {
-    found: Vec<DocContent>,
-    /// Paths that had no match in any collection
-    not_found: Vec<String>,
 }
 
 // ── status / update output types ──────────────────────────────────────────────
@@ -156,7 +138,8 @@ impl IrMcpServer {
 
     #[tool(description = "Retrieve the full text of a single document by file path. \
         Tries exact match first, then suffix match, then substring match across all collections. \
-        Use this when search returns a path you want to read in full.")]
+        Also accepts vault-root paths (e.g. 'Notes/2026/file.md' where 'Notes' is the collection dir). \
+        Returns a tool error if not found — use multi_get if you need a non-error response for misses.")]
     async fn get(&self, params: Parameters<GetInput>) -> Result<String, String> {
         let GetInput { path, collections } = params.0;
         let collections = collections.unwrap_or_default();
@@ -316,87 +299,6 @@ fn run_update(collection: Option<&str>, force: bool) -> IrResult<Vec<UpdateResul
         });
     }
     Ok(results)
-}
-
-// ── helpers ───────────────────────────────────────────────────────────────────
-
-fn open_readonly(path: &std::path::Path) -> std::result::Result<Connection, rusqlite::Error> {
-    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-    let _ = conn.execute_batch("PRAGMA busy_timeout = 5000;");
-    Ok(conn)
-}
-
-const SQL_EXACT: &str = "SELECT d.path, d.title, c.doc \
-    FROM documents d JOIN content c ON d.hash = c.hash \
-    WHERE d.path = ?1 AND d.active = 1 LIMIT 1";
-const SQL_LIKE: &str = "SELECT d.path, d.title, c.doc \
-    FROM documents d JOIN content c ON d.hash = c.hash \
-    WHERE d.path LIKE ?1 AND d.active = 1 LIMIT 1";
-
-fn fetch_document(path: &str, collection_filter: &[String]) -> IrResult<Option<DocContent>> {
-    let config = Config::load()?;
-    fetch_document_with_config(path, collection_filter, &config)
-}
-
-fn fetch_document_with_config(
-    path: &str,
-    collection_filter: &[String],
-    config: &Config,
-) -> IrResult<Option<DocContent>> {
-    let cols: Vec<_> = if collection_filter.is_empty() {
-        config.collections.iter().collect()
-    } else {
-        config.collections.iter().filter(|c| collection_filter.contains(&c.name)).collect()
-    };
-
-    db::ensure_sqlite_vec();
-
-    for col in cols {
-        let db_path = collection_db_path(&col.name);
-        let conn = match open_readonly(&db_path) {
-            Ok(c) => c,
-            Err(rusqlite::Error::SqliteFailure(e, _))
-                if e.code == rusqlite::ErrorCode::CannotOpen => continue,
-            Err(e) => return Err(e.into()),
-        };
-        if let Some(doc) = lookup_in_conn(&conn, &col.name, path)? {
-            return Ok(Some(doc));
-        }
-    }
-    Ok(None)
-}
-
-/// Try exact, suffix, then substring path match. Stops at first hit.
-fn lookup_in_conn(conn: &Connection, collection: &str, path: &str) -> IrResult<Option<DocContent>> {
-    let suffix = format!("%/{path}");
-    let substr = format!("%{path}%");
-    let queries: &[(&str, &str)] = &[
-        (SQL_EXACT, path),
-        (SQL_LIKE, &suffix),
-        (SQL_LIKE, &substr),
-    ];
-    for (sql, param) in queries {
-        let row = conn.query_row(sql, rusqlite::params![param], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-            ))
-        });
-        match row {
-            Ok((doc_path, title, content)) => {
-                return Ok(Some(DocContent {
-                    collection: collection.to_string(),
-                    path: doc_path,
-                    title,
-                    content,
-                }));
-            }
-            Err(rusqlite::Error::QueryReturnedNoRows) => continue,
-            Err(e) => return Err(e.into()),
-        }
-    }
-    Ok(None)
 }
 
 // ── entry point ───────────────────────────────────────────────────────────────

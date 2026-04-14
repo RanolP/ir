@@ -3,6 +3,7 @@ mod config;
 mod daemon;
 mod db;
 mod error;
+mod get;
 mod index;
 mod llm;
 mod mcp;
@@ -12,6 +13,7 @@ mod types;
 
 use clap::Parser;
 use cli::{Cli, CollectionCmd, Command, DaemonCmd, PreprocessorCmd, output};
+use get::{DocContent, MultiGetResult};
 use config::{Config, collection_db_path};
 use error::Result;
 use types::{Collection, SearchMode};
@@ -56,9 +58,9 @@ fn run() -> Result<()> {
             files,
             verbose,
         ),
-        Command::Get { .. } => {
-            eprintln!("not yet implemented");
-            Ok(())
+        Command::Get { target, collections, json } => handle_get(target, collections, json),
+        Command::MultiGet { targets, collections, json, files } => {
+            handle_multi_get(targets, collections, json, files)
         }
         Command::Daemon { cmd } => match cmd {
             DaemonCmd::Start { timeout } => daemon::start_server(timeout),
@@ -74,6 +76,66 @@ fn run() -> Result<()> {
             rt.block_on(mcp::run(http))
         }
     }
+}
+
+fn handle_get(target: String, collections: Vec<String>, json: bool) -> Result<()> {
+    let config = Config::load()?;
+    let filter = resolve_collections(&config, &collections)?;
+    match get::fetch_document_with_config(&target, &filter, &config)? {
+        Some(doc) => {
+            if json {
+                println!("{}", serde_json::to_string_pretty(&doc)?);
+            } else {
+                print!("{}", doc.content);
+            }
+        }
+        None => {
+            eprintln!("not found: {target}");
+            std::process::exit(1);
+        }
+    }
+    Ok(())
+}
+
+fn handle_multi_get(
+    targets: Vec<String>,
+    collections: Vec<String>,
+    json: bool,
+    files: bool,
+) -> Result<()> {
+    let config = Config::load()?;
+    let filter = resolve_collections(&config, &collections)?;
+    let mut found: Vec<DocContent> = Vec::new();
+    let mut not_found: Vec<String> = Vec::new();
+    for target in &targets {
+        match get::fetch_document_with_config(target, &filter, &config)? {
+            Some(doc) => found.push(doc),
+            None => not_found.push(target.clone()),
+        }
+    }
+    let has_missing = !not_found.is_empty();
+    if json {
+        println!("{}", serde_json::to_string_pretty(&MultiGetResult { found, not_found })?);
+    } else {
+        if files {
+            for doc in &found {
+                println!("{}", doc.path);
+            }
+        } else {
+            for (i, doc) in found.iter().enumerate() {
+                if i > 0 { println!("---"); }
+                eprintln!("[{}] {}", doc.collection, doc.path);
+                print!("{}", doc.content);
+            }
+        }
+        for path in &not_found {
+            eprintln!("not found: {path}");
+        }
+        if has_missing {
+            std::process::exit(1);
+        }
+    }
+    Ok(())
 }
 
 fn handle_collection(cmd: CollectionCmd) -> Result<()> {
