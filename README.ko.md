@@ -173,7 +173,9 @@ ir search "에러 처리"          --mode hybrid -c notes --min-score 0.4
 # 출력 형식
 ir search "소유권" --json
 ir search "소유권" --md
-ir search "소유권" --files   # 경로만
+ir search "소유권" --files       # 경로만
+ir search "소유권" --full        # 결과에 문서 전문 포함
+ir search "소유권" --chunk       # 가장 관련성 높은 청크 텍스트 포함 (벡터 결과)
 ```
 
 **문서 조회:**
@@ -183,10 +185,13 @@ ir get "2026/Daily/04/2026-04-07.md"            # 컬렉션 상대 경로
 ir get "Notes/2026/Daily/04/2026-04-07.md"      # 볼트 루트 경로 (컬렉션 디렉토리명 접두사 자동 제거)
 ir get "2026-04-07" -c periodic                  # 부분 일치, 컬렉션 지정
 ir get "some/path.md" --json                     # JSON으로 전체 메타데이터 출력
+ir get "some/path.md" --max-chars 3000           # 앞 3000자만 반환
+ir get "some/path.md" --offset 1000 --max-chars 2000  # 1000~3000번째 문자
 
 ir multi-get "file1.md" "file2.md" "file3.md"   # 일괄 조회
 ir multi-get "file1.md" "file2.md" --json        # {found: [...], not_found: [...]}
 ir multi-get "file1.md" "file2.md" --files       # 찾은 경로만 출력
+ir multi-get "file1.md" "file2.md" --max-chars 2000  # 각 문서 잘라서 반환
 ```
 
 경로 매칭 순서: 정확 일치 → 접미 일치(`%/path`) → 부분 문자열. 볼트 루트 경로(첫 번째 구성 요소가 컬렉션 디렉토리명과 일치하는 경우)는 일반 매칭 전에 먼저 처리됩니다.
@@ -238,9 +243,9 @@ ir daemon status
 
 | 도구 | 설명 |
 |------|------|
-| `search` | 하이브리드 BM25+벡터 검색. 경로, 제목, 점수, 스니펫 반환. `mode`, `limit`, `min_score`, `collections` 파라미터 지원. |
-| `get` | 경로로 문서 전문 조회. 정확 일치 → 접미 일치 → 부분 문자열 순으로 검색. `collection`, `path`, `title`, `content` 반환. |
-| `multi_get` | 문서 일괄 조회. `paths` 배열을 받아 `found` 문서와 `not_found` 경로를 한 번에 반환. |
+| `search` | 하이브리드 BM25+벡터 검색. 경로, 제목, 점수, 스니펫 반환. `mode`, `limit`, `min_score`, `collections`, `full`(전문 포함), `include_chunk`(청크 텍스트 포함) 파라미터 지원. |
+| `get` | 경로로 문서 조회 (정확 → 접미 → 부분 일치). `collections`, `offset`(문자 오프셋), `max_chars`(잘라내기) 파라미터 지원. |
+| `multi_get` | 문서 일괄 조회. `paths[]`, `collections`, `max_chars`(각 문서 잘라내기) 파라미터. `found`와 `not_found` 반환. |
 | `status` | 인덱스 상태 — 컬렉션 이름, 문서 수, DB 크기, 데몬 상태. |
 | `update` | 파일 변경 후 컬렉션 재인덱싱. `collection`과 `force` 파라미터 지원. |
 

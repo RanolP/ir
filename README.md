@@ -127,7 +127,9 @@ ir search "error handling"     --mode hybrid -c notes --min-score 0.4
 # Output formats
 ir search "ownership" --json
 ir search "ownership" --md
-ir search "ownership" --files   # paths only
+ir search "ownership" --files       # paths only
+ir search "ownership" --full        # include full document content in results
+ir search "ownership" --chunk       # include best-matching chunk text (vector results)
 ```
 
 **Retrieve documents:**
@@ -137,10 +139,13 @@ ir get "2026/Daily/04/2026-04-07.md"           # collection-relative path
 ir get "Notes/2026/Daily/04/2026-04-07.md"     # vault-root path (strips collection dir prefix)
 ir get "2026-04-07" -c periodic                # substring match, scoped to collection
 ir get "some/path.md" --json                   # full metadata as JSON
+ir get "some/path.md" --max-chars 3000         # first 3000 chars
+ir get "some/path.md" --offset 1000 --max-chars 2000  # chars 1000–3000
 
 ir multi-get "file1.md" "file2.md" "file3.md"  # batch fetch
 ir multi-get "file1.md" "file2.md" --json       # {found: [...], not_found: [...]}
 ir multi-get "file1.md" "file2.md" --files      # paths only (found ones)
+ir multi-get "file1.md" "file2.md" --max-chars 2000  # truncate each doc
 ```
 
 Path matching order: exact → suffix (`%/path`) → substring. Vault-root paths (where the first component matches the collection's directory name) are resolved before the normal match.
@@ -192,9 +197,9 @@ Five tools are exposed:
 
 | Tool | Description |
 |------|-------------|
-| `search` | Hybrid BM25+vector search. Returns path, title, score, snippet. Supports `mode`, `limit`, `min_score`, `collections` params. |
-| `get` | Retrieve full text of a document by path. Tries exact → suffix → substring match. Returns `collection`, `path`, `title`, `content`. |
-| `multi_get` | Batch document retrieval. Accepts a `paths` array; returns `found` documents and `not_found` paths in one call. |
+| `search` | Hybrid BM25+vector search. Returns path, title, score, snippet. Params: `mode`, `limit`, `min_score`, `collections`, `full` (include full doc text), `include_chunk` (include best-matching chunk text). |
+| `get` | Retrieve document text by path (exact → suffix → substring match). Params: `collections`, `offset` (char offset), `max_chars` (truncate). |
+| `multi_get` | Batch document retrieval. Params: `paths[]`, `collections`, `max_chars` (truncate each doc). Returns `found` and `not_found`. |
 | `status` | Index health — collection names, doc counts, DB sizes, daemon status. |
 | `update` | Re-index collections after file changes. Accepts `collection` and `force` params. |
 
