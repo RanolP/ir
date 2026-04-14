@@ -1,11 +1,11 @@
-## [Unreleased]
+## [0.8.1] - 2026-04-14
 
 ### Features
 
-- `ir get` / `ir multi-get`: `--max-chars` truncates output to N characters; `--offset` skips the first N characters (`get` only). Both use char-safe slicing (correct for CJK and other multibyte content). MCP `get` and `multi_get` tools gain equivalent `max_chars` and `offset` parameters. Solves MCP tool-result overflow for large documents ([`9e54c69`](https://github.com/vlwkaos/ir/commit/9e54c69))
-- `ir search --chunk`: populates result content with the best-matching chunk text from vector/hybrid search. MCP `search` gains equivalent `include_chunk` parameter. Results from BM25-only queries leave content empty (no chunk identity for FTS results)
-- MCP `search`: `full` parameter now exposed (was CLI-only). Set `full=true` to include full document text inline in search results
-- `SearchResult.chunk_seq`: best-matching chunk index propagated through the full pipeline (vector kNN → score fusion → reranking → daemon IPC → CLI/MCP). Appears in JSON output for vector/hybrid results; absent for BM25-only results
+- `ir get` / `ir multi-get`: `--max-chars` truncates output to N characters; `--offset` skips the first N characters (`get` only). Both use char-safe slicing (correct for CJK and other multibyte content). MCP `get` and `multi_get` tools gain equivalent `max_chars` and `offset` parameters. Solves MCP tool-result overflow for large documents ([`9e54c69`](https://github.com/vlwkaos/ir/commit/9e54c69c986d34cb1c91e1cf704e77950e7fe713))
+- `ir search --chunk`: populates result content with the best-matching chunk text from vector/hybrid search. MCP `search` gains equivalent `include_chunk` parameter. Results from BM25-only queries leave content empty (no chunk identity for FTS results) ([`9e54c69`](https://github.com/vlwkaos/ir/commit/9e54c69c986d34cb1c91e1cf704e77950e7fe713))
+- MCP `search`: `full` parameter now exposed (was CLI-only). Set `full=true` to include full document text inline in search results ([`9e54c69`](https://github.com/vlwkaos/ir/commit/9e54c69c986d34cb1c91e1cf704e77950e7fe713))
+- `SearchResult.chunk_seq`: best-matching chunk index propagated through the full pipeline (vector kNN → score fusion → reranking → daemon IPC → CLI/MCP). Appears in JSON output for vector/hybrid results; absent for BM25-only results ([`9e54c69`](https://github.com/vlwkaos/ir/commit/9e54c69c986d34cb1c91e1cf704e77950e7fe713))
 
 ### Breaking
 
