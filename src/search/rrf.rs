@@ -67,6 +67,7 @@ mod tests {
             hash: "abc".into(),
             doc_id: "#abc".into(),
             content: None,
+            chunk_seq: None,
         }
     }
 

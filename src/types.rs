@@ -27,6 +27,9 @@ pub struct SearchResult {
     pub doc_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    /// Best-matching chunk index within the document (set by vector search; None for BM25-only results).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chunk_seq: Option<usize>,
 }
 
 impl SearchResult {

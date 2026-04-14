@@ -1,13 +1,14 @@
 // Document retrieval by path -- shared by CLI and MCP.
 // Supports exact, suffix, and substring matching with vault-root path resolution.
 
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 use crate::config::{Config, collection_db_path};
 use crate::db;
 use crate::error::Result;
-use crate::types::Collection;
+use crate::types::{Collection, SearchResult};
 
 // ── output types ─────────────────────────────────────────────────────────────
 
@@ -166,11 +167,338 @@ fn resolve_vault_root_path<'a>(
     None
 }
 
+// ── chunk retrieval ───────────────────────────────────────────────────────────
+
+/// Inner: batch-fetch chunks from a single open connection.
+/// `items` is a slice of (result_idx, hash, seq) tuples.
+/// Writes chunk text into `results[result_idx].content`.
+fn apply_chunks_from_conn(
+    conn: &Connection,
+    items: &[(usize, String, usize)],
+    results: &mut [SearchResult],
+) -> Result<()> {
+    let mut unique_hashes: Vec<&str> = items.iter().map(|(_, h, _)| h.as_str()).collect();
+    unique_hashes.sort_unstable();
+    unique_hashes.dedup();
+    let placeholders = unique_hashes.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let sql = format!("SELECT hash, doc FROM content WHERE hash IN ({placeholders})");
+    let mut stmt = conn.prepare(&sql)?;
+    let content_map: HashMap<String, String> = stmt
+        .query_map(rusqlite::params_from_iter(unique_hashes.iter().copied()), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<std::result::Result<_, _>>()?;
+
+    for (result_idx, hash, seq) in items {
+        if let Some(doc) = content_map.get(hash) {
+            let chunks = crate::index::chunker::chunk_document(doc);
+            results[*result_idx].content = chunks.into_iter().nth(*seq).map(|c| c.text);
+        }
+    }
+    Ok(())
+}
+
+/// Inner: fetch a single chunk from an open connection.
+fn fetch_chunk_from_conn(conn: &Connection, hash: &str, seq: usize) -> Result<Option<String>> {
+    let doc: Option<String> = conn
+        .query_row(
+            "SELECT doc FROM content WHERE hash = ?1",
+            rusqlite::params![hash],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(doc.and_then(|text| {
+        crate::index::chunker::chunk_document(&text).into_iter().nth(seq).map(|c| c.text)
+    }))
+}
+
+/// Populate `.content` on search results that have `chunk_seq` set.
+/// Batches DB access per collection: one connection + one query per distinct collection.
+pub fn populate_chunk_content(results: &mut [SearchResult]) -> Result<()> {
+    let tasks: Vec<(usize, String, String, usize)> = results
+        .iter()
+        .enumerate()
+        .filter_map(|(i, r)| r.chunk_seq.map(|seq| (i, r.collection.clone(), r.hash.clone(), seq)))
+        .collect();
+    if tasks.is_empty() {
+        return Ok(());
+    }
+
+    let config = Config::load()?;
+    let mut by_col: HashMap<String, Vec<(usize, String, usize)>> = HashMap::new();
+    for (idx, col, hash, seq) in tasks {
+        by_col.entry(col).or_default().push((idx, hash, seq));
+    }
+
+    for (col_name, items) in &by_col {
+        let col = match config.get_collection(col_name) {
+            Some(c) => c,
+            None => continue,
+        };
+        let db_path = collection_db_path(&col.name);
+        let conn = match open_readonly(&db_path) {
+            Ok(c) => c,
+            Err(rusqlite::Error::SqliteFailure(e, _))
+                if e.code == rusqlite::ErrorCode::CannotOpen => continue,
+            Err(e) => return Err(e.into()),
+        };
+        apply_chunks_from_conn(&conn, items, results)?;
+    }
+    Ok(())
+}
+
+/// Return the text of chunk `seq` for a single document by hash.
+/// For batch use over multiple search results, prefer `populate_chunk_content`.
+pub fn fetch_chunk_text(hash: &str, seq: usize, collection: &str) -> Result<Option<String>> {
+    let config = Config::load()?;
+    let col = match config.get_collection(collection) {
+        Some(c) => c,
+        None => return Ok(None),
+    };
+    let db_path = collection_db_path(&col.name);
+    let conn = match open_readonly(&db_path) {
+        Ok(c) => c,
+        Err(rusqlite::Error::SqliteFailure(e, _))
+            if e.code == rusqlite::ErrorCode::CannotOpen => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    fetch_chunk_from_conn(&conn, hash, seq)
+}
+
+// ── content trimming ─────────────────────────────────────────────────────────
+
+/// Trim document content by char offset and max length.
+/// Char-safe: slices on character boundaries, not byte boundaries.
+/// - `offset=None` or `0` → start from beginning
+/// - `max_chars=None` or `0` → no limit
+/// - `offset` beyond content length → empty string
+pub fn trim_content<'a>(content: &'a str, offset: Option<usize>, max_chars: Option<usize>) -> &'a str {
+    let start = offset.unwrap_or(0);
+    let limit = max_chars.unwrap_or(0);
+
+    let byte_start = match content.char_indices().nth(start) {
+        Some((b, _)) => b,
+        None => return "",
+    };
+    let sliced = &content[byte_start..];
+
+    if limit == 0 {
+        return sliced;
+    }
+
+    match sliced.char_indices().nth(limit) {
+        Some((b, _)) => &sliced[..b],
+        None => sliced,
+    }
+}
+
 // ── tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── trim_content ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn trim_no_args_returns_full() {
+        assert_eq!(trim_content("hello", None, None), "hello");
+    }
+
+    #[test]
+    fn trim_max_chars_truncates() {
+        assert_eq!(trim_content("hello world", None, Some(5)), "hello");
+    }
+
+    #[test]
+    fn trim_max_chars_zero_means_no_limit() {
+        assert_eq!(trim_content("hello", None, Some(0)), "hello");
+    }
+
+    #[test]
+    fn trim_offset_skips_start() {
+        assert_eq!(trim_content("hello world", Some(6), None), "world");
+    }
+
+    #[test]
+    fn trim_offset_zero_means_start() {
+        assert_eq!(trim_content("hello", Some(0), None), "hello");
+    }
+
+    #[test]
+    fn trim_offset_and_max_chars() {
+        assert_eq!(trim_content("hello world", Some(6), Some(3)), "wor");
+    }
+
+    #[test]
+    fn trim_offset_beyond_len_returns_empty() {
+        assert_eq!(trim_content("hi", Some(100), None), "");
+    }
+
+    #[test]
+    fn trim_max_chars_beyond_len_returns_rest() {
+        assert_eq!(trim_content("hi", None, Some(100)), "hi");
+    }
+
+    #[test]
+    fn trim_cjk_char_boundary() {
+        // Each CJK char is 3 bytes; slicing must be char-safe
+        let s = "日本語テスト";
+        assert_eq!(trim_content(s, Some(2), Some(2)), "語テ");
+    }
+
+    #[test]
+    fn trim_cjk_offset_beyond_len_empty() {
+        assert_eq!(trim_content("日本語", Some(10), None), "");
+    }
+
+    #[test]
+    fn trim_empty_string() {
+        assert_eq!(trim_content("", None, Some(5)), "");
+        assert_eq!(trim_content("", Some(3), None), "");
+    }
+
+    // ── fetch_chunk_from_conn ────────────────────────────────────────────────
+
+    fn open_chunk_test_db() -> Connection {
+        crate::db::ensure_sqlite_vec();
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(include_str!("db/schema_base.sql")).unwrap();
+        conn
+    }
+
+    fn insert_content(conn: &Connection, hash: &str, doc: &str) {
+        conn.execute(
+            "INSERT OR IGNORE INTO content (hash, doc, created_at) VALUES (?1, ?2, '2026-01-01')",
+            rusqlite::params![hash, doc],
+        ).unwrap();
+    }
+
+    #[test]
+    fn chunk_from_conn_seq0_returns_first_chunk() {
+        let conn = open_chunk_test_db();
+        insert_content(&conn, "h1", "hello world");
+        let text = fetch_chunk_from_conn(&conn, "h1", 0).unwrap();
+        // Short doc is a single chunk — seq 0 returns the whole text.
+        assert_eq!(text.as_deref(), Some("hello world"));
+    }
+
+    #[test]
+    fn chunk_from_conn_hash_not_found_returns_none() {
+        let conn = open_chunk_test_db();
+        let text = fetch_chunk_from_conn(&conn, "missing", 0).unwrap();
+        assert!(text.is_none());
+    }
+
+    #[test]
+    fn chunk_from_conn_seq_out_of_range_returns_none() {
+        let conn = open_chunk_test_db();
+        insert_content(&conn, "h2", "short doc");
+        // Only one chunk exists (seq 0); seq 5 is out of range.
+        let text = fetch_chunk_from_conn(&conn, "h2", 5).unwrap();
+        assert!(text.is_none());
+    }
+
+    #[test]
+    fn chunk_from_conn_multi_chunk_doc_seq1() {
+        use crate::index::chunker::{chunk_document, set_chunk_size_tokens_override};
+        // Force tiny chunks so a short doc produces multiple chunks.
+        set_chunk_size_tokens_override(Some(4)); // 4 tokens = 16 chars
+        let doc = "aaaa bbbb cccc dddd eeee ffff gggg hhhh iiii jjjj"; // 50 chars > 16
+        let chunks = chunk_document(doc);
+        assert!(chunks.len() >= 2, "expected multiple chunks");
+
+        let conn = open_chunk_test_db();
+        insert_content(&conn, "h3", doc);
+        let chunk1 = fetch_chunk_from_conn(&conn, "h3", 1).unwrap();
+        assert_eq!(chunk1.as_deref(), Some(chunks[1].text.as_str()));
+
+        set_chunk_size_tokens_override(None); // restore default
+    }
+
+    // ── apply_chunks_from_conn ───────────────────────────────────────────────
+
+    fn make_result_with_chunk(hash: &str, seq: usize) -> SearchResult {
+        SearchResult {
+            collection: "col".into(),
+            path: "p".into(),
+            title: "t".into(),
+            score: 1.0,
+            snippet: None,
+            hash: hash.into(),
+            doc_id: "#abc".into(),
+            content: None,
+            chunk_seq: Some(seq),
+        }
+    }
+
+    fn make_result_no_chunk(hash: &str) -> SearchResult {
+        SearchResult {
+            collection: "col".into(),
+            path: "p".into(),
+            title: "t".into(),
+            score: 1.0,
+            snippet: None,
+            hash: hash.into(),
+            doc_id: "#abc".into(),
+            content: None,
+            chunk_seq: None,
+        }
+    }
+
+    #[test]
+    fn apply_chunks_populates_content() {
+        let conn = open_chunk_test_db();
+        insert_content(&conn, "abc", "hello world");
+        let items = vec![(0usize, "abc".to_string(), 0usize)];
+        let mut results = vec![make_result_with_chunk("abc", 0)];
+        apply_chunks_from_conn(&conn, &items, &mut results).unwrap();
+        assert_eq!(results[0].content.as_deref(), Some("hello world"));
+    }
+
+    #[test]
+    fn apply_chunks_skips_missing_hash() {
+        let conn = open_chunk_test_db();
+        let items = vec![(0usize, "nope".to_string(), 0usize)];
+        let mut results = vec![make_result_with_chunk("nope", 0)];
+        apply_chunks_from_conn(&conn, &items, &mut results).unwrap();
+        assert!(results[0].content.is_none());
+    }
+
+    #[test]
+    fn apply_chunks_batch_multiple_hashes() {
+        let conn = open_chunk_test_db();
+        insert_content(&conn, "h_a", "doc alpha");
+        insert_content(&conn, "h_b", "doc beta");
+        let items = vec![
+            (0usize, "h_a".to_string(), 0usize),
+            (1usize, "h_b".to_string(), 0usize),
+        ];
+        let mut results = vec![
+            make_result_with_chunk("h_a", 0),
+            make_result_with_chunk("h_b", 0),
+        ];
+        apply_chunks_from_conn(&conn, &items, &mut results).unwrap();
+        assert_eq!(results[0].content.as_deref(), Some("doc alpha"));
+        assert_eq!(results[1].content.as_deref(), Some("doc beta"));
+    }
+
+    #[test]
+    fn apply_chunks_leaves_no_chunk_seq_results_untouched() {
+        // Results without chunk_seq are not passed to apply_chunks, but even if content is
+        // pre-populated it should not be overwritten (items list controls what gets written).
+        let conn = open_chunk_test_db();
+        insert_content(&conn, "h_c", "some content");
+        // Only pass the result that has chunk_seq; the other is untouched.
+        let items = vec![(0usize, "h_c".to_string(), 0usize)];
+        let mut results = vec![
+            make_result_with_chunk("h_c", 0),
+            make_result_no_chunk("h_d"),
+        ];
+        apply_chunks_from_conn(&conn, &items, &mut results).unwrap();
+        assert!(results[0].content.is_some());
+        assert!(results[1].content.is_none());
+    }
 
     fn test_col(name: &str, path: &str) -> Collection {
         Collection {

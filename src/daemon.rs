@@ -74,6 +74,8 @@ pub struct DaemonResult {
     pub snippet: String,
     pub hash: String,
     pub doc_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chunk_seq: Option<usize>,
 }
 
 // ── Client ────────────────────────────────────────────────────────────────────
@@ -533,6 +535,7 @@ fn handle_request(
         snippet: r.snippet.unwrap_or_default(),
         hash: r.hash,
         doc_id: r.doc_id,
+        chunk_seq: r.chunk_seq,
     }).collect(), log))
 }
 

@@ -83,15 +83,16 @@ pub fn search(
     }
 
     // kNN results are sorted by distance asc; first occurrence of each hash is its best chunk.
-    let mut hash_order: Vec<(&str, f64)> = Vec::new();
+    // Carry the chunk seq so callers can retrieve that specific chunk if needed.
+    let mut hash_order: Vec<(&str, f64, usize)> = Vec::new();
     let mut seen_hashes: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for r in &raw {
-        let hash = match r.hash_seq.rsplit_once('_') {
-            Some((h, _)) => h,
-            None => &r.hash_seq,
+        let (hash, seq) = match r.hash_seq.rsplit_once('_') {
+            Some((h, s)) => (h, s.parse::<usize>().unwrap_or(0)),
+            None => (r.hash_seq.as_str(), 0),
         };
         if seen_hashes.insert(hash) {
-            hash_order.push((hash, r.distance));
+            hash_order.push((hash, r.distance, seq));
         }
     }
 
@@ -100,7 +101,7 @@ pub fn search(
     let sql = format!(
         "SELECT hash, path, title FROM documents WHERE hash IN ({placeholders}) AND active = 1"
     );
-    let hashes: Vec<&str> = hash_order.iter().map(|(h, _)| *h).collect();
+    let hashes: Vec<&str> = hash_order.iter().map(|(h, _, _)| *h).collect();
     let mut stmt = conn.prepare(&sql)?;
     let hash_meta: HashMap<String, (String, String)> = stmt
         .query_map(rusqlite::params_from_iter(hashes.iter().copied()), |row| {
@@ -115,12 +116,13 @@ pub fn search(
     let mut results: Vec<SearchResult> = Vec::new();
     let mut path_idx: HashMap<String, usize> = HashMap::new();
 
-    for (hash, distance) in &hash_order {
+    for (hash, distance, seq) in &hash_order {
         if let Some((path, title)) = hash_meta.get(*hash) {
             let score = 1.0 - distance;
             if let Some(&idx) = path_idx.get(path) {
                 if score > results[idx].score {
                     results[idx].score = score;
+                    results[idx].chunk_seq = Some(*seq);
                 }
             } else {
                 path_idx.insert(path.clone(), results.len());
@@ -133,6 +135,7 @@ pub fn search(
                     hash: hash.to_string(),
                     doc_id: format!("#{}", &hash[..6.min(hash.len())]),
                     content: None,
+                    chunk_seq: Some(*seq),
                 });
             }
         }
@@ -221,5 +224,28 @@ mod tests {
         assert_eq!(results[0].path, "doc.md");
         assert_eq!(results[0].title, "Doc Title");
         assert!(results[0].score > 0.9);
+        assert_eq!(results[0].chunk_seq, Some(0));
+    }
+
+    #[test]
+    fn search_chunk_seq_best_chunk_wins() {
+        let conn = open_test_db();
+        let hash = "aabbccdd";
+        conn.execute(
+            "INSERT INTO documents (path, title, hash, active) VALUES ('multi.md','Multi',?1,1)",
+            [hash],
+        ).unwrap();
+
+        // chunk 0 is further away, chunk 2 is closest
+        let far  = vec![0.5f32, 0.5, 0.5, 0.5];
+        let near = vec![1.0f32, 0.0, 0.0, 0.0];
+        insert(&conn, &format!("{hash}_0"), &far).unwrap();
+        insert(&conn, &format!("{hash}_2"), &near).unwrap();
+
+        let query = vec![1.0f32, 0.0, 0.0, 0.0];
+        let results = search(&conn, &query, "col", 5).unwrap();
+        assert_eq!(results.len(), 1);
+        // chunk 2 is closest — its seq should win
+        assert_eq!(results[0].chunk_seq, Some(2));
     }
 }

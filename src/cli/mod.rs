@@ -50,8 +50,11 @@ pub enum Command {
         #[arg(long)]
         all: bool,
         /// Show full document content
-        #[arg(long)]
+        #[arg(long, conflicts_with = "chunk")]
         full: bool,
+        /// Show best-matching chunk content (vector results only; falls back to snippet for BM25)
+        #[arg(long, conflicts_with = "full")]
+        chunk: bool,
         /// JSON output
         #[arg(long)]
         json: bool,
@@ -76,6 +79,12 @@ pub enum Command {
         /// Restrict to collection(s)
         #[arg(short = 'c', long = "collection")]
         collections: Vec<String>,
+        /// Start output at this character offset into the document
+        #[arg(long)]
+        offset: Option<usize>,
+        /// Truncate output to this many characters
+        #[arg(long)]
+        max_chars: Option<usize>,
         /// JSON output
         #[arg(long)]
         json: bool,
@@ -89,6 +98,9 @@ pub enum Command {
         /// Restrict to collection(s)
         #[arg(short = 'c', long = "collection")]
         collections: Vec<String>,
+        /// Truncate each document to this many characters
+        #[arg(long)]
+        max_chars: Option<usize>,
         /// JSON output
         #[arg(long)]
         json: bool,

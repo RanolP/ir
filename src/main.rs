@@ -40,6 +40,7 @@ fn run() -> Result<()> {
             collections,
             all,
             full,
+            chunk,
             json,
             csv,
             md,
@@ -52,15 +53,18 @@ fn run() -> Result<()> {
             min_score,
             collections,
             full,
+            chunk,
             json,
             csv,
             md,
             files,
             verbose,
         ),
-        Command::Get { target, collections, json } => handle_get(target, collections, json),
-        Command::MultiGet { targets, collections, json, files } => {
-            handle_multi_get(targets, collections, json, files)
+        Command::Get { target, collections, offset, max_chars, json } => {
+            handle_get(target, collections, offset, max_chars, json)
+        }
+        Command::MultiGet { targets, collections, max_chars, json, files } => {
+            handle_multi_get(targets, collections, max_chars, json, files)
         }
         Command::Daemon { cmd } => match cmd {
             DaemonCmd::Start { timeout } => daemon::start_server(timeout),
@@ -78,11 +82,20 @@ fn run() -> Result<()> {
     }
 }
 
-fn handle_get(target: String, collections: Vec<String>, json: bool) -> Result<()> {
+fn handle_get(
+    target: String,
+    collections: Vec<String>,
+    offset: Option<usize>,
+    max_chars: Option<usize>,
+    json: bool,
+) -> Result<()> {
     let config = Config::load()?;
     let filter = resolve_collections(&config, &collections)?;
     match get::fetch_document_with_config(&target, &filter, &config)? {
-        Some(doc) => {
+        Some(mut doc) => {
+            if offset.is_some() || max_chars.is_some() {
+                doc.content = get::trim_content(&doc.content, offset, max_chars).to_string();
+            }
             if json {
                 println!("{}", serde_json::to_string_pretty(&doc)?);
             } else {
@@ -100,6 +113,7 @@ fn handle_get(target: String, collections: Vec<String>, json: bool) -> Result<()
 fn handle_multi_get(
     targets: Vec<String>,
     collections: Vec<String>,
+    max_chars: Option<usize>,
     json: bool,
     files: bool,
 ) -> Result<()> {
@@ -109,7 +123,12 @@ fn handle_multi_get(
     let mut not_found: Vec<String> = Vec::new();
     for target in &targets {
         match get::fetch_document_with_config(target, &filter, &config)? {
-            Some(doc) => found.push(doc),
+            Some(mut doc) => {
+                if max_chars.is_some() {
+                    doc.content = get::trim_content(&doc.content, None, max_chars).to_string();
+                }
+                found.push(doc);
+            }
             None => not_found.push(target.clone()),
         }
     }
@@ -383,6 +402,7 @@ fn handle_search(
     min_score: Option<f64>,
     collection_filter: Vec<String>,
     full: bool,
+    chunk: bool,
     json: bool,
     csv: bool,
     md: bool,
@@ -420,6 +440,8 @@ fn handle_search(
             })
             .collect::<Result<Vec<_>>>()?;
         fill_content(&mut results, &dbs);
+    } else if chunk {
+        get::populate_chunk_content(&mut results)?;
     }
 
     output::print_results(&mut results, fmt);
@@ -437,11 +459,12 @@ fn to_search_results(daemon_results: Vec<daemon::DaemonResult>) -> Vec<types::Se
             hash: r.hash,
             doc_id: r.doc_id,
             content: None,
+            chunk_seq: r.chunk_seq,
         })
         .collect()
 }
 
-fn fill_content(results: &mut [types::SearchResult], dbs: &[db::CollectionDb]) {
+pub(crate) fn fill_content(results: &mut [types::SearchResult], dbs: &[db::CollectionDb]) {
     let db_map: std::collections::HashMap<&str, &db::CollectionDb> =
         dbs.iter().map(|d| (d.name.as_str(), d)).collect();
 

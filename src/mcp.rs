@@ -21,6 +21,7 @@ use crate::{
     db,
     get::{MultiGetResult, fetch_document, fetch_document_with_config, open_readonly},
     index,
+    types::SearchResult,
 };
 
 // ^ don't import crate::error::Result here — macro-generated code uses
@@ -41,6 +42,10 @@ struct SearchInput {
     min_score: Option<f64>,
     /// Restrict search to these collection names (default: all)
     collections: Option<Vec<String>>,
+    /// Include full document content in results (default: false; returns snippet only)
+    full: Option<bool>,
+    /// Include best-matching chunk text in results (vector results only; ignored for BM25-only results)
+    include_chunk: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -57,6 +62,10 @@ struct GetInput {
     path: String,
     /// Restrict lookup to these collection names (default: all)
     collections: Option<Vec<String>>,
+    /// Start output at this character offset into the document (default: 0)
+    offset: Option<usize>,
+    /// Truncate output to this many characters (default: no limit)
+    max_chars: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -65,6 +74,8 @@ struct MultiGetInput {
     paths: Vec<String>,
     /// Restrict lookup to these collection names (default: all)
     collections: Option<Vec<String>>,
+    /// Truncate each document to this many characters (default: no limit)
+    max_chars: Option<usize>,
 }
 
 // ── status / update output types ──────────────────────────────────────────────
@@ -113,12 +124,20 @@ impl IrMcpServer {
         Returns ranked results with file path, title, relevance score, and a text snippet. \
         Use the file path with a file-read tool to retrieve full document content.")]
     async fn search(&self, params: Parameters<SearchInput>) -> Result<String, String> {
-        let SearchInput { query, mode, limit, min_score, collections } = params.0;
+        let SearchInput { query, mode, limit, min_score, collections, full, include_chunk } = params.0;
         let mode = mode.unwrap_or_else(|| "hybrid".to_string());
         let limit = limit.unwrap_or(10);
         let collections = collections.unwrap_or_default();
+        let full = full.unwrap_or(false);
+        let include_chunk = include_chunk.unwrap_or(false);
         spawn_tool(move || {
-            crate::search_core(&query, &mode, limit, min_score, &collections, crate::types::Verbosity::Quiet)
+            let mut results = crate::search_core(&query, &mode, limit, min_score, &collections, crate::types::Verbosity::Quiet)?;
+            if full && !results.is_empty() {
+                fill_results_content(&mut results)?;
+            } else if include_chunk {
+                crate::get::populate_chunk_content(&mut results)?;
+            }
+            Ok(results)
         }).await
     }
 
@@ -141,11 +160,15 @@ impl IrMcpServer {
         Also accepts vault-root paths (e.g. 'Notes/2026/file.md' where 'Notes' is the collection dir). \
         Returns a tool error if not found — use multi_get if you need a non-error response for misses.")]
     async fn get(&self, params: Parameters<GetInput>) -> Result<String, String> {
-        let GetInput { path, collections } = params.0;
+        let GetInput { path, collections, offset, max_chars } = params.0;
         let collections = collections.unwrap_or_default();
         spawn_tool(move || {
-            fetch_document(&path, &collections)?
-                .ok_or_else(|| crate::error::Error::Other(format!("not found: {path}")))
+            let mut doc = fetch_document(&path, &collections)?
+                .ok_or_else(|| crate::error::Error::Other(format!("not found: {path}")))?;
+            if offset.is_some() || max_chars.is_some() {
+                doc.content = crate::get::trim_content(&doc.content, offset, max_chars).to_string();
+            }
+            Ok(doc)
         }).await
     }
 
@@ -153,7 +176,7 @@ impl IrMcpServer {
         Each path is resolved independently (exact → suffix → substring match). \
         Returns found documents and a list of unmatched paths.")]
     async fn multi_get(&self, params: Parameters<MultiGetInput>) -> Result<String, String> {
-        let MultiGetInput { paths, collections } = params.0;
+        let MultiGetInput { paths, collections, max_chars } = params.0;
         let collections = collections.unwrap_or_default();
         spawn_tool(move || {
             let config = Config::load()?;
@@ -161,7 +184,12 @@ impl IrMcpServer {
             let mut not_found = Vec::new();
             for path in &paths {
                 match fetch_document_with_config(path, &collections, &config)? {
-                    Some(doc) => found.push(doc),
+                    Some(mut doc) => {
+                        if max_chars.is_some() {
+                            doc.content = crate::get::trim_content(&doc.content, None, max_chars).to_string();
+                        }
+                        found.push(doc);
+                    }
                     None => not_found.push(path.clone()),
                 }
             }
@@ -236,6 +264,22 @@ fn build_instructions() -> String {
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
+
+fn fill_results_content(results: &mut [SearchResult]) -> IrResult<()> {
+    let config = Config::load()?;
+    let col_names: std::collections::HashSet<&str> =
+        results.iter().map(|r| r.collection.as_str()).collect();
+    let dbs: Vec<db::CollectionDb> = col_names.iter()
+        .filter_map(|name| config.get_collection(name))
+        .map(|c| {
+            let pp_aliases = c.preprocessor.as_deref().unwrap_or(&[]);
+            let pp_commands = config.resolve_preprocessor_commands(pp_aliases);
+            db::CollectionDb::open_rw(&c.name, &collection_db_path(&c.name), pp_commands)
+        })
+        .collect::<crate::error::Result<Vec<_>>>()?;
+    crate::fill_content(results, &dbs);
+    Ok(())
+}
 
 fn count_docs(db_path: &std::path::Path) -> Option<usize> {
     db::ensure_sqlite_vec();

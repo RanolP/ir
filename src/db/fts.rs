@@ -213,6 +213,7 @@ fn collect_search_rows(
             hash,
             doc_id,
             content: None,
+            chunk_seq: None,
         });
     }
     Ok(results)
