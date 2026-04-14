@@ -1,3 +1,13 @@
+## [0.8.2] - 2026-04-15
+
+### Features
+
+- `ir get --section "Heading"`: extract a named section from a document by ATX heading text (case-insensitive, CommonMark-compliant, code-fence-aware). Section runs from the matched heading to the next heading of the same or higher level. MCP `get` tool gains an equivalent `section` parameter. Returns empty string when heading not found. ([`dfc7d2d`](https://github.com/vlwkaos/ir/commit/dfc7d2dd5a898e636b90fe600c6425a22eecaa5f))
+
+### Bug Fixes
+
+- Chunker: replace post-loop tail merge with inline rebalance-or-absorb. When a normal split would leave a sub-minimum tail, the chunk boundary is pulled back so both the current chunk and the tail meet `MIN_CHUNK_SIZE_TOKENS` (100 tokens / 400 chars). Fixes a latent infinite loop where a semantic break point inside the overlap window caused `start` to stop advancing, producing an unbounded `Vec<Chunk>` and OOM. ([`ddced38`](https://github.com/vlwkaos/ir/commit/ddced38b493f0d59cd392b3374b837728a392a47))
+
 ## [0.8.1] - 2026-04-14
 
 ### Features
