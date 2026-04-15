@@ -2,10 +2,10 @@
 # Run eval sequentially across named configs, log each run, print summary.
 #
 # Usage:
-#   scripts/bench.sh --data test-data/scifact [--mode all] [--eval-args "..."] \
+#   scripts/bench.sh --data test-data/fiqa [--mode all] [--eval-args "..."] \
 #       baseline \
-#       "B:IR_QWEN_MODEL=~/local-models/Qwen3.5-0.8B-Q8_0.gguf" \
-#       "C:IR_QWEN_MODEL=~/local-models/Qwen3.5-2B-Q4_K_M.gguf"
+#       "B:IR_COMBINED_MODEL=~/local-models/Qwen3.5-0.8B-Q8_0.gguf" \
+#       "C:IR_COMBINED_MODEL=~/local-models/Qwen3.5-2B-Q4_K_M.gguf"
 #
 # Each run arg is either:
 #   name                        — no extra env (baseline)
@@ -45,7 +45,7 @@ RESULTS_FILE=$(mktemp)
 trap 'rm -f "$RESULTS_FILE"' EXIT
 
 echo "==> building eval..."
-cargo build --release --bin eval 2>&1
+cargo build --release --bin eval --features bench 2>&1
 echo ""
 
 for spec in "$@"; do
@@ -58,9 +58,10 @@ for spec in "$@"; do
     fi
 
     log="$LOG_DIR/bench-${DATASET}-${name}-${TIMESTAMP}.log"
+    json_out="$LOG_DIR/bench-${DATASET}-${name}-${TIMESTAMP}.json"
     echo "==> [$name] starting  (log: $log)"
 
-    cmd="cargo run --release --bin eval -- --data $DATA --mode $MODE $EVAL_ARGS"
+    cmd="cargo run --release --features bench --bin eval -- --data $DATA --mode $MODE --emit-json $json_out $EVAL_ARGS"
     if [[ -n "$env_part" ]]; then
         cmd="$env_part $cmd"
     fi
@@ -70,9 +71,19 @@ for spec in "$@"; do
     status="${PIPESTATUS[0]}"
     set -e
 
-    if [[ "$status" -eq 0 ]]; then
-        ndcg=$(grep -E '^\s*(hybrid|hybrid-rerank)\s+[0-9]' "$log" | tail -1 | awk '{print $2}')
-        recall=$(grep -E '^\s*(hybrid|hybrid-rerank)\s+[0-9]' "$log" | tail -1 | awk '{print $3}')
+    if [[ "$status" -eq 0 ]] && [[ -f "$json_out" ]]; then
+        read -r ndcg recall < <(python3 - "$json_out" <<'EOF'
+import json, sys
+with open(sys.argv[1]) as f: d = json.load(f)
+for r in d.get("results", []):
+    if r["mode"] in ("hybrid-rerank", "hybrid"):
+        m = r["metrics"]
+        print(m.get("ndcg_10", "?"), m.get("recall_10", "?"))
+        break
+else:
+    print("? ?")
+EOF
+)
         printf '%s\t%s\t%s\n' "$name" "${ndcg:-?}" "${recall:-?}" >> "$RESULTS_FILE"
         echo ""
         echo "==> [$name] done  nDCG@10=${ndcg:-?}  Recall@10=${recall:-?}"

@@ -16,7 +16,7 @@ cargo test -- --ignored            # includes LLM tests (require model files)
 
 Benchmark runner (requires BEIR dataset):
 ```bash
-scripts/bench.sh --data test-data/nfcorpus baseline "B:IR_COMBINED_MODEL=~/local-models/Qwen3.5-0.8B-Q8_0.gguf"
+scripts/bench.sh --data test-data/fiqa baseline "B:IR_COMBINED_MODEL=~/local-models/Qwen3.5-0.8B-Q8_0.gguf"
 ```
 Logs go to `logs/` (gitignored).
 
@@ -101,3 +101,5 @@ Recurring audit axes (auto-maintained by /good-to-go):
 - Enum variants in types.rs must be wired to a CLI flag or MCP field — check with `rg 'Variant::' src/ | grep -v test`
 - Preprocessor protocol tests must use line-flushing commands (cat, rev) not buffered ones (tr, sed, sort)
 - IR_COMBINED_MODEL is the canonical combined-model env var; IR_QWEN_MODEL is a deprecated alias — do not promote the alias in new docs
+- src/search/filter.rs must have unit tests for eval_clause + match_op — these are pure functions with no DB dependency; easy to test, and zero coverage is a gap
+- FilterOp::Ne on multi-valued fields uses any-match semantics (same as all ops): `meta.tags!=rust` passes if ANY tag != "rust"; document this in README filter table, not just code comments
