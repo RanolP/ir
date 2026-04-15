@@ -164,6 +164,72 @@ The daemon keeps models warm in memory. Subsequent queries over the Unix socket 
 </details>
 
 <details>
+<summary><strong>Incremental Indexing</strong></summary>
+
+IR efficiently handles updates by only processing changed files through content-addressed storage with SHA-256 hashing.
+
+**How it works:**
+
+- **Change detection**: Files are hashed (SHA-256) and compared against stored hashes
+- **Smart updates**: Only modified or new files are re-processed
+- **Deletion handling**: Removed files are marked as inactive (soft delete)
+- **Deduplication**: Identical content within a collection shares storage
+
+**Index operations:**
+
+```bash
+# Regular incremental update (default)
+ir update                    # all collections
+ir update notes              # specific collection
+
+# Force full re-index from scratch
+ir update notes --force      # rebuilds entire index
+
+# Check what changed (see the summary)
+ir update notes
+# Output: "2 added, 1 updated, 0 deactivated"
+```
+
+**Embedding operations:**
+
+```bash
+# Incremental embedding (only new/changed documents)
+ir embed                     # embeds unembedded content
+ir embed notes               # specific collection
+
+# Force re-embedding everything
+ir embed notes --force       # re-computes all vectors
+```
+
+**Performance characteristics:**
+
+- Initial indexing: fast (no models, pure text extraction)
+- Incremental updates: only processes changed files
+- Hash comparison: instant even for thousands of files
+- Embedding: slow first time, fast incremental updates
+
+**Example workflow:**
+
+```bash
+# Monday: initial setup
+ir collection add notes ~/notes
+ir update notes              # indexes 500 files
+ir embed notes               # computes 500 embeddings (slow)
+
+# Tuesday: added 3 files, modified 2
+ir update notes              # Output: "3 added, 2 updated, 0 deactivated"
+ir embed notes               # only embeds 5 documents (fast)
+
+# Wednesday: deleted 1 file
+ir update notes              # Output: "0 added, 0 updated, 1 deactivated"
+# No embedding needed for deletions
+```
+
+The incremental approach means you can run `ir update` frequently without performance penalty — only changed content is processed.
+
+</details>
+
+<details>
 <summary><strong>MCP server — Claude Desktop / Claude Code</strong></summary>
 
 `ir mcp` runs a Model Context Protocol server so Claude can search your indexed documents directly.
