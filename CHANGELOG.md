@@ -1,5 +1,17 @@
 ## [Unreleased]
 
+### Features
+
+- `-f/--filter "FIELD OP VALUE"` on `ir search`: general structured filter supporting built-in fields (`path`, `modified_at`, `created_at`) and YAML frontmatter fields (`meta.<name>`). Operators: `=`, `!=`, `>`, `>=`, `<`, `<=`, `~` (contains), `!~` (not-contains). Multiple `-f` flags are ANDed. Date values are normalized to UTC RFC3339. Applied at all three search pipeline tiers so each exit point returns correctly filtered results.
+- MCP `search` tool gains a structured `filter` array (`[{field, op, value}]`) with full JSON schema — LLM clients see typed enum choices for operators.
+- Frontmatter metadata indexed into a new `document_metadata` table at `ir update` time; supports all scalar values, tag arrays (one row per element), and nested keys.
+
+### Breaking
+
+- `--modified-after` / `--modified-before` CLI flags removed (were unreleased). Use `-f "modified_at>=YYYY-MM-DD"` and `-f "modified_at<=YYYY-MM-DD"`.
+- MCP `SearchInput.modified_after` / `modified_before` fields removed. Use `filter: [{field: "modified_at", op: ">=", value: "YYYY-MM-DD"}]`.
+- Collection DBs upgrade to schema version 2 on first use. A one-time backfill populates `document_metadata` from existing frontmatter (sub-second for <10k docs). No manual migration required.
+
 ## [0.9.0] - 2026-04-15
 
 ### Features

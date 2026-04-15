@@ -135,6 +135,12 @@ ir search "ownership" --files       # paths only
 ir search "ownership" --full        # include full document content in results
 ir search "ownership" --chunk       # include best-matching chunk text (vector results)
 ir search "ownership" --quiet       # suppress stderr (progress, logs) — for scripting
+
+# Filter by field (-f/--filter, repeatable; all clauses ANDed)
+ir search "design" -f "modified_at>=2026-01-01"
+ir search "design" -f "meta.tags=rust"
+ir search "design" -f "path~notes/"
+ir search "design" -f "modified_at>=2025-01-01" -f "meta.author=vlwkaos"
 ```
 
 **Retrieve documents:**
@@ -155,6 +161,27 @@ ir multi-get "file1.md" "file2.md" --max-chars 2000  # truncate each doc
 ```
 
 Path matching order: exact → suffix (`%/path`) → substring. Vault-root paths (where the first component matches the collection's directory name) are resolved before the normal match.
+
+**Filter syntax (`-f/--filter`):**
+
+Each clause is a string `FIELD OP VALUE`. Multiple `-f` flags are ANDed together.
+
+| Field | Description |
+|-------|-------------|
+| `path` | Document path (relative to collection root) |
+| `modified_at` | File modification time (UTC RFC3339) |
+| `created_at` | File creation time (UTC RFC3339) |
+| `meta.<name>` | Frontmatter field (e.g. `meta.tags`, `meta.author`) |
+
+| Op | Meaning |
+|----|---------|
+| `=` / `!=` | Equal / not equal (case-sensitive) |
+| `>` / `>=` / `<` / `<=` | Lexicographic compare (dates normalize to UTC RFC3339) |
+| `~` / `!~` | Contains / not-contains (case-insensitive) |
+
+Date values for `modified_at`, `created_at`, and `meta.date` are normalized to UTC RFC3339 (`YYYY-MM-DD` becomes `YYYY-MM-DDT00:00:00Z`). Multi-valued frontmatter fields (e.g. tag arrays) match if **any** element satisfies the clause — including `!=`. A doc tagged `["rust", "go"]` passes `meta.tags!=rust` because `"go"` satisfies the condition. Documents with no metadata rows always fail `meta.*` clauses.
+
+> **Note:** Collection DBs are upgraded to schema version 2 on first use after this release. The one-time backfill (populating `document_metadata` from existing frontmatter) is fast (<1s for <10k docs).
 
 **Daemon:**
 
@@ -269,11 +296,13 @@ Five tools are exposed:
 
 | Tool | Description |
 |------|-------------|
-| `search` | Hybrid BM25+vector search. Returns path, title, score, snippet. Params: `mode`, `limit`, `min_score`, `collections`, `full` (include full doc text), `include_chunk` (include best-matching chunk text). |
+| `search` | Hybrid BM25+vector search. Returns path, title, score, snippet. Params: `mode`, `limit`, `min_score`, `collections`, `full` (include full doc text), `include_chunk` (include best-matching chunk text), `filter` (array of `{field, op, value}` objects, ANDed). |
 | `get` | Retrieve document text by path (exact → suffix → substring match). Params: `collections`, `section` (heading text, case-insensitive), `offset` (char offset), `max_chars` (truncate). |
 | `multi_get` | Batch document retrieval. Params: `paths[]`, `collections`, `max_chars` (truncate each doc). Returns `found` and `not_found`. |
 | `status` | Index health — collection names, doc counts, DB sizes, daemon status. |
 | `update` | Re-index collections after file changes. Accepts `collection` and `force` params. |
+
+The `filter` array accepts structured clauses: `{"field": "modified_at", "op": ">=", "value": "2024-01-01"}`. Fields: `path`, `modified_at`, `created_at`, `meta.<name>`. Ops: `=`, `!=`, `>`, `>=`, `<`, `<=`, `~` (contains), `!~` (not-contains).
 
 **HTTP mode** (for remote access or multi-client setups):
 

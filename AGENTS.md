@@ -99,7 +99,10 @@ Recurring audit axes (auto-maintained by /good-to-go):
 - README.md + README.ko.md must both be updated for any user-facing feature (CLI flags, env vars, output formats)
 - CHANGELOG.md Unreleased section must cover: new CLI flags, env var renames/deprecations, breaking behavior changes
 - Enum variants in types.rs must be wired to a CLI flag or MCP field — check with `rg 'Variant::' src/ | grep -v test`
-- Preprocessor protocol tests must use line-flushing commands (cat, rev) not buffered ones (tr, sed, sort)
+- Preprocessor protocol tests must use `cat` only — `rev` uses full stdio buffering in pipe mode on macOS and deadlocks. `tr`, `sed`, `sort` also buffer.
 - IR_COMBINED_MODEL is the canonical combined-model env var; IR_QWEN_MODEL is a deprecated alias — do not promote the alias in new docs
-- src/search/filter.rs must have unit tests for eval_clause + match_op — these are pure functions with no DB dependency; easy to test, and zero coverage is a gap
-- FilterOp::Ne on multi-valued fields uses any-match semantics (same as all ops): `meta.tags!=rust` passes if ANY tag != "rust"; document this in README filter table, not just code comments
+- src/search/filter.rs must have unit tests for eval_clause + match_op — these are pure functions with no DB dependency; easy to test, and zero coverage is a gap [resolved v0.10.0: 9 tests added]
+- FilterOp::Ne on multi-valued fields uses any-match semantics (same as all ops): `meta.tags!=rust` passes if ANY tag != "rust"; document this in README filter table, not just code comments [resolved v0.10.0: documented in both READMEs and tested]
+- items_after_test_module: in Rust files, keep non-test items (impl fns, helper fns) BEFORE any #[cfg(test)] mod block — clippy::items_after_test_module will fail the build
+- build_query_or in db/fts.rs is dead code (suppressed); it should be wired to eval.rs for BEIR evaluation (queries are full sentences — OR semantics avoid stop-word over-matching)
+- cargo clippy --all-targets -- -D warnings must pass before release; check llm/ files for needless_borrow when updating llama.cpp bindings
