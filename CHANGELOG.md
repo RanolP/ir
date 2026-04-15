@@ -1,13 +1,15 @@
 ## [Unreleased]
 
+## [0.9.0] - 2026-04-15
+
 ### Features
 
-- `ir search --quiet` / `-q`: suppress all stderr output (progress indicators, daemon log lines). Useful for scripting. Conflicts with `--verbose`.
-- `IR_COMBINED_MODEL`: new canonical env var for the unified Qwen3.5 GGUF (replaces both expander + reranker). `IR_QWEN_MODEL` still accepted but emits a deprecation warning on load.
-- `IR_*_MODEL` env vars now accept HuggingFace repo IDs (`owner/name`) in addition to local file and directory paths. Setting e.g. `IR_EMBEDDING_MODEL=ggml-org/bge-m3-Q8_0-GGUF` downloads and caches the model automatically on first use.
-- BGE-M3 added to the auto-download registry (`ggml-org/bge-m3-Q8_0-GGUF`). Download progress is shown in the foreground terminal; the daemon loads from cache and starts instantly.
-- Download UX improved: a structured message is printed before the HF progress bar showing model name, size hint, source URL, cache location, and a tip for offline use.
-- Download errors now include actionable fixes: network retry, offline mode (`HF_HUB_OFFLINE=1`), manual download URL, and cache directory path for clearing corrupt downloads.
+- `ir search --quiet` / `-q`: suppress all stderr output (progress indicators, daemon log lines). Useful for scripting. Conflicts with `--verbose`. ([`486b360`](https://github.com/vlwkaos/ir/commit/486b360))
+- `IR_COMBINED_MODEL`: new canonical env var for the unified Qwen3.5 GGUF (replaces both expander + reranker roles). `IR_QWEN_MODEL` still accepted but emits a deprecation warning on load. ([`6524540`](https://github.com/vlwkaos/ir/commit/6524540))
+- `IR_*_MODEL` env vars now accept HuggingFace repo IDs (`owner/name`) in addition to local file and directory paths. Setting e.g. `IR_EMBEDDING_MODEL=ggml-org/bge-m3-Q8_0-GGUF` downloads and caches the model automatically on first use. ([`9325335`](https://github.com/vlwkaos/ir/commit/9325335))
+- BGE-M3 added to the auto-download registry (`ggml-org/bge-m3-Q8_0-GGUF`). Download progress shown in foreground terminal; daemon loads from cache instantly.
+- Download UX improved: structured message before HF progress bar shows model name, size hint, source URL, cache location, and offline tip.
+- Download errors now include actionable fixes: retry, `HF_HUB_OFFLINE=1`, manual download URL, cache path to clear on corruption.
 
 ### Breaking
 
