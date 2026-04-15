@@ -28,6 +28,7 @@ pub struct HybridRequest<'a> {
     pub limit: usize,
     pub min_score: Option<f64>,
     pub verbose: bool,
+    pub filter: &'a crate::types::Filter,
 }
 
 pub struct SearchOutput {
@@ -97,8 +98,18 @@ impl HybridSearch {
             log.log.push(format!("[fused] top-5 scores: [{}]", scores.join(", ")));
         }
 
-        // 2. Shortcut: fused results show clear winner → skip LLM enhancement.
-        if is_strong_signal(&fused) {
+        // Tier-1 filter: apply to fused list before strong-signal shortcut.
+        let mut fused = fused;
+        super::filter::apply(&mut fused, req.filter, dbs)?;
+
+        if fused.is_empty() {
+            log.timing("total", t_total.elapsed());
+            return Ok(SearchOutput { results: vec![], log: log.log });
+        }
+
+        // 2. Shortcut: fused results show clear winner AND post-filter count meets limit.
+        //    If filter reduced count below limit, escalate to get more candidates from expansion.
+        if is_strong_signal(&fused) && (req.filter.is_empty() || fused.len() >= req.limit) {
             let top = fused[0].score;
             let gap = fused.get(1).map(|r| top - r.score).unwrap_or(top);
             log.info(format!(
@@ -150,6 +161,10 @@ impl HybridSearch {
             fused
         };
 
+        // Tier-2 filter: after expansion+RRF, before reranker sees candidates.
+        let mut enhanced = enhanced;
+        super::filter::apply(&mut enhanced, req.filter, dbs)?;
+
         if enhanced.is_empty() {
             log.timing("total", t_total.elapsed());
             return Ok(SearchOutput { results: vec![], log: log.log });
@@ -178,14 +193,21 @@ impl HybridSearch {
 // ── Fusion strategies ─────────────────────────────────────────────────────────
 
 /// Score-based linear fusion: combined = α·vec_score + (1-α)·bm25_score.
-/// Retrieves limit*3 candidates from each list to improve recall before re-ranking.
+/// Retrieves limit*fetch_multiplier candidates to improve recall; over-fetches when filter active.
 fn score_fusion_two_list(
     dbs: &[CollectionDb],
     embedder: &Embedder,
     req: &HybridRequest,
     log: &mut Logger,
 ) -> Result<Vec<SearchResult>> {
-    let fetch_n = req.limit * 3;
+    let fetch_n = if req.filter.is_empty() {
+        req.limit * 3
+    } else {
+        (req.limit * super::filter::over_fetch_multiplier(req.filter)).clamp(50, 500)
+    };
+    if log.verbose {
+        log.log.push(format!("[filter] prefetch={fetch_n}"));
+    }
     // Log preprocessor chain usage for each collection.
     if log.verbose {
         for db in dbs {
@@ -234,7 +256,7 @@ fn score_fusion_two_list(
         .collect();
 
     SearchResult::sort_desc(&mut merged);
-    merged.truncate(req.limit * 2);
+    merged.truncate(fetch_n); // keep over-fetched count; tier-1 filter will reduce further
     log.timing("fusion", t0.elapsed());
     Ok(merged)
 }
@@ -268,9 +290,15 @@ fn rrf_from_subqueries(
         })
         .collect();
 
+    let fetch_n = if req.filter.is_empty() {
+        req.limit * 2
+    } else {
+        (req.limit * super::filter::over_fetch_multiplier(req.filter)).clamp(50, 500)
+    };
+
     // BM25 for lex sub-queries
     for sub in sub_queries.iter().filter(|s| s.kind == SubQueryKind::Lex) {
-        let results = bm25_across(dbs, &sub.text, req.limit * 2)?;
+        let results = bm25_across(dbs, &sub.text, fetch_n)?;
         if !results.is_empty() {
             ranked_lists.push(RankedList {
                 results,
@@ -292,7 +320,7 @@ fn rrf_from_subqueries(
 
         let t0 = Instant::now();
         for (emb, &(_, weight)) in embeddings.iter().zip(&vec_subs) {
-            let results = vec_across(dbs, emb, req.limit * 2)?;
+            let results = vec_across(dbs, emb, fetch_n)?;
             if !results.is_empty() {
                 ranked_lists.push(RankedList { results, weight });
             }
@@ -313,7 +341,7 @@ fn rrf_from_subqueries(
     }
 
     let t0 = Instant::now();
-    let result = rrf::fuse(&ranked_lists, req.limit * 2);
+    let result = rrf::fuse(&ranked_lists, fetch_n);
     log.timing("fusion", t0.elapsed());
     Ok(result)
 }
@@ -339,7 +367,6 @@ fn bm25_across(dbs: &[CollectionDb], query: &str, limit: usize) -> Result<Vec<Se
         .collect::<Result<Vec<Vec<_>>>>()
         .map(|vv| vv.into_iter().flatten().collect())
 }
-
 
 fn vec_across(dbs: &[CollectionDb], embedding: &[f32], limit: usize) -> Result<Vec<SearchResult>> {
     dbs.iter()
@@ -456,14 +483,14 @@ fn rerank(
         let mut new_entries: HashMap<&str, Vec<(String, f64)>> = HashMap::new();
 
         for (j, &i) in uncached_indices.iter().enumerate() {
-            if texts[j].is_some() {
-                if let Some(&score) = scores.get(j) {
-                    rerank_scores[i] = Some(score);
-                    new_entries
-                        .entry(to_rerank[i].collection.as_str())
-                        .or_default()
-                        .push((cache_keys[i].clone(), score));
-                }
+            if texts[j].is_some()
+                && let Some(&score) = scores.get(j)
+            {
+                rerank_scores[i] = Some(score);
+                new_entries
+                    .entry(to_rerank[i].collection.as_str())
+                    .or_default()
+                    .push((cache_keys[i].clone(), score));
             }
         }
 

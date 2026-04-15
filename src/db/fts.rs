@@ -11,6 +11,51 @@ fn fts5_escape(s: &str) -> String {
     s.replace('"', "\"\"")
 }
 
+/// Build an FTS5 query for evaluation / recall mode.
+/// Identical tokenization to `build_query` but positive terms are ORed, not ANDed.
+/// Required for BEIR-style evaluation where queries are full questions — AND semantics
+/// force all stop words to match and nearly nothing passes.
+#[allow(dead_code)] // ^ wired to eval.rs in a future pass
+pub fn build_query_or(input: &str) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let mut neg_parts: Vec<String> = Vec::new();
+
+    let mut chars = input.chars().peekable();
+    while let Some(&ch) = chars.peek() {
+        match ch {
+            ' ' | '\t' => { chars.next(); }
+            '-' => {
+                chars.next();
+                let term = read_term(&mut chars);
+                if !term.is_empty() {
+                    neg_parts.push(format!("NOT \"{}\"", fts5_escape(&term)));
+                }
+            }
+            '"' => {
+                chars.next();
+                let phrase: String = chars.by_ref().take_while(|&c| c != '"').collect();
+                if !phrase.is_empty() {
+                    parts.push(format!("\"{}\"", fts5_escape(&phrase)));
+                }
+            }
+            _ => {
+                let term = read_term(&mut chars);
+                if !term.is_empty() {
+                    parts.push(format!("\"{}\"*", fts5_escape(&term)));
+                }
+            }
+        }
+    }
+
+    let pos = parts.join(" OR ");
+    if neg_parts.is_empty() {
+        pos
+    } else {
+        let neg = neg_parts.join(" ");
+        if pos.is_empty() { neg } else { format!("{pos} {neg}") }
+    }
+}
+
 /// Build an FTS5 query from user input.
 /// - bare terms become prefix matches: `"term"*`
 /// - "quoted phrases" stay as exact: `"phrase"`
@@ -87,68 +132,6 @@ pub struct BM25Query<'a> {
     pub title_weight: Option<f64>,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn bare_terms_become_prefix_and() {
-        let q = build_query("rust memory");
-        assert!(q.contains("\"rust\"*"), "expected prefix match for 'rust'");
-        assert!(
-            q.contains("\"memory\"*"),
-            "expected prefix match for 'memory'"
-        );
-        assert!(q.contains(" AND "), "terms should be ANDed");
-    }
-
-    #[test]
-    fn quoted_phrase_stays_exact() {
-        assert_eq!(build_query("\"exact phrase\""), "\"exact phrase\"");
-    }
-
-    #[test]
-    fn negation_produces_not() {
-        let q = build_query("good -bad");
-        assert!(q.contains("\"good\"*"));
-        assert!(q.contains("NOT \"bad\""));
-    }
-
-    #[test]
-    fn empty_and_whitespace_return_empty() {
-        assert_eq!(build_query(""), "");
-        assert_eq!(build_query("   "), "");
-    }
-
-    #[test]
-    fn embedded_quote_is_escaped() {
-        // A bare term containing `"` must not break FTS5 query syntax.
-        // read_term stops at whitespace, so `rust"lang` becomes a single token.
-        let q = build_query("rust\"lang");
-        assert!(
-            q.contains("\"rust\"\"lang\"*"),
-            "inner quote must be doubled: {q}"
-        );
-
-        // Same for negated terms.
-        let q2 = build_query("-bad\"actor");
-        assert!(
-            q2.contains("NOT \"bad\"\"actor\""),
-            "negated inner quote must be doubled: {q2}"
-        );
-    }
-
-    #[test]
-    fn normalize_maps_negative_fts5_scores() {
-        // FTS5 raw score -1.0 → pos=1.0 → 1/(1+1) = 0.5
-        assert!((normalize(-1.0) - 0.5).abs() < 1e-10);
-        // Large negative score → approaches 1.0
-        assert!(normalize(-1000.0) > 0.999);
-        // Zero → 0.0
-        assert_eq!(normalize(0.0), 0.0);
-    }
-}
-
 pub fn search(conn: &Connection, q: &BM25Query) -> Result<Vec<SearchResult>> {
     let fts = &q.fts_query;
     if fts.is_empty() {
@@ -217,4 +200,66 @@ fn collect_search_rows(
         });
     }
     Ok(results)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bare_terms_become_prefix_and() {
+        let q = build_query("rust memory");
+        assert!(q.contains("\"rust\"*"), "expected prefix match for 'rust'");
+        assert!(
+            q.contains("\"memory\"*"),
+            "expected prefix match for 'memory'"
+        );
+        assert!(q.contains(" AND "), "terms should be ANDed");
+    }
+
+    #[test]
+    fn quoted_phrase_stays_exact() {
+        assert_eq!(build_query("\"exact phrase\""), "\"exact phrase\"");
+    }
+
+    #[test]
+    fn negation_produces_not() {
+        let q = build_query("good -bad");
+        assert!(q.contains("\"good\"*"));
+        assert!(q.contains("NOT \"bad\""));
+    }
+
+    #[test]
+    fn empty_and_whitespace_return_empty() {
+        assert_eq!(build_query(""), "");
+        assert_eq!(build_query("   "), "");
+    }
+
+    #[test]
+    fn embedded_quote_is_escaped() {
+        // A bare term containing `"` must not break FTS5 query syntax.
+        // read_term stops at whitespace, so `rust"lang` becomes a single token.
+        let q = build_query("rust\"lang");
+        assert!(
+            q.contains("\"rust\"\"lang\"*"),
+            "inner quote must be doubled: {q}"
+        );
+
+        // Same for negated terms.
+        let q2 = build_query("-bad\"actor");
+        assert!(
+            q2.contains("NOT \"bad\"\"actor\""),
+            "negated inner quote must be doubled: {q2}"
+        );
+    }
+
+    #[test]
+    fn normalize_maps_negative_fts5_scores() {
+        // FTS5 raw score -1.0 → pos=1.0 → 1/(1+1) = 0.5
+        assert!((normalize(-1.0) - 0.5).abs() < 1e-10);
+        // Large negative score → approaches 1.0
+        assert!(normalize(-1000.0) > 0.999);
+        // Zero → 0.0
+        assert_eq!(normalize(0.0), 0.0);
+    }
 }

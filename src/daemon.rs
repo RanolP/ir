@@ -44,6 +44,9 @@ pub struct DaemonRequest {
     pub mode: String,
     #[serde(default)]
     pub verbose: bool,
+    /// Structured filter clauses (AND semantics). Older clients omit this field → empty filter.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub filter: Vec<crate::types::FilterClause>,
 }
 
 fn default_limit() -> usize { 10 }
@@ -89,6 +92,7 @@ fn open_lock_file() -> Result<std::fs::File> {
     std::fs::OpenOptions::new()
         .create(true)
         .write(true)
+        .truncate(false)
         .open(config::daemon_lock_path())
         .map_err(Error::Io)
 }
@@ -517,6 +521,8 @@ fn handle_request(
         })
         .collect::<Result<Vec<_>>>()?;
 
+    let filter = crate::types::Filter::from_clauses(req.filter);
+
     let (results, log) = match mode {
         SearchMode::Hybrid => {
             let r = search::hybrid::HybridRequest {
@@ -524,6 +530,7 @@ fn handle_request(
                 limit: req.limit,
                 min_score: req.min_score,
                 verbose: req.verbose,
+                filter: &filter,
             };
             let out = hybrid.search(&dbs, &r)?;
             (out.results, out.log)
@@ -534,7 +541,10 @@ fn handle_request(
                 limit: req.limit,
                 min_score: req.min_score,
             };
-            (search::vector::search(&hybrid.embedder, &dbs, &r)?, vec![])
+            let mut results = search::vector::search(&hybrid.embedder, &dbs, &r)?;
+            search::filter::apply(&mut results, &filter, &dbs)?;
+            results.truncate(req.limit);
+            (results, vec![])
         }
         SearchMode::Bm25 => {
             let r = search::fan_out::SearchRequest {
@@ -542,7 +552,9 @@ fn handle_request(
                 limit: req.limit,
                 min_score: req.min_score,
             };
-            (search::fan_out::bm25(&dbs, &r)?, vec![])
+            let mut results = search::fan_out::bm25(&dbs, &r)?;
+            search::filter::apply(&mut results, &filter, &dbs)?;
+            (results, vec![])
         }
     };
 
@@ -568,7 +580,7 @@ pub fn stop() -> Result<()> {
         // Tier-1 may be up (socket bound) but tier-2 still loading (no PID yet).
         if sock_path.exists() {
             let _ = std::fs::remove_file(&sock_path);
-            let _ = std::fs::remove_file(&config::daemon_tier2_path());
+            let _ = std::fs::remove_file(config::daemon_tier2_path());
             eprintln!("daemon stopping (tier-2 still loading, socket removed)");
         } else {
             eprintln!("daemon not running (no pid file)");
@@ -594,7 +606,7 @@ pub fn stop() -> Result<()> {
 
     let _ = std::fs::remove_file(&pid_path);
     let _ = std::fs::remove_file(&sock_path);
-    let _ = std::fs::remove_file(&config::daemon_tier2_path());
+    let _ = std::fs::remove_file(config::daemon_tier2_path());
     eprintln!("daemon stopped (pid {pid})");
     Ok(())
 }

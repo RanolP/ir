@@ -12,6 +12,10 @@ pub struct ScannedFile {
     pub abs_path: PathBuf,
     /// Path relative to the collection root.
     pub rel_path: String,
+    /// Filesystem modification time, or None if unavailable.
+    pub mtime: Option<std::time::SystemTime>,
+    /// Filesystem creation/birth time. Not available on all Linux filesystems; falls back to mtime.
+    pub birthtime: Option<std::time::SystemTime>,
 }
 
 pub fn scan(collection: &Collection) -> Result<Vec<ScannedFile>> {
@@ -57,7 +61,10 @@ pub fn scan(collection: &Collection) -> Result<Vec<ScannedFile>> {
                 .unwrap_or(&abs_path)
                 .to_string_lossy()
                 .into_owned();
-            files.push(ScannedFile { abs_path, rel_path });
+            let meta = entry.metadata().ok();
+            let mtime = meta.as_ref().and_then(|m| m.modified().ok());
+            let birthtime = meta.as_ref().and_then(|m| m.created().ok());
+            files.push(ScannedFile { abs_path, rel_path, mtime, birthtime });
         }
     }
 

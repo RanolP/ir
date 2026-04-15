@@ -87,19 +87,31 @@ pub fn update(
     let scanned_files = scanner::scan(collection)?;
     let pb = new_progress_bar(scanned_files.len() as u64);
 
-    // 3. Hash scanned files: {rel_path → (hash, content_bytes)}
-    let mut scanned: HashMap<String, (String, Vec<u8>)> =
+    // 3. Hash scanned files: {rel_path → (hash, content_bytes, mtime_rfc3339, birthtime_rfc3339)}
+    let mut scanned: HashMap<String, (String, Vec<u8>, String, String)> =
         HashMap::with_capacity(scanned_files.len());
     for f in &scanned_files {
         let content = std::fs::read(&f.abs_path)?;
         let hash = hasher::hash_bytes(&content);
-        scanned.insert(f.rel_path.clone(), (hash, content));
+        // ^ use filesystem timestamps so date filters work correctly.
+        //   birthtime falls back to mtime on Linux filesystems that don't track it.
+        let now = Utc::now();
+        let mtime = f.mtime
+            .map(chrono::DateTime::<Utc>::from)
+            .unwrap_or(now);
+        let birthtime = f.birthtime
+            .map(chrono::DateTime::<Utc>::from)
+            .unwrap_or(mtime);
+        scanned.insert(
+            f.rel_path.clone(),
+            (hash, content, mtime.to_rfc3339(), birthtime.to_rfc3339()),
+        );
     }
 
     // 4. Compute diff — pass hash-only view
     let hash_only: HashMap<String, String> = scanned
         .iter()
-        .map(|(path, (hash, _))| (path.clone(), hash.clone()))
+        .map(|(path, (hash, _, _, _))| (path.clone(), hash.clone()))
         .collect();
     let d = diff::compute(&hash_only, &stored);
     let (n_add, n_update, n_deactivate) =
@@ -143,35 +155,33 @@ pub fn update(
 
         // 6. Add new files
         for rel_path in &d.to_add {
-            let (hash, content) = scanned
+            let (hash, content, file_mtime, file_birthtime) = scanned
                 .get(rel_path)
                 .ok_or_else(|| crate::error::Error::Other(format!("missing scan entry: {rel_path}")))?;
             let raw_text = String::from_utf8_lossy(content).into_owned();
             let text = raw_text.replace("\r\n", "\n");
             let title = chunker::extract_title(&text, rel_path);
-            let now = Utc::now().to_rfc3339();
 
-            store_document(conn, rel_path, &title, hash, &text, &now, &now, chain.as_mut())?;
+            store_document(conn, rel_path, &title, hash, &text, file_birthtime, file_mtime, chain.as_mut())?;
             pb.inc(1);
             pb.set_message(format!("add {rel_path}"));
         }
 
         // 7. Update changed files
         for rel_path in &d.to_update {
-            let (hash, content) = scanned
+            let (hash, content, file_mtime, _file_birthtime) = scanned
                 .get(rel_path)
                 .ok_or_else(|| crate::error::Error::Other(format!("missing scan entry: {rel_path}")))?;
             let raw_text = String::from_utf8_lossy(content).into_owned();
             let text = raw_text.replace("\r\n", "\n");
             let title = chunker::extract_title(&text, rel_path);
-            let now = Utc::now().to_rfc3339();
             let created_at: String = conn
                 .query_row(
                     "SELECT created_at FROM documents WHERE path = ?1",
                     [rel_path],
                     |row| row.get(0),
                 )
-                .unwrap_or_else(|_| now.clone());
+                .unwrap_or_else(|_| file_mtime.clone());
 
             if has_preprocessor {
                 // ! Triggers disabled — must manually remove from FTS before delete.
@@ -185,7 +195,8 @@ pub fn update(
                 }
             }
             conn.execute("DELETE FROM documents WHERE path = ?1", [rel_path])?;
-            store_document(conn, rel_path, &title, hash, &text, &created_at, &now, chain.as_mut())?;
+            // ^ ON DELETE CASCADE removes document_metadata rows for this document
+            store_document(conn, rel_path, &title, hash, &text, &created_at, file_mtime, chain.as_mut())?;
             pb.inc(1);
             pb.set_message(format!("update {rel_path}"));
         }
@@ -204,6 +215,7 @@ pub fn update(
     Ok((n_add, n_update, n_deactivate))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn store_document(
     conn: &rusqlite::Connection,
     rel_path: &str,
@@ -226,16 +238,28 @@ fn store_document(
         rusqlite::params![rel_path, title, hash, created_at, modified_at],
     )?;
 
-    // When chain is active, triggers are disabled — explicitly insert preprocessed text into FTS.
-    if let Some(chain) = chain {
-        if chain.is_active() {
-            let rowid = conn.last_insert_rowid();
-            let processed = chain.process_text(text)?;
+    let doc_id = conn.last_insert_rowid();
+
+    // Extract and store frontmatter metadata
+    if let Some(mapping) = chunker::extract_frontmatter(text) {
+        for (key, value) in chunker::flatten_frontmatter(&mapping) {
             conn.execute(
-                "INSERT INTO documents_fts(rowid, path, title, body) VALUES (?1, ?2, ?3, ?4)",
-                rusqlite::params![rowid, rel_path, title, processed],
+                "INSERT OR IGNORE INTO document_metadata (document_id, key, value) \
+                 VALUES (?1, ?2, ?3)",
+                rusqlite::params![doc_id, key, value],
             )?;
         }
+    }
+
+    // When chain is active, triggers are disabled — explicitly insert preprocessed text into FTS.
+    if let Some(chain) = chain
+        && chain.is_active()
+    {
+        let processed = chain.process_text(text)?;
+        conn.execute(
+            "INSERT INTO documents_fts(rowid, path, title, body) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![doc_id, rel_path, title, processed],
+        )?;
     }
 
     Ok(())

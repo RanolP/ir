@@ -4,7 +4,7 @@
 use crate::error::Result;
 use rusqlite::Connection;
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 pub fn init(conn: &Connection, collection_name: &str, has_preprocessor: bool) -> Result<()> {
     conn.execute_batch(include_str!("schema_base.sql"))?;
@@ -20,8 +20,28 @@ pub fn init(conn: &Connection, collection_name: &str, has_preprocessor: bool) ->
         conn.execute_batch(include_str!("schema_triggers.sql"))?;
     }
 
+    // Bootstrap version to 0 for brand-new DBs (so migration check is uniform)
     conn.execute(
-        "INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', ?1)",
+        "INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', '0')",
+        [],
+    )?;
+
+    let current_version: i64 = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'schema_version'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+
+    if current_version < 2 {
+        migrate_v1_to_v2(conn)?;
+    }
+
+    conn.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', ?1)",
         [SCHEMA_VERSION.to_string()],
     )?;
     conn.execute(
@@ -32,5 +52,37 @@ pub fn init(conn: &Connection, collection_name: &str, has_preprocessor: bool) ->
         "INSERT OR REPLACE INTO meta (key, value) VALUES ('has_preprocessor', ?1)",
         [if has_preprocessor { "1" } else { "0" }],
     )?;
+    Ok(())
+}
+
+/// Backfill `document_metadata` from YAML frontmatter stored in `content.doc`.
+/// Idempotent via `INSERT OR IGNORE`; safe to re-run.
+fn migrate_v1_to_v2(conn: &Connection) -> Result<()> {
+    // Collect active document IDs + content before opening the write transaction
+    // (rusqlite can't run a SELECT iterator and INSERT statements on the same connection simultaneously).
+    let docs: Vec<(i64, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT d.id, c.doc \
+             FROM documents d \
+             JOIN content c ON d.hash = c.hash \
+             WHERE d.active = 1",
+        )?;
+        stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+    };
+
+    // document_metadata table already created by schema_base.sql (CREATE TABLE IF NOT EXISTS)
+    let tx = conn.unchecked_transaction()?;
+    for (doc_id, content) in &docs {
+        let Some(mapping) = crate::frontmatter::extract(content) else { continue };
+        for (key, value) in crate::frontmatter::flatten(&mapping) {
+            tx.execute(
+                "INSERT OR IGNORE INTO document_metadata (document_id, key, value) \
+                 VALUES (?1, ?2, ?3)",
+                rusqlite::params![doc_id, key, value],
+            )?;
+        }
+    }
+    tx.commit()?;
     Ok(())
 }

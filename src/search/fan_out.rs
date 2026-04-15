@@ -39,6 +39,33 @@ pub fn bm25(dbs: &[CollectionDb], req: &SearchRequest) -> Result<Vec<SearchResul
     merge_and_filter(results, req)
 }
 
+fn merge_and_filter(
+    result_sets: Vec<Vec<SearchResult>>,
+    req: &SearchRequest,
+) -> Result<Vec<SearchResult>> {
+    let mut merged: Vec<SearchResult> = result_sets.into_iter().flatten().collect();
+
+    // Sort by score descending.
+    SearchResult::sort_desc(&mut merged);
+
+    // Apply min_score filter.
+    if let Some(min) = req.min_score {
+        merged.retain(|r| r.score >= min);
+    }
+
+    // Deduplicate by (collection, path) — take best score.
+    merged.dedup_by(|a, b| {
+        if a.collection == b.collection && a.path == b.path {
+            // b has higher score (we sorted desc), keep b
+            true
+        } else {
+            false
+        }
+    });
+
+    merged.truncate(req.limit);
+    Ok(merged)
+}
 
 #[cfg(test)]
 mod tests {
@@ -123,32 +150,4 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].collection, "col_b");
     }
-}
-
-fn merge_and_filter(
-    result_sets: Vec<Vec<SearchResult>>,
-    req: &SearchRequest,
-) -> Result<Vec<SearchResult>> {
-    let mut merged: Vec<SearchResult> = result_sets.into_iter().flatten().collect();
-
-    // Sort by score descending.
-    SearchResult::sort_desc(&mut merged);
-
-    // Apply min_score filter.
-    if let Some(min) = req.min_score {
-        merged.retain(|r| r.score >= min);
-    }
-
-    // Deduplicate by (collection, path) — take best score.
-    merged.dedup_by(|a, b| {
-        if a.collection == b.collection && a.path == b.path {
-            // b has higher score (we sorted desc), keep b
-            true
-        } else {
-            false
-        }
-    });
-
-    merged.truncate(req.limit);
-    Ok(merged)
 }

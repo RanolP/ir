@@ -53,7 +53,18 @@ CREATE TABLE IF NOT EXISTS meta (
     value TEXT NOT NULL
 );
 
+-- Frontmatter key-value metadata extracted at index time.
+-- One row per (document, key, value); multi-valued fields (e.g. tags) have one row per element.
+-- ON DELETE CASCADE: rows are removed automatically when the parent document is deleted.
+CREATE TABLE IF NOT EXISTS document_metadata (
+    document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    key         TEXT NOT NULL,
+    value       TEXT NOT NULL,
+    PRIMARY KEY (document_id, key, value)
+);
+
 -- Indexes
 CREATE INDEX IF NOT EXISTS idx_documents_hash   ON documents (hash);
 CREATE INDEX IF NOT EXISTS idx_documents_active ON documents (active);
 CREATE INDEX IF NOT EXISTS idx_content_vectors_hash ON content_vectors (hash);
+CREATE INDEX IF NOT EXISTS idx_document_metadata_key_value ON document_metadata (key, value);

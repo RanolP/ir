@@ -73,6 +73,12 @@ pub enum Command {
         /// Suppress all stderr output (progress, logs)
         #[arg(long, short = 'q', conflicts_with = "verbose")]
         quiet: bool,
+        /// Filter clause: FIELD OP VALUE (repeatable; clauses are ANDed).
+        /// Fields: path, modified_at, created_at, meta.<name>
+        /// Ops: =, !=, >, >=, <, <=, ~ (contains), !~ (not-contains)
+        /// Dates normalized to UTC RFC3339. Example: -f "modified_at>=2024-01-01"
+        #[arg(short = 'f', long = "filter", action = clap::ArgAction::Append, value_name = "CLAUSE")]
+        filter: Vec<String>,
     },
     /// Retrieve a document by path
     Get {

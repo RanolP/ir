@@ -30,6 +30,18 @@ type IrResult<T> = std::result::Result<T, crate::error::Error>;
 
 // ── tool input types ──────────────────────────────────────────────────────────
 
+/// A single filter predicate for the search tool.
+/// Use multiple clauses (all ANDed) via the `filter` array on SearchInput.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct FilterClauseInput {
+    /// Field to filter on: path, modified_at, created_at, or meta.<name> (e.g. meta.tags)
+    field: String,
+    /// Comparison operator
+    op: crate::types::FilterOp,
+    /// Value to compare against. Dates for modified_at/created_at/meta.date accept YYYY-MM-DD or RFC3339.
+    value: String,
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 struct SearchInput {
     /// Search query text
@@ -46,6 +58,10 @@ struct SearchInput {
     full: Option<bool>,
     /// Include best-matching chunk text in results (vector results only; ignored for BM25-only results)
     include_chunk: Option<bool>,
+    /// Filter clauses (ANDed). Fields: path, modified_at, created_at, meta.<name>.
+    /// Ops: =, !=, >, >=, <, <=, ~ (contains), !~ (not-contains).
+    /// Example: [{"field":"modified_at","op":">=","value":"2024-01-01"},{"field":"meta.tags","op":"=","value":"rust"}]
+    filter: Option<Vec<FilterClauseInput>>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -126,16 +142,23 @@ impl IrMcpServer {
         Returns ranked results with file path, title, relevance score, and a text snippet. \
         Set full=true to include full document text inline. \
         Set include_chunk=true to include the best-matching chunk text inline (vector results only). \
-        Use get or multi_get to retrieve full document text by path.")]
+        Use get or multi_get to retrieve full document text by path. \
+        Use filter to narrow results by metadata: fields path, modified_at, created_at, meta.<name>; \
+        ops =, !=, >, >=, <, <=, ~ (contains), !~ (not-contains); multiple clauses are ANDed.")]
     async fn search(&self, params: Parameters<SearchInput>) -> Result<String, String> {
-        let SearchInput { query, mode, limit, min_score, collections, full, include_chunk } = params.0;
+        let SearchInput { query, mode, limit, min_score, collections, full, include_chunk, filter } = params.0;
         let mode = mode.unwrap_or_else(|| "hybrid".to_string());
         let limit = limit.unwrap_or(10);
         let collections = collections.unwrap_or_default();
         let full = full.unwrap_or(false);
         let include_chunk = include_chunk.unwrap_or(false);
+        let filter = crate::types::Filter::from_clauses(
+            filter.unwrap_or_default().into_iter()
+                .map(|c| crate::types::FilterClause { field: c.field, op: c.op, value: c.value })
+                .collect()
+        );
         spawn_tool(move || {
-            let mut results = crate::search_core(&query, &mode, limit, min_score, &collections, crate::types::Verbosity::Quiet)?;
+            let mut results = crate::search_core(&query, &mode, limit, min_score, &collections, crate::types::Verbosity::Quiet, filter)?;
             if full && !results.is_empty() {
                 fill_results_content(&mut results)?;
             } else if include_chunk {

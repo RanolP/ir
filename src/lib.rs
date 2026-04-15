@@ -2,6 +2,7 @@
 pub mod config;
 pub mod db;
 pub mod error;
+pub(crate) mod frontmatter;
 pub mod get;
 pub mod index;
 pub mod llm;

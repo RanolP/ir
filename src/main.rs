@@ -3,6 +3,7 @@ mod config;
 mod daemon;
 mod db;
 mod error;
+mod frontmatter;
 mod get;
 mod index;
 mod llm;
@@ -47,20 +48,24 @@ fn run() -> Result<()> {
             files,
             verbose,
             quiet,
-        } => handle_search(
-            query.join(" "),
-            mode,
-            if all { crate::db::vectors::KNN_MAX } else { limit },
-            min_score,
-            collections,
-            full,
-            chunk,
-            json,
-            csv,
-            md,
-            files,
-            if verbose { types::Verbosity::Verbose } else if quiet { types::Verbosity::Quiet } else { types::Verbosity::Normal },
-        ),
+            filter,
+        } => {
+            handle_search(
+                query.join(" "),
+                mode,
+                if all { crate::db::vectors::KNN_MAX } else { limit },
+                min_score,
+                collections,
+                full,
+                chunk,
+                json,
+                csv,
+                md,
+                files,
+                if verbose { types::Verbosity::Verbose } else if quiet { types::Verbosity::Quiet } else { types::Verbosity::Normal },
+                filter,
+            )
+        }
         Command::Get { target, collections, section, offset, max_chars, json } => {
             handle_get(target, collections, section, offset, max_chars, json)
         }
@@ -299,6 +304,7 @@ pub(crate) fn search_core(
     min_score: Option<f64>,
     collection_filter: &[String],
     verbosity: types::Verbosity,
+    filter: types::Filter,
 ) -> Result<Vec<types::SearchResult>> {
     llm::download::prepare_model_envs()?;
 
@@ -317,14 +323,33 @@ pub(crate) fn search_core(
         })
         .collect::<Result<Vec<_>>>()?;
 
-    let bm25_req = search::fan_out::SearchRequest { query, limit, min_score };
-    let bm25_results = search::fan_out::bm25(&dbs, &bm25_req)?;
+    // Tier-0: BM25 with over-fetch when filter is active
+    let fetch_limit = if filter.is_empty() {
+        limit
+    } else {
+        (limit * search::filter::over_fetch_multiplier(&filter)).clamp(50, 500)
+    };
+
+    let bm25_req = search::fan_out::SearchRequest {
+        query,
+        limit: fetch_limit,
+        min_score: None, // ^ applied after tier-0 filter below
+    };
+    let mut bm25_results = search::fan_out::bm25(&dbs, &bm25_req)?;
+
+    // Tier-0 filter: apply before BM25 strong-signal check
+    search::filter::apply(&mut bm25_results, &filter, &dbs)?;
+    if let Some(min) = min_score {
+        bm25_results.retain(|r| r.score >= min);
+    }
+    bm25_results.truncate(limit);
 
     match search_mode {
         SearchMode::Bm25 => return Ok(bm25_results),
         SearchMode::Vector => {}
         SearchMode::Hybrid => {
-            if search::hybrid::is_bm25_strong_signal(&bm25_results) {
+            // Only shortcut if post-filter count meets limit (else escalate for more candidates)
+            if search::hybrid::is_bm25_strong_signal(&bm25_results) && (filter.is_empty() || bm25_results.len() >= limit) {
                 if !daemon::is_running() {
                     llm::download::prepare_model_envs()?;
                     let _ = daemon::start_in_background();
@@ -349,6 +374,7 @@ pub(crate) fn search_core(
         min_score,
         mode: mode.to_string(),
         verbose: verbosity.daemon_verbose(),
+        filter: filter.clauses,
     };
 
     let log_lines = |lines: &[String]| {
@@ -422,7 +448,10 @@ fn handle_search(
     md: bool,
     files: bool,
     verbosity: types::Verbosity,
+    filter_strs: Vec<String>,
 ) -> Result<()> {
+    let filter = types::Filter::parse(&filter_strs).map_err(error::Error::Other)?;
+
     let fmt = if json {
         output::Format::Json
     } else if csv {
@@ -435,7 +464,7 @@ fn handle_search(
         output::Format::Pretty
     };
 
-    let mut results = search_core(&query, &mode, limit, min_score, &collection_filter, verbosity)?;
+    let mut results = search_core(&query, &mode, limit, min_score, &collection_filter, verbosity, filter)?;
 
     if full {
         let config = Config::load()?;
@@ -457,7 +486,7 @@ fn handle_search(
         get::populate_chunk_content(&mut results)?;
     }
 
-    output::print_results(&mut results, fmt);
+    output::print_results(&results, fmt);
     Ok(())
 }
 
@@ -476,6 +505,7 @@ fn to_search_results(daemon_results: Vec<daemon::DaemonResult>) -> Vec<types::Se
         })
         .collect()
 }
+
 
 pub(crate) fn fill_content(results: &mut [types::SearchResult], dbs: &[db::CollectionDb]) {
     let db_map: std::collections::HashMap<&str, &db::CollectionDb> =
@@ -618,16 +648,16 @@ fn handle_preprocessor(cmd: PreprocessorCmd) -> Result<()> {
             let cmd = config.preprocessors.get(&alias).cloned();
             config.remove_preprocessor(&alias)?;
             config.save()?;
-            if delete {
-                if let Some(cmd_str) = cmd {
-                    let path = std::path::Path::new(&cmd_str);
-                    let preprocess_dir = config::ir_dir().join("preprocessors");
-                    if path.starts_with(&preprocess_dir) && path.is_file() {
-                        std::fs::remove_file(path).map_err(error::Error::Io)?;
-                        println!("deleted {}", path.display());
-                    } else {
-                        println!("note: '{cmd_str}' is outside the ir preprocessors dir, not deleted");
-                    }
+            if delete
+                && let Some(cmd_str) = cmd
+            {
+                let path = std::path::Path::new(&cmd_str);
+                let preprocess_dir = config::ir_dir().join("preprocessors");
+                if path.starts_with(&preprocess_dir) && path.is_file() {
+                    std::fs::remove_file(path).map_err(error::Error::Io)?;
+                    println!("deleted {}", path.display());
+                } else {
+                    println!("note: '{cmd_str}' is outside the ir preprocessors dir, not deleted");
                 }
             }
             println!("removed preprocessor '{alias}'");

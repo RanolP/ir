@@ -212,41 +212,37 @@ fn best_break(
     p
 }
 
+/// Find the YAML frontmatter block in `doc`.
+/// Returns `(yaml_content, end_byte_offset)` where `end_byte_offset` is the position
+/// in `doc` immediately after the closing frontmatter delimiter line (including its newline).
+/// Returns `None` if no valid frontmatter is found.
+pub(crate) use crate::frontmatter::extract as extract_frontmatter;
+pub(crate) use crate::frontmatter::flatten as flatten_frontmatter;
+
 /// Extract a title from the document.
 /// Priority: YAML frontmatter `title` or `name` field → first `# Heading` → first non-empty line → filename.
 pub fn extract_title(doc: &str, path_hint: &str) -> String {
-    let mut lines = doc.lines().peekable();
+    let mut body_start = 0;
 
-    // Parse YAML frontmatter
-    if lines.peek() == Some(&"---") {
-        lines.next(); // consume opening ---
-        let mut fm_title: Option<String> = None;
-        for line in lines.by_ref() {
-            if line == "---" || line == "..." {
-                break;
-            }
-            // Match `title: value` or `name: value`
-            if let Some(rest) = line
-                .strip_prefix("title:")
-                .or_else(|| line.strip_prefix("name:"))
-            {
-                let val = rest.trim().trim_matches('"').trim_matches('\'');
-                if !val.is_empty() {
-                    fm_title = Some(val.to_string());
-                    // Keep consuming until end of frontmatter
+    if let Some((yaml_block, end)) = crate::frontmatter::find_block(doc) {
+        body_start = end;
+        if let Ok(serde_yaml::Value::Mapping(m)) = serde_yaml::from_str::<serde_yaml::Value>(yaml_block) {
+            for key in ["title", "name"] {
+                let k = serde_yaml::Value::String(key.to_string());
+                if let Some(serde_yaml::Value::String(s)) = m.get(&k)
+                    && !s.is_empty()
+                {
+                    return s.clone();
                 }
             }
         }
-        if let Some(t) = fm_title {
-            return t;
-        }
-        // Fall through to scan the rest of the document for headings.
+        // Fall through to scan body for headings.
     }
 
-    for line in lines {
+    for line in doc[body_start..].lines() {
         let trimmed = line.trim();
-        if trimmed.starts_with("# ") {
-            return trimmed[2..].trim().to_string();
+        if let Some(heading) = trimmed.strip_prefix("# ") {
+            return heading.trim().to_string();
         }
         if !trimmed.is_empty() {
             return trimmed.to_string();
@@ -263,6 +259,10 @@ pub fn extract_title(doc: &str, path_hint: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    // Serialize tests that mutate the global CHUNK_SIZE_OVERRIDE_TOKENS.
+    static CHUNK_OVERRIDE_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn short_doc_is_single_chunk() {
@@ -302,6 +302,7 @@ mod tests {
 
     #[test]
     fn doc_at_chunk_size_boundary_is_single_chunk() {
+        let _lock = CHUNK_OVERRIDE_LOCK.lock().unwrap();
         // chunk_size=200 tokens=800 chars. Doc of 500 chars ≤ 800 → early-return single chunk.
         set_chunk_size_tokens_override(Some(200));
         let doc = "word ".repeat(100); // 500 chars
@@ -313,6 +314,7 @@ mod tests {
 
     #[test]
     fn rebalances_when_tail_would_be_sub_min() {
+        let _lock = CHUNK_OVERRIDE_LOCK.lock().unwrap();
         // chunk_size=200 tokens=800 chars, min=100 tokens=400 chars.
         // Doc of 1000 chars: naive split → remaining_after=200 < min(400), sub-min tail.
         // doc_tail=1000 ≥ 2*min=800 → rebalance: target pulled to 1000-400=600.
@@ -330,6 +332,7 @@ mod tests {
 
     #[test]
     fn normal_split_when_tail_is_healthy() {
+        let _lock = CHUNK_OVERRIDE_LOCK.lock().unwrap();
         // chunk_size=200 tokens=800 chars, min=400 chars.
         // Doc ~1414 chars: heading break at ~702 (section boundary).
         // remaining_after naive split ≈ 614 ≥ 400 → normal split, rebalance not triggered.
@@ -351,6 +354,7 @@ mod tests {
 
     #[test]
     fn doc_exactly_chunk_size_is_single_chunk() {
+        let _lock = CHUNK_OVERRIDE_LOCK.lock().unwrap();
         // doc.len() == chunk_size_chars triggers the early-return branch (<=).
         set_chunk_size_tokens_override(Some(100)); // 400 chars
         let doc = "x".repeat(400);
@@ -362,6 +366,7 @@ mod tests {
 
     #[test]
     fn doc_one_byte_over_chunk_size_splits() {
+        let _lock = CHUNK_OVERRIDE_LOCK.lock().unwrap();
         // doc.len() == chunk_size_chars + 1 triggers the split path.
         set_chunk_size_tokens_override(Some(100)); // 400 chars
         // Must be > 2*min_chunk_chars (800) to avoid absorb, so we need more room.
@@ -381,6 +386,7 @@ mod tests {
 
     #[test]
     fn multibyte_utf8_near_boundary_stays_valid() {
+        let _lock = CHUNK_OVERRIDE_LOCK.lock().unwrap();
         // 3-byte CJK chars; chunk boundary must land on a char boundary.
         set_chunk_size_tokens_override(Some(200)); // 800 chars
         // Each "あ" is 3 bytes but counts as 1 char in Rust str.
@@ -396,10 +402,12 @@ mod tests {
         for c in &chunks {
             assert!(std::str::from_utf8(c.text.as_bytes()).is_ok());
         }
+        set_chunk_size_tokens_override(None);
     }
 
     #[test]
     fn best_break_fallback_when_no_qualifying_break() {
+        let _lock = CHUNK_OVERRIDE_LOCK.lock().unwrap();
         // If no break point falls in [min_break_pos, target_end], best_break falls back
         // to a char boundary at target_end. Verify: doc with no semantic breaks at all
         // (continuous ASCII) still produces valid chunk boundaries.
@@ -429,6 +437,7 @@ mod tests {
         // For guard: start2 ≤ prev_start means 440-64=376 ≤ 0 → false.
         // The guard fires when rebalance target coincides exactly with the start of the last chunk.
         // Let's just verify the chunker never loops forever on any plausible config.
+        let _lock = CHUNK_OVERRIDE_LOCK.lock().unwrap();
         set_chunk_size_tokens_override(Some(120)); // 480 chars
         let doc = "word ".repeat(400); // 2000 chars
         let chunks = chunk_document(&doc);
@@ -442,6 +451,7 @@ mod tests {
 
     #[test]
     fn consecutive_headings_exactly_at_chunk_boundary() {
+        let _lock = CHUNK_OVERRIDE_LOCK.lock().unwrap();
         // Two headings back-to-back right at the target_end. The min_break_pos guard
         // (prev_end + 1) must prevent re-selecting the first heading on the overlapping chunk.
         set_chunk_size_tokens_override(Some(200)); // 800 chars
@@ -466,6 +476,7 @@ mod tests {
         // Use chunk_size=150 tokens=600 chars, min=100 tokens=400 chars, 2*min=800.
         // doc=700 chars: naive_target=600, remaining_after=100 < min(400),
         // doc_tail=700 < 2*min=800 → absorb to doc.len() → single chunk despite > chunk_size.
+        let _lock = CHUNK_OVERRIDE_LOCK.lock().unwrap();
         set_chunk_size_tokens_override(Some(150)); // 600 chars
         let doc = "x".repeat(700);
         let chunks = chunk_document(&doc);
@@ -483,6 +494,7 @@ mod tests {
 
     #[test]
     fn chunk_positions_cover_document() {
+        let _lock = CHUNK_OVERRIDE_LOCK.lock().unwrap();
         // Every byte in the doc must be covered by at least the last chunk's range.
         set_chunk_size_tokens_override(Some(200));
         let line = "The quick brown fox. ".repeat(20); // 420 chars
