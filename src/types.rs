@@ -132,6 +132,12 @@ fn parse_clause(s: &str) -> Result<FilterClause, String> {
 
     validate_field(&field)?;
     let value = normalize_filter_value(&field, value)?;
+    // Pre-lowercase for case-insensitive ops so match_op allocates only once (actual, not expected).
+    let value = if matches!(op, FilterOp::Contains | FilterOp::NotContains) {
+        value.to_ascii_lowercase()
+    } else {
+        value
+    };
 
     Ok(FilterClause { field, op, value })
 }

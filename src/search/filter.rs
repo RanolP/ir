@@ -136,10 +136,9 @@ fn match_op(actual: &str, op: FilterOp, expected: &str) -> bool {
         FilterOp::Gte => actual >= expected,
         FilterOp::Lt => actual < expected,
         FilterOp::Lte => actual <= expected,
-        FilterOp::Contains => actual.to_ascii_lowercase().contains(&expected.to_ascii_lowercase()),
-        FilterOp::NotContains => {
-            !actual.to_ascii_lowercase().contains(&expected.to_ascii_lowercase())
-        }
+        // expected is pre-lowercased at parse time (parse_clause in types.rs)
+        FilterOp::Contains => actual.to_ascii_lowercase().contains(expected),
+        FilterOp::NotContains => !actual.to_ascii_lowercase().contains(expected),
     }
 }
 
@@ -185,8 +184,9 @@ mod tests {
 
     #[test]
     fn contains_case_insensitive() {
+        // expected is pre-lowercased by parse_clause; actual is lowercased at eval time
         assert!(match_op("Rust Language", FilterOp::Contains, "rust"));
-        assert!(match_op("rust", FilterOp::Contains, "RUST"));
+        assert!(match_op("RUST", FilterOp::Contains, "rust"));
         assert!(!match_op("go", FilterOp::Contains, "rust"));
     }
 

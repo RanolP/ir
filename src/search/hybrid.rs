@@ -125,7 +125,7 @@ impl HybridSearch {
 
         // 3. LLM enhancement: expand only when reranker is also available.
         // ! Expansion without reranking is harmful (p<0.05 on NFCorpus, -0.53% nDCG).
-        let enhanced = if self.scorer.is_some() {
+        let (enhanced, expansion_ran) = if self.scorer.is_some() {
             if let Some(exp) = &self.expander {
                 let t0 = Instant::now();
                 let cached = self.expander_cache.as_ref()
@@ -150,20 +150,23 @@ impl HybridSearch {
                 let n_lex = subs.iter().filter(|s| s.kind == SubQueryKind::Lex).count();
                 log.info(format!("Searching {} sub-queries ({} lex, {} vec/hyde)...", subs.len(), n_lex, n_vec));
 
-                rrf_from_subqueries(dbs, &self.embedder, &subs, req, fused, &mut log)?
+                (rrf_from_subqueries(dbs, &self.embedder, &subs, req, fused, &mut log)?, true)
             } else {
-                fused
+                (fused, false)
             }
         } else {
             if self.expander.is_some() {
                 log.info("Skipping expansion (no reranker)");
             }
-            fused
+            (fused, false)
         };
 
-        // Tier-2 filter: after expansion+RRF, before reranker sees candidates.
+        // Tier-2 filter: only when expansion ran (RRF produces new candidates not yet filtered).
+        // When no expansion, enhanced == fused which was already filtered at tier-1.
         let mut enhanced = enhanced;
-        super::filter::apply(&mut enhanced, req.filter, dbs)?;
+        if expansion_ran {
+            super::filter::apply(&mut enhanced, req.filter, dbs)?;
+        }
 
         if enhanced.is_empty() {
             log.timing("total", t_total.elapsed());
