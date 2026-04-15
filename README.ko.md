@@ -210,6 +210,72 @@ ir daemon status
 </details>
 
 <details>
+<summary><strong>증분 인덱싱</strong></summary>
+
+IR은 SHA-256 해싱을 사용한 콘텐츠 주소 저장소를 통해 변경된 파일만 효율적으로 처리합니다.
+
+**작동 방식:**
+
+- **변경 감지**: 파일을 해시(SHA-256)하여 저장된 해시와 비교
+- **스마트 업데이트**: 수정되거나 새로운 파일만 재처리
+- **삭제 처리**: 제거된 파일은 비활성으로 표시 (소프트 삭제)
+- **중복 제거**: 컬렉션 내 동일한 콘텐츠는 저장소 공유
+
+**인덱스 작업:**
+
+```bash
+# 일반 증분 업데이트 (기본값)
+ir update                    # 모든 컬렉션
+ir update notes              # 특정 컬렉션
+
+# 처음부터 전체 재인덱싱 강제
+ir update notes --force      # 전체 인덱스 재구축
+
+# 변경 사항 확인 (요약 확인)
+ir update notes
+# 출력: "2 added, 1 updated, 0 deactivated"
+```
+
+**임베딩 작업:**
+
+```bash
+# 증분 임베딩 (새로운/변경된 문서만)
+ir embed                     # 미임베딩 콘텐츠 임베딩
+ir embed notes               # 특정 컬렉션
+
+# 전체 재임베딩 강제
+ir embed notes --force       # 모든 벡터 재계산
+```
+
+**성능 특성:**
+
+- 초기 인덱싱: 빠름 (모델 없음, 순수 텍스트 추출)
+- 증분 업데이트: 변경된 파일만 처리
+- 해시 비교: 수천 개 파일도 즉시 처리
+- 임베딩: 첫 실행은 느림, 증분 업데이트는 빠름
+
+**예제 워크플로우:**
+
+```bash
+# 월요일: 초기 설정
+ir collection add notes ~/notes
+ir update notes              # 500개 파일 인덱싱
+ir embed notes               # 500개 임베딩 계산 (느림)
+
+# 화요일: 3개 파일 추가, 2개 수정
+ir update notes              # 출력: "3 added, 2 updated, 0 deactivated"
+ir embed notes               # 5개 문서만 임베딩 (빠름)
+
+# 수요일: 1개 파일 삭제
+ir update notes              # 출력: "0 added, 0 updated, 1 deactivated"
+# 삭제에는 임베딩 불필요
+```
+
+증분 방식으로 인해 성능 저하 없이 `ir update`를 자주 실행할 수 있습니다 — 변경된 콘텐츠만 처리됩니다.
+
+</details>
+
+<details>
 <summary><strong>MCP 서버 — Claude Desktop / Claude Code</strong></summary>
 
 `ir mcp`는 Model Context Protocol 서버를 실행하여 Claude가 인덱싱된 문서를 직접 검색할 수 있게 합니다.
