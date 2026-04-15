@@ -322,7 +322,7 @@ pub fn extract_section<'a>(doc: &'a str, heading: &str) -> Option<&'a str> {
 /// - `offset=None` or `0` → start from beginning
 /// - `max_chars=None` or `0` → no limit
 /// - `offset` beyond content length → empty string
-pub fn trim_content<'a>(content: &'a str, offset: Option<usize>, max_chars: Option<usize>) -> &'a str {
+pub fn trim_content(content: &str, offset: Option<usize>, max_chars: Option<usize>) -> &str {
     let start = offset.unwrap_or(0);
     let limit = max_chars.unwrap_or(0);
 

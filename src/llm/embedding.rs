@@ -112,7 +112,7 @@ impl Embedder {
         } else {
             model_load_params()
         };
-        let model = LlamaModel::load_from_file(&backend, model_path, &params)
+        let model = LlamaModel::load_from_file(backend, model_path, &params)
             .map_err(|e| Error::Other(format!("load embedding model: {e}")))?;
         let profile = profile_for_model_path(model_path);
         Ok(Self {
@@ -218,7 +218,7 @@ impl Embedder {
         }
 
         self.model
-            .new_context(&self.backend, ctx_params)
+            .new_context(self.backend, ctx_params)
             .map_err(|e| Error::Other(format!("embedding context: {e}")))
     }
 
@@ -341,7 +341,7 @@ mod tests {
     fn embed_query_returns_unit_vector() {
         let e = Embedder::load_default().expect("load model");
         let emb = e.embed_query("test query").expect("embed");
-        assert!(emb.len() > 0);
+        assert!(!emb.is_empty());
         let mag: f32 = emb.iter().map(|x| x * x).sum::<f32>().sqrt();
         assert!((mag - 1.0).abs() < 1e-5, "not unit vector: mag={mag}");
     }
