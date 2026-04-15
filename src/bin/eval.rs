@@ -44,7 +44,9 @@ enum ExpanderFusionMode {
 struct Args {
     data_dir: PathBuf,
     cache_db: PathBuf,
-    limit: usize,
+    /// Cutoff values for nDCG and Recall (e.g. [10, 20, 100]).
+    /// BM25 always additionally computes Recall@1000.
+    at_k: Vec<usize>,
     mode: EvalMode,
     pooling: Option<EmbeddingPooling>,
     alpha: f64,
@@ -72,6 +74,10 @@ struct Args {
     rrf_no_expander: bool,
     title_weight: f64,
     preprocessor: Option<String>,
+    /// Written by compare.sh to disambiguate same-config runs across git versions.
+    version_tag: Option<String>,
+    /// Path to write JSON result file (used by compare.sh).
+    emit_json: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -84,9 +90,9 @@ enum EvalMode {
 
 fn parse_args() -> Args {
     let args: Vec<String> = std::env::args().collect();
-    let mut data_dir = PathBuf::from("test-data/nfcorpus");
-    let mut cache_db = PathBuf::from("test-data/nfcorpus-eval.sqlite");
-    let mut limit = 10;
+    let mut data_dir = PathBuf::from("test-data/fiqa");
+    let mut cache_db = PathBuf::from("test-data/fiqa-eval.sqlite");
+    let mut at_k: Vec<usize> = vec![10, 20, 100];
     let mut mode = EvalMode::All;
     let mut pooling: Option<EmbeddingPooling> = None;
     let mut alpha = DEFAULT_SCORE_FUSION_ALPHA;
@@ -114,6 +120,8 @@ fn parse_args() -> Args {
     let mut rrf_no_expander = false;
     let mut title_weight = 1.0f64;
     let mut preprocessor: Option<String> = None;
+    let mut version_tag: Option<String> = None;
+    let mut emit_json: Option<PathBuf> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -130,10 +138,23 @@ fn parse_args() -> Args {
                     cache_db = PathBuf::from(&args[i]);
                 }
             }
-            "--limit" | "-k" => {
+            "--at-k" => {
                 i += 1;
                 if i < args.len() {
-                    limit = args[i].parse().expect("--limit must be a number");
+                    at_k = args[i]
+                        .split(',')
+                        .map(|s| s.trim().parse().expect("--at-k values must be integers"))
+                        .collect();
+                    at_k.sort_unstable();
+                    at_k.dedup();
+                }
+            }
+            "--limit" | "-k" => {
+                // legacy alias: --limit 10 → same as --at-k 10
+                i += 1;
+                if i < args.len() {
+                    let k: usize = args[i].parse().expect("--limit must be a number");
+                    at_k = vec![k];
                 }
             }
             "--mode" | "-m" => {
@@ -310,9 +331,21 @@ fn parse_args() -> Args {
                     preprocessor = Some(args[i].clone());
                 }
             }
+            "--version-tag" => {
+                i += 1;
+                if i < args.len() {
+                    version_tag = Some(args[i].clone());
+                }
+            }
+            "--emit-json" => {
+                i += 1;
+                if i < args.len() {
+                    emit_json = Some(PathBuf::from(&args[i]));
+                }
+            }
             "--help" | "-h" => {
                 println!(
-                    "Usage: eval [--data DIR] [--limit K] [--mode bm25|vector|hybrid|all] \
+                    "Usage: eval [--data DIR] [--at-k 10,20,100] [--mode bm25|vector|hybrid|all] \
                      [--pooling none|mean|cls|last|rank] \
                      [--cache-db PATH] [--alpha A] [--adaptive-alpha] [--alpha-normalizer N] \
                      [--rerank] [--rerank-weight W] [--rerank-top-n N] \
@@ -320,7 +353,8 @@ fn parse_args() -> Args {
                      [--rrf-lex-weight W] [--rrf-vec-weight W] [--rrf-hyde-weight W] \
                      [--prf] [--prf-weight W] [--prf-docs N] [--prf-terms N] \
                      [--tune-alpha] [--tune-rerank] [--chunk-size TOKENS] [--max-docs N] [--max-queries N] \
-                     [--rrf-no-expander] [--title-weight W] [--preprocessor CMD]"
+                     [--rrf-no-expander] [--title-weight W] [--preprocessor CMD] \
+                     [--version-tag TAG] [--emit-json PATH]"
                 );
                 std::process::exit(0);
             }
@@ -332,7 +366,7 @@ fn parse_args() -> Args {
     Args {
         data_dir,
         cache_db,
-        limit,
+        at_k,
         mode,
         pooling,
         alpha,
@@ -360,6 +394,8 @@ fn parse_args() -> Args {
         rrf_no_expander,
         title_weight,
         preprocessor,
+        version_tag,
+        emit_json,
     }
 }
 
@@ -451,6 +487,20 @@ fn load_qrels(path: &Path) -> Result<Qrels> {
 // ── Eval cache ────────────────────────────────────────────────────────────────
 
 fn ensure_eval_cache_schema(conn: &Connection) -> Result<()> {
+    // Check if the schema uses the new ranked_ids format; if not, migrate.
+    let has_ranked_ids: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('eval_run_results') WHERE name='ranked_ids'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+        > 0;
+
+    if !has_ranked_ids {
+        conn.execute_batch("DROP TABLE IF EXISTS eval_run_results;")?;
+    }
+
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS eval_query_embeddings (
             query_id TEXT NOT NULL,
@@ -459,19 +509,19 @@ fn ensure_eval_cache_schema(conn: &Connection) -> Result<()> {
             PRIMARY KEY (query_id, model)
         );
         CREATE TABLE IF NOT EXISTS eval_run_results (
-            run_key  TEXT NOT NULL,
-            query_id TEXT NOT NULL,
-            mode     TEXT NOT NULL,
-            ndcg     REAL NOT NULL,
-            recall   REAL NOT NULL,
+            run_key    TEXT NOT NULL,
+            query_id   TEXT NOT NULL,
+            mode       TEXT NOT NULL,
+            ranked_ids TEXT NOT NULL,  -- JSON array of doc IDs, top-N in order
+            elapsed_ms REAL,           -- per-query search time (NULL if loaded from cache)
             PRIMARY KEY (run_key, query_id, mode)
         );",
     )?;
     Ok(())
 }
 
-/// Fingerprint of the config parameters that affect eval results for a given mode.
-/// Different model paths, alpha, chunk size → different run_key → separate cache entries.
+/// Fingerprint of the config + code version that affects eval results.
+/// Different model paths, alpha, chunk size, or git version → separate cache entries.
 fn eval_run_key(args: &Args) -> String {
     let embed_model = std::env::var("IR_EMBEDDING_MODEL")
         .or_else(|_| std::env::var("QMD_EMBEDDING_MODEL"))
@@ -486,10 +536,11 @@ fn eval_run_key(args: &Args) -> String {
         .or_else(|_| std::env::var("IR_QWEN_MODEL"))
         .unwrap_or_default();
     let pp = args.preprocessor.as_deref().unwrap_or("");
+    let vtag = args.version_tag.as_deref().unwrap_or("");
     format!(
         "embed={embed_model}|expander={expander_model}|reranker={reranker_model}|combined={combined_model}|\
          alpha={:.4}|chunk={:?}|rerank={},w={:.3},n={}|expander_on={}|prf={}|alpha_norm={:.3}|\
-         rrf_k={:.1},lex={:.2},vec={:.2},hyde={:.2}|title_w={:.2}|pp={pp}",
+         rrf_k={:.1},lex={:.2},vec={:.2},hyde={:.2}|title_w={:.2}|pp={pp}|vtag={vtag}",
         args.alpha,
         args.chunk_size_tokens,
         args.use_rerank,
@@ -1417,63 +1468,134 @@ fn maybe_log_query_progress(phase: &str, index: usize, total: usize) {
 
 struct EvalResult {
     mode: &'static str,
-    ndcg: f64,
-    recall: f64,
-    n_queries: usize,
-    per_query: HashMap<String, f64>, // query_id → nDCG@k
+    /// Metrics at each requested k: (k, ndcg, recall).
+    metrics: Vec<(usize, f64, f64)>,
+    per_query: HashMap<String, f64>, // query_id → nDCG@primary_k (for paired t-test)
+    /// Warm query latency stats (ms), skipping first 5 queries.
+    median_ms: Option<f64>,
+    p95_ms: Option<f64>,
 }
 
+impl EvalResult {
+    /// nDCG at the first (primary) k value.
+    fn primary_ndcg(&self) -> f64 {
+        self.metrics.first().map(|(_, n, _)| *n).unwrap_or(0.0)
+    }
+    /// Recall at the first (primary) k value.
+    fn primary_recall(&self) -> f64 {
+        self.metrics.first().map(|(_, _, r)| *r).unwrap_or(0.0)
+    }
+    fn ndcg_at(&self, k: usize) -> Option<f64> {
+        self.metrics.iter().find(|(ki, _, _)| *ki == k).map(|(_, n, _)| *n)
+    }
+    fn recall_at(&self, k: usize) -> Option<f64> {
+        self.metrics.iter().find(|(ki, _, _)| *ki == k).map(|(_, _, r)| *r)
+    }
+}
+
+/// Returns map of query_id → ranked doc IDs (JSON-decoded).
 fn load_cached_results(
     conn: &Connection,
     run_key: &str,
     mode: &str,
-) -> HashMap<String, (f64, f64)> {
+) -> HashMap<String, Vec<String>> {
     let mut map = HashMap::new();
     let mut stmt = match conn.prepare_cached(
-        "SELECT query_id, ndcg, recall FROM eval_run_results WHERE run_key = ?1 AND mode = ?2",
+        "SELECT query_id, ranked_ids FROM eval_run_results WHERE run_key = ?1 AND mode = ?2",
     ) {
         Ok(s) => s,
         Err(_) => return map,
     };
     let rows = stmt.query_map(params![run_key, mode], |r| {
-        Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?, r.get::<_, f64>(2)?))
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
     });
     if let Ok(rows) = rows {
         for row in rows.flatten() {
-            map.insert(row.0, (row.1, row.2));
+            let ranked: Vec<String> = serde_json::from_str(&row.1).unwrap_or_default();
+            map.insert(row.0, ranked);
         }
     }
     map
 }
 
-fn save_query_result(conn: &Connection, run_key: &str, query_id: &str, mode: &str, ndcg: f64, recall: f64) {
+fn save_query_result(
+    conn: &Connection,
+    run_key: &str,
+    query_id: &str,
+    mode: &str,
+    ranked_ids: &[String],
+    elapsed_ms: Option<f64>,
+) {
+    let json = serde_json::to_string(ranked_ids).unwrap_or_else(|_| "[]".to_string());
     if let Err(e) = conn.execute(
-        "INSERT OR REPLACE INTO eval_run_results (run_key, query_id, mode, ndcg, recall)
+        "INSERT OR REPLACE INTO eval_run_results (run_key, query_id, mode, ranked_ids, elapsed_ms)
          VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![run_key, query_id, mode, ndcg, recall],
+        params![run_key, query_id, mode, json, elapsed_ms],
     ) {
         eprintln!("warn: failed to cache eval result ({mode} {query_id}): {e}");
     }
+}
+
+const WARMUP: usize = 5;
+
+
+fn timing_stats(times: &[f64]) -> (Option<f64>, Option<f64>) {
+    if times.is_empty() {
+        return (None, None);
+    }
+    let mut sorted = times.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median = sorted[sorted.len() / 2];
+    let p95_idx = ((sorted.len() as f64 * 0.95) as usize).min(sorted.len() - 1);
+    let p95 = sorted[p95_idx];
+    (Some(median), Some(p95))
+}
+
+/// Accumulate per-k metric totals from a cached ranked list.
+/// `totals[i]` is (sum_ndcg, sum_recall) for at_ks[i].
+fn accumulate_metrics(
+    ranked: &[String],
+    relevant: &HashMap<String, u32>,
+    at_ks: &[usize],
+    totals: &mut Vec<(f64, f64)>,
+) {
+    for (i, &k) in at_ks.iter().enumerate() {
+        totals[i].0 += ndcg_at_k(ranked, relevant, k);
+        totals[i].1 += recall_at_k(ranked, relevant, k);
+    }
+}
+
+/// Convert accumulated totals to final per-k metric vec.
+fn finalize_metrics(totals: &[(f64, f64)], at_ks: &[usize], n: usize) -> Vec<(usize, f64, f64)> {
+    if n == 0 {
+        return at_ks.iter().map(|&k| (k, 0.0, 0.0)).collect();
+    }
+    at_ks.iter().zip(totals.iter()).map(|(&k, &(sum_n, sum_r))| {
+        (k, sum_n / n as f64, sum_r / n as f64)
+    }).collect()
 }
 
 fn evaluate_bm25(
     conn: &Connection,
     queries: &[Query],
     qrels: &Qrels,
-    k: usize,
+    at_ks: &[usize],
     run_key: &str,
     mut chain: Option<&mut PreprocessChain>,
 ) -> EvalResult {
+    let fetch_k = at_ks.iter().copied().max().unwrap_or(10).max(1000);
     let cached = load_cached_results(conn, run_key, "bm25");
     let n_cached = cached.len();
-    let (mut total_ndcg, mut total_recall, mut n) = (0.0f64, 0.0f64, 0usize);
+    let mut totals: Vec<(f64, f64)> = vec![(0.0, 0.0); at_ks.len()];
     let mut per_query: HashMap<String, f64> = HashMap::new();
+    let mut n = 0usize;
 
-    // Include cached results in totals.
-    for (qid, (ndcg, recall)) in &cached {
-        total_ndcg += ndcg;
-        total_recall += recall;
-        per_query.insert(qid.clone(), *ndcg);
+    // Accumulate cached results.
+    for (qid, ranked) in &cached {
+        let Some(relevant) = qrels.get(qid) else { continue; };
+        accumulate_metrics(ranked, relevant, at_ks, &mut totals);
+        let primary_ndcg = ndcg_at_k(ranked, relevant, at_ks.first().copied().unwrap_or(10));
+        per_query.insert(qid.clone(), primary_ndcg);
         n += 1;
     }
 
@@ -1484,25 +1606,49 @@ fn evaluate_bm25(
         println!("  {n_cached}/{} bm25 results cached, computing {} new...", queries.len(), pending.len());
     }
 
+    let mut query_times: Vec<f64> = Vec::new();
+    let pending_offset = n; // queries already counted from cache
     for (i, q) in pending.iter().enumerate() {
         maybe_log_query_progress("bm25", i + n_cached, queries.len());
         let Some(relevant) = qrels.get(&q.id) else { continue; };
-        let results = bm25_search(conn, &q.text, k, 1.0, chain.as_deref_mut());
+        let t0 = std::time::Instant::now();
+        let results = bm25_search(conn, &q.text, fetch_k, 1.0, chain.as_deref_mut());
+        let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
         let ranked: Vec<String> = results.iter().map(|r| r.path.clone()).collect();
-        let ndcg = ndcg_at_k(&ranked, relevant, k);
-        let recall = recall_at_k(&ranked, relevant, k);
-        save_query_result(conn, run_key, &q.id, "bm25", ndcg, recall);
-        per_query.insert(q.id.clone(), ndcg);
-        total_ndcg += ndcg;
-        total_recall += recall;
+        accumulate_metrics(&ranked, relevant, at_ks, &mut totals);
+        let primary_ndcg = ndcg_at_k(&ranked, relevant, at_ks.first().copied().unwrap_or(10));
+        per_query.insert(q.id.clone(), primary_ndcg);
+        save_query_result(conn, run_key, &q.id, "bm25", &ranked, Some(elapsed_ms));
         n += 1;
+        // Skip first WARMUP queries for timing stats.
+        if pending_offset + i >= WARMUP {
+            query_times.push(elapsed_ms);
+        }
     }
+
+    // Recall@1000: reload all cached ranked lists and compute over full set.
+    let all_cached = load_cached_results(conn, run_key, "bm25");
+    let mut recall_1000_sum = 0.0f64;
+    let mut recall_1000_n = 0usize;
+    for q in queries {
+        let Some(ranked) = all_cached.get(&q.id) else { continue; };
+        let Some(relevant) = qrels.get(&q.id) else { continue; };
+        recall_1000_sum += recall_at_k(ranked, relevant, 1000);
+        recall_1000_n += 1;
+    }
+    let recall_1000 = if recall_1000_n > 0 { recall_1000_sum / recall_1000_n as f64 } else { 0.0 };
+
+    let (median_ms, p95_ms) = timing_stats(&query_times);
+    let mut metrics = finalize_metrics(&totals, at_ks, n);
+    // Append Recall@1000 as diagnostic entry (nDCG@1000 is 0.0 — not a meaningful metric here).
+    metrics.push((1000, 0.0, recall_1000));
+
     EvalResult {
         mode: "bm25",
-        ndcg: if n > 0 { total_ndcg / n as f64 } else { 0.0 },
-        recall: if n > 0 { total_recall / n as f64 } else { 0.0 },
-        n_queries: n,
+        metrics,
         per_query,
+        median_ms,
+        p95_ms,
     }
 }
 
@@ -1510,19 +1656,22 @@ fn evaluate_vector(
     conn: &Connection,
     queries: &[Query],
     qrels: &Qrels,
-    k: usize,
+    at_ks: &[usize],
     query_embeddings: &HashMap<String, Vec<f32>>,
     run_key: &str,
 ) -> EvalResult {
+    let fetch_k = at_ks.iter().copied().max().unwrap_or(10);
     let cached = load_cached_results(conn, run_key, "vector");
     let n_cached = cached.len();
-    let (mut total_ndcg, mut total_recall, mut n) = (0.0f64, 0.0f64, 0usize);
+    let mut totals: Vec<(f64, f64)> = vec![(0.0, 0.0); at_ks.len()];
     let mut per_query: HashMap<String, f64> = HashMap::new();
+    let mut n = 0usize;
 
-    for (qid, (ndcg, recall)) in &cached {
-        total_ndcg += ndcg;
-        total_recall += recall;
-        per_query.insert(qid.clone(), *ndcg);
+    for (qid, ranked) in &cached {
+        let Some(relevant) = qrels.get(qid) else { continue; };
+        accumulate_metrics(ranked, relevant, at_ks, &mut totals);
+        let primary_ndcg = ndcg_at_k(ranked, relevant, at_ks.first().copied().unwrap_or(10));
+        per_query.insert(qid.clone(), primary_ndcg);
         n += 1;
     }
 
@@ -1533,26 +1682,33 @@ fn evaluate_vector(
         println!("  {n_cached}/{} vector results cached, computing {} new...", queries.len(), pending.len());
     }
 
+    let mut query_times: Vec<f64> = Vec::new();
+    let pending_offset = n;
     for (i, q) in pending.iter().enumerate() {
         maybe_log_query_progress("vector", i + n_cached, queries.len());
         let Some(relevant) = qrels.get(&q.id) else { continue; };
         let Some(embedding) = query_embeddings.get(&q.id) else { continue; };
-        let results = vector_search_from_embedding(conn, embedding, k);
+        let t0 = std::time::Instant::now();
+        let results = vector_search_from_embedding(conn, embedding, fetch_k);
+        let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
         let ranked: Vec<String> = results.iter().map(|r| r.path.clone()).collect();
-        let ndcg = ndcg_at_k(&ranked, relevant, k);
-        let recall = recall_at_k(&ranked, relevant, k);
-        save_query_result(conn, run_key, &q.id, "vector", ndcg, recall);
-        per_query.insert(q.id.clone(), ndcg);
-        total_ndcg += ndcg;
-        total_recall += recall;
+        accumulate_metrics(&ranked, relevant, at_ks, &mut totals);
+        let primary_ndcg = ndcg_at_k(&ranked, relevant, at_ks.first().copied().unwrap_or(10));
+        per_query.insert(q.id.clone(), primary_ndcg);
+        save_query_result(conn, run_key, &q.id, "vector", &ranked, Some(elapsed_ms));
         n += 1;
+        if pending_offset + i >= WARMUP {
+            query_times.push(elapsed_ms);
+        }
     }
+
+    let (median_ms, p95_ms) = timing_stats(&query_times);
     EvalResult {
         mode: "vector",
-        ndcg: if n > 0 { total_ndcg / n as f64 } else { 0.0 },
-        recall: if n > 0 { total_recall / n as f64 } else { 0.0 },
-        n_queries: n,
+        metrics: finalize_metrics(&totals, at_ks, n),
         per_query,
+        median_ms,
+        p95_ms,
     }
 }
 
@@ -1560,7 +1716,7 @@ fn evaluate_hybrid(
     conn: &Connection,
     queries: &[Query],
     qrels: &Qrels,
-    k: usize,
+    at_ks: &[usize],
     query_embeddings: &HashMap<String, Vec<f32>>,
     embedder: &Embedder,
     expander: Option<&Expander>,
@@ -1574,15 +1730,18 @@ fn evaluate_hybrid(
     run_key: &str,
     mut chain: Option<&mut PreprocessChain>,
 ) -> EvalResult {
+    let fetch_k = at_ks.iter().copied().max().unwrap_or(10);
     let cached = load_cached_results(conn, run_key, mode_name);
     let n_cached = cached.len();
-    let (mut total_ndcg, mut total_recall, mut n) = (0.0f64, 0.0f64, 0usize);
+    let mut totals: Vec<(f64, f64)> = vec![(0.0, 0.0); at_ks.len()];
     let mut per_query: HashMap<String, f64> = HashMap::new();
+    let mut n = 0usize;
 
-    for (qid, (ndcg, recall)) in &cached {
-        total_ndcg += ndcg;
-        total_recall += recall;
-        per_query.insert(qid.clone(), *ndcg);
+    for (qid, ranked) in &cached {
+        let Some(relevant) = qrels.get(qid) else { continue; };
+        accumulate_metrics(ranked, relevant, at_ks, &mut totals);
+        let primary_ndcg = ndcg_at_k(ranked, relevant, at_ks.first().copied().unwrap_or(10));
+        per_query.insert(qid.clone(), primary_ndcg);
         n += 1;
     }
 
@@ -1594,15 +1753,18 @@ fn evaluate_hybrid(
     }
 
     let mut rerank_cache: HashMap<(String, String), f64> = HashMap::new();
+    let mut query_times: Vec<f64> = Vec::new();
+    let pending_offset = n;
     for (i, q) in pending.iter().enumerate() {
         maybe_log_query_progress(mode_name, i + n_cached, queries.len());
         let Some(relevant) = qrels.get(&q.id) else { continue; };
         let Some(embedding) = query_embeddings.get(&q.id) else { continue; };
         let fusion_limit = if reranker.is_some() {
-            (k * 2).max(rerank_top_n)
+            (fetch_k * 2).max(rerank_top_n)
         } else {
-            k
+            fetch_k
         };
+        let t0 = std::time::Instant::now();
         let mut run = hybrid_search(
             conn,
             &q.text,
@@ -1641,22 +1803,26 @@ fn evaluate_hybrid(
                 &mut rerank_cache,
             );
         }
-        results.truncate(k);
+        let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        results.truncate(fetch_k);
         let ranked: Vec<String> = results.iter().map(|r| r.path.clone()).collect();
-        let ndcg = ndcg_at_k(&ranked, relevant, k);
-        let recall = recall_at_k(&ranked, relevant, k);
-        save_query_result(conn, run_key, &q.id, mode_name, ndcg, recall);
-        per_query.insert(q.id.clone(), ndcg);
-        total_ndcg += ndcg;
-        total_recall += recall;
+        accumulate_metrics(&ranked, relevant, at_ks, &mut totals);
+        let primary_ndcg = ndcg_at_k(&ranked, relevant, at_ks.first().copied().unwrap_or(10));
+        per_query.insert(q.id.clone(), primary_ndcg);
+        save_query_result(conn, run_key, &q.id, mode_name, &ranked, Some(elapsed_ms));
         n += 1;
+        if pending_offset + i >= WARMUP {
+            query_times.push(elapsed_ms);
+        }
     }
+
+    let (median_ms, p95_ms) = timing_stats(&query_times);
     EvalResult {
         mode: mode_name,
-        ndcg: if n > 0 { total_ndcg / n as f64 } else { 0.0 },
-        recall: if n > 0 { total_recall / n as f64 } else { 0.0 },
-        n_queries: n,
+        metrics: finalize_metrics(&totals, at_ks, n),
         per_query,
+        median_ms,
+        p95_ms,
     }
 }
 
@@ -1665,7 +1831,7 @@ fn tune_score_fusion(
     conn: &Connection,
     queries: &[Query],
     qrels: &Qrels,
-    k: usize,
+    at_ks: &[usize],
     query_embeddings: &HashMap<String, Vec<f32>>,
     embedder: &Embedder,
     expander: Option<&Expander>,
@@ -1677,8 +1843,9 @@ fn tune_score_fusion(
     rerank_top_n: usize,
     mut chain: Option<&mut PreprocessChain>,
 ) {
+    let pk = at_ks.first().copied().unwrap_or(10);
     println!("\n── Score-fusion tuning (α*vec + (1-α)*bm25) ──────────────────");
-    println!("{:<8}  {:>10}  {:>12}", "alpha", "nDCG@10", "Recall@10");
+    println!("{:<8}  {:>10}  {:>12}", "alpha", format!("nDCG@{pk}"), format!("Recall@{pk}"));
     println!("{}", "─".repeat(36));
 
     let alphas = [0.70f64, 0.75, 0.80, 0.85, 0.90, 0.95];
@@ -1693,7 +1860,7 @@ fn tune_score_fusion(
             conn,
             queries,
             qrels,
-            k,
+            at_ks,
             query_embeddings,
             embedder,
             expander,
@@ -1707,8 +1874,8 @@ fn tune_score_fusion(
             &tune_key,
             chain.as_deref_mut(),
         );
-        let ndcg = r.ndcg;
-        let recall = r.recall;
+        let ndcg = r.primary_ndcg();
+        let recall = r.primary_recall();
         println!("{:<8.2}  {:>10.4}  {:>12.4}", alpha, ndcg, recall);
         if ndcg > best.0 {
             best = (ndcg, recall, alpha);
@@ -1716,7 +1883,7 @@ fn tune_score_fusion(
     }
     println!("{}", "─".repeat(36));
     println!(
-        "best: alpha={:.2} → nDCG@10={:.4}, Recall@10={:.4}",
+        "best: alpha={:.2} → nDCG@{pk}={:.4}, Recall@{pk}={:.4}",
         best.2, best.0, best.1
     );
 }
@@ -1727,7 +1894,7 @@ fn tune_rerank_blend(
     conn: &Connection,
     queries: &[Query],
     qrels: &Qrels,
-    k: usize,
+    at_ks: &[usize],
     query_embeddings: &HashMap<String, Vec<f32>>,
     embedder: &Embedder,
     expander: Option<&Expander>,
@@ -1738,10 +1905,11 @@ fn tune_rerank_blend(
     doc_texts: &HashMap<String, String>,
     mut chain: Option<&mut PreprocessChain>,
 ) {
+    let pk = at_ks.first().copied().unwrap_or(10);
     println!("\n── Reranker blend tuning ───────────────────────────────────────");
     println!(
         "{:<14}  {:>10}  {:>12}",
-        "rerank/fusion", "nDCG@10", "Recall@10"
+        "rerank/fusion", format!("nDCG@{pk}"), format!("Recall@{pk}")
     );
     println!("{}", "─".repeat(42));
 
@@ -1754,7 +1922,7 @@ fn tune_rerank_blend(
             conn,
             queries,
             qrels,
-            k,
+            at_ks,
             query_embeddings,
             embedder,
             expander,
@@ -1771,16 +1939,16 @@ fn tune_rerank_blend(
         println!(
             "{:<14}  {:>10.4}  {:>12.4}",
             format!("{:.2}/{:.2}", rerank_weight, 1.0 - rerank_weight),
-            r.ndcg,
-            r.recall
+            r.primary_ndcg(),
+            r.primary_recall()
         );
-        if r.ndcg > best.0 {
-            best = (r.ndcg, r.recall, rerank_weight);
+        if r.primary_ndcg() > best.0 {
+            best = (r.primary_ndcg(), r.primary_recall(), rerank_weight);
         }
     }
     println!("{}", "─".repeat(42));
     println!(
-        "best: rerank/fusion = {:.2}/{:.2} → nDCG@10={:.4}, Recall@10={:.4}",
+        "best: rerank/fusion = {:.2}/{:.2} → nDCG@{pk}={:.4}, Recall@{pk}={:.4}",
         best.2,
         1.0 - best.2,
         best.0,
@@ -1825,7 +1993,8 @@ fn print_paired_comparisons(results: &[EvalResult]) {
         return;
     }
 
-    println!("\n── Paired comparisons (nDCG@k, hybrid vs baseline) ────────────");
+    let pk = hyb.metrics.first().map(|(k, _, _)| *k).unwrap_or(10);
+    println!("\n── Paired comparisons (nDCG@{pk}, hybrid vs baseline) ────────────");
     let w = 18;
     for base in &baselines {
         let label = format!("{} vs {}", hyb.mode, base.mode);
@@ -2144,13 +2313,13 @@ fn main() -> Result<()> {
     };
 
     let run_key = eval_run_key(&args);
-    let k = args.limit;
+    let at_ks = &args.at_k;
     let mut results: Vec<EvalResult> = Vec::new();
 
     if matches!(args.mode, EvalMode::Bm25 | EvalMode::All) {
         print!("evaluating bm25 ({} queries)... ", queries.len());
         let _ = std::io::stdout().flush();
-        results.push(evaluate_bm25(&conn, &queries, &qrels, k, &run_key, preprocess_chain.as_mut()));
+        results.push(evaluate_bm25(&conn, &queries, &qrels, at_ks, &run_key, preprocess_chain.as_mut()));
         println!("done");
     }
 
@@ -2166,7 +2335,7 @@ fn main() -> Result<()> {
                 &conn,
                 &queries,
                 &qrels,
-                k,
+                at_ks,
                 query_embeddings,
                 &run_key,
             ));
@@ -2190,7 +2359,7 @@ fn main() -> Result<()> {
                 &conn,
                 &queries,
                 &qrels,
-                k,
+                at_ks,
                 query_embeddings,
                 embedder,
                 expander_opt.as_ref(),
@@ -2216,7 +2385,7 @@ fn main() -> Result<()> {
                     &conn,
                     &queries,
                     &qrels,
-                    k,
+                    at_ks,
                     query_embeddings,
                     embedder,
                     expander_opt.as_ref(),
@@ -2233,6 +2402,7 @@ fn main() -> Result<()> {
                 println!("done");
 
                 let base_result = results.last().unwrap();
+                let pk = at_ks.first().copied().unwrap_or(10);
                 println!(
                     "\n── Paired comparison: hybrid α={:.2} vs α={cmp_alpha:.2} ────────────",
                     args.alpha
@@ -2243,11 +2413,11 @@ fn main() -> Result<()> {
                         let t = if se > 0.0 { mean / se } else { 0.0 };
                         let sig = if t.abs() >= 1.96 { "sig" } else { "not sig" };
                         println!(
-                            "  α={cmp_alpha:.2} vs α={:.2}  nDCG: {:.4} vs {:.4}  \
+                            "  α={cmp_alpha:.2} vs α={:.2}  nDCG@{pk}: {:.4} vs {:.4}  \
                              Δ={:+.4}  SE={:.4}  t={:+.2}  95%CI=[{:+.4},{:+.4}]  ({sig})",
                             args.alpha,
-                            cmp_result.ndcg,
-                            base_result.ndcg,
+                            cmp_result.primary_ndcg(),
+                            base_result.primary_ndcg(),
                             mean,
                             se,
                             t,
@@ -2263,7 +2433,7 @@ fn main() -> Result<()> {
                     &conn,
                     &queries,
                     &qrels,
-                    k,
+                    at_ks,
                     query_embeddings,
                     embedder,
                     expander_opt.as_ref(),
@@ -2283,7 +2453,7 @@ fn main() -> Result<()> {
                         &conn,
                         &queries,
                         &qrels,
-                        k,
+                        at_ks,
                         query_embeddings,
                         embedder,
                         expander_opt.as_ref(),
@@ -2302,57 +2472,81 @@ fn main() -> Result<()> {
         }
     }
 
-    // Results table
+    // ── Results table ─────────────────────────────────────────────────────────
     let corpus_label = args
         .data_dir
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("corpus");
-    println!("\n── {corpus_label} evaluation (k={k}) ────────────────────────────────");
-    println!(
-        "{:<10}  {:>10}  {:>12}  {:>10}",
-        "mode", "nDCG@10", "Recall@10", "queries"
-    );
-    println!("{}", "─".repeat(50));
-    for r in &results {
-        println!(
-            "{:<10}  {:>10.4}  {:>12.4}  {:>10}",
-            r.mode, r.ndcg, r.recall, r.n_queries
-        );
-    }
-    println!("{}", "─".repeat(50));
 
-    // Summary
-    let get = |mode: &str| {
-        results
-            .iter()
-            .find(|r| r.mode == mode)
-            .map(|r| r.ndcg)
-            .unwrap_or(0.0)
+    // Build header columns: nDCG@k and R@k for each k in at_ks, plus R@1000 and med ms.
+    let pk = at_ks.first().copied().unwrap_or(10);
+    let separator_len = 16 + at_ks.len() * 16 + 10 + 8; // rough width
+    println!("\n── {corpus_label} evaluation ─{}", "─".repeat(separator_len.saturating_sub(corpus_label.len() + 16)));
+
+    // Header
+    let mut header = format!("{:<16}", "mode");
+    for &k in at_ks.iter() {
+        header.push_str(&format!("  {:>8}", format!("nDCG@{k}")));
+    }
+    for &k in at_ks.iter() {
+        header.push_str(&format!("  {:>8}", format!("R@{k}")));
+    }
+    header.push_str(&format!("  {:>8}", "R@1000"));
+    header.push_str(&format!("  {:>7}", "med ms"));
+    println!("{header}");
+    println!("{}", "─".repeat(header.len()));
+
+    for r in &results {
+        let mut row = format!("{:<16}", r.mode);
+        // nDCG columns (skip R@1000 entry in metrics vec)
+        for &k in at_ks.iter() {
+            match r.ndcg_at(k) {
+                Some(v) => row.push_str(&format!("  {:>8.4}", v)),
+                None => row.push_str(&format!("  {:>8}", "—")),
+            }
+        }
+        // Recall columns (skip R@1000 entry)
+        for &k in at_ks.iter() {
+            match r.recall_at(k) {
+                Some(v) => row.push_str(&format!("  {:>8.4}", v)),
+                None => row.push_str(&format!("  {:>8}", "—")),
+            }
+        }
+        // R@1000: only show for bm25
+        if r.mode == "bm25" {
+            match r.recall_at(1000) {
+                Some(v) => row.push_str(&format!("  {:>8.4}", v)),
+                None => row.push_str(&format!("  {:>8}", "—")),
+            }
+        } else {
+            row.push_str(&format!("  {:>8}", "—"));
+        }
+        // Timing
+        match r.median_ms {
+            Some(ms) => row.push_str(&format!("  {:>6}ms", ms.round() as u64)),
+            None => row.push_str(&format!("  {:>7}", "—")),
+        }
+        println!("{row}");
+    }
+    println!("{}", "─".repeat(header.len()));
+
+    // Summary deltas using primary_ndcg()
+    let get_ndcg = |mode: &str| {
+        results.iter().find(|r| r.mode == mode).map(|r| r.primary_ndcg()).unwrap_or(0.0)
     };
-    let bm25_ndcg = get("bm25");
-    let vec_ndcg = get("vector");
-    let hybrid_ndcg = get("hybrid").max(get("hybrid-rerank"));
+    let bm25_ndcg = get_ndcg("bm25");
+    let vec_ndcg = get_ndcg("vector");
+    let hybrid_ndcg = get_ndcg("hybrid").max(get_ndcg("hybrid-rerank"));
 
     if hybrid_ndcg > 0.0 && (bm25_ndcg > 0.0 || vec_ndcg > 0.0) {
         let beats_bm25 = hybrid_ndcg > bm25_ndcg;
         let beats_vec = vec_ndcg == 0.0 || hybrid_ndcg > vec_ndcg;
 
         if beats_bm25 && beats_vec {
-            let bm25_delta = if bm25_ndcg > 0.0 {
-                (hybrid_ndcg - bm25_ndcg) / bm25_ndcg * 100.0
-            } else {
-                0.0
-            };
-            let vec_delta = if vec_ndcg > 0.0 {
-                (hybrid_ndcg - vec_ndcg) / vec_ndcg * 100.0
-            } else {
-                0.0
-            };
-            println!(
-                "hybrid beats bm25 (+{:.1}%) and vector (+{:.1}%) on nDCG@10",
-                bm25_delta, vec_delta,
-            );
+            let bm25_delta = if bm25_ndcg > 0.0 { (hybrid_ndcg - bm25_ndcg) / bm25_ndcg * 100.0 } else { 0.0 };
+            let vec_delta = if vec_ndcg > 0.0 { (hybrid_ndcg - vec_ndcg) / vec_ndcg * 100.0 } else { 0.0 };
+            println!("hybrid beats bm25 (+{:.1}%) and vector (+{:.1}%) on nDCG@{pk}", bm25_delta, vec_delta);
         } else if beats_bm25 {
             println!(
                 "hybrid beats bm25 (+{:.1}%) but not vector ({:+.1}%)",
@@ -2370,6 +2564,55 @@ fn main() -> Result<()> {
 
     if args.mode == EvalMode::All {
         print_paired_comparisons(&results);
+    }
+
+    // ── JSON emit ─────────────────────────────────────────────────────────────
+    if let Some(ref json_path) = args.emit_json {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let ts_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        let results_json: Vec<serde_json::Value> = results.iter().map(|r| {
+            let mut metrics_map = serde_json::Map::new();
+            for &(k, ndcg, recall) in &r.metrics {
+                if k == 1000 {
+                    // R@1000 only (nDCG@1000 is 0.0 placeholder)
+                    metrics_map.insert(format!("recall_{k}"), serde_json::json!(recall));
+                } else {
+                    metrics_map.insert(format!("ndcg_{k}"), serde_json::json!(ndcg));
+                    metrics_map.insert(format!("recall_{k}"), serde_json::json!(recall));
+                }
+            }
+            let timing = serde_json::json!({
+                "median_ms": r.median_ms,
+                "p95_ms": r.p95_ms,
+            });
+            serde_json::json!({
+                "mode": r.mode,
+                "metrics": metrics_map,
+                "timing": timing,
+            })
+        }).collect();
+
+        let json_out = serde_json::json!({
+            "dataset": corpus_name,
+            "git_hash": args.version_tag.as_deref().unwrap_or(""),
+            "run_key": run_key,
+            "timestamp": ts_secs,
+            "corpus_size": corpus.len(),
+            "n_queries": queries.len(),
+            "results": results_json,
+        });
+
+        let json_str = serde_json::to_string_pretty(&json_out)
+            .unwrap_or_else(|_| "{}".to_string());
+        if let Err(e) = std::fs::write(json_path, &json_str) {
+            eprintln!("warn: failed to write JSON output to {}: {e}", json_path.display());
+        } else {
+            println!("JSON written to {}", json_path.display());
+        }
     }
 
     Ok(())
