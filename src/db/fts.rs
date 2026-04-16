@@ -11,11 +11,132 @@ fn fts5_escape(s: &str) -> String {
     s.replace('"', "\"\"")
 }
 
+/// Strip English stop words from a query string.
+/// Returns the original string unchanged if all tokens are stop words (avoids empty query).
+#[allow(dead_code)] // ^ public utility; tested; no production caller yet
+pub fn strip_stopwords(input: &str) -> String {
+    let filtered: Vec<&str> = input.split_whitespace().filter(|w| !is_stopword(w)).collect();
+    if filtered.is_empty() {
+        input.to_string()
+    } else {
+        filtered.join(" ")
+    }
+}
+
+fn is_stopword(word: &str) -> bool {
+    matches!(
+        word.to_ascii_lowercase().as_str(),
+        "a" | "an"
+            | "the"
+            | "and"
+            | "or"
+            | "but"
+            | "in"
+            | "on"
+            | "at"
+            | "to"
+            | "for"
+            | "of"
+            | "with"
+            | "from"
+            | "by"
+            | "as"
+            | "is"
+            | "are"
+            | "was"
+            | "were"
+            | "be"
+            | "been"
+            | "being"
+            | "have"
+            | "has"
+            | "had"
+            | "do"
+            | "does"
+            | "did"
+            | "will"
+            | "would"
+            | "could"
+            | "should"
+            | "can"
+            | "may"
+            | "might"
+            | "shall"
+            | "not"
+            | "no"
+            | "that"
+            | "this"
+            | "these"
+            | "those"
+            | "it"
+            | "its"
+            | "i"
+            | "me"
+            | "my"
+            | "we"
+            | "our"
+            | "you"
+            | "your"
+            | "he"
+            | "him"
+            | "his"
+            | "she"
+            | "her"
+            | "they"
+            | "them"
+            | "their"
+            | "who"
+            | "whom"
+            | "which"
+            | "what"
+            | "when"
+            | "where"
+            | "why"
+            | "how"
+            | "about"
+            | "into"
+            | "than"
+            | "then"
+            | "there"
+            | "also"
+            | "such"
+            | "so"
+            | "if"
+            | "use"
+            | "used"
+            | "using"
+    )
+}
+
+/// Build FTS5 query adapted for natural-language input.
+/// Queries with more than 3 terms (after stop word removal) use OR semantics.
+/// Short keyword queries (≤3 non-stop terms) keep AND semantics.
+///
+/// This handles question-format queries like "what are the symptoms of diabetes"
+/// where AND semantics would nearly always return empty results.
+pub fn build_query_natural(input: &str) -> String {
+    let all_terms: Vec<&str> = input.split_whitespace().collect();
+    let content_terms: Vec<&str> = all_terms.iter().copied().filter(|w| !is_stopword(w)).collect();
+
+    // Short keyword query: keep existing AND semantics
+    if content_terms.len() <= 3 && content_terms.len() == all_terms.len() {
+        return build_query(input);
+    }
+
+    // Natural-language query: strip stop words and use OR
+    let cleaned = if content_terms.is_empty() {
+        // All stop words (e.g., "what is the") — preserve all terms, use OR
+        all_terms.join(" ")
+    } else {
+        content_terms.join(" ")
+    };
+    build_query_or(&cleaned)
+}
+
 /// Build an FTS5 query for evaluation / recall mode.
 /// Identical tokenization to `build_query` but positive terms are ORed, not ANDed.
 /// Required for BEIR-style evaluation where queries are full questions — AND semantics
 /// force all stop words to match and nearly nothing passes.
-#[allow(dead_code)] // ^ wired to eval.rs in a future pass
 pub fn build_query_or(input: &str) -> String {
     let mut parts: Vec<String> = Vec::new();
     let mut neg_parts: Vec<String> = Vec::new();
@@ -261,5 +382,67 @@ mod tests {
         assert!(normalize(-1000.0) > 0.999);
         // Zero → 0.0
         assert_eq!(normalize(0.0), 0.0);
+    }
+
+    // ── build_query_natural tests ────────────────────────────────────────────
+
+    #[test]
+    fn natural_short_keyword_query_stays_and() {
+        // ≤3 terms, no stop words → unchanged AND behavior
+        let q = build_query_natural("rust memory");
+        assert!(q.contains("AND"), "short query should keep AND: {q}");
+    }
+
+    #[test]
+    fn natural_long_question_becomes_or() {
+        // Question-format query: stop words stripped, remaining joined with OR
+        let q = build_query_natural("what is the best way to invest money");
+        assert!(q.contains("OR"), "long question should use OR: {q}");
+        assert!(!q.contains("\"what\""), "stop word 'what' should be stripped: {q}");
+        assert!(!q.contains("\"is\""), "stop word 'is' should be stripped: {q}");
+        assert!(!q.contains("\"the\""), "stop word 'the' should be stripped: {q}");
+        assert!(q.contains("\"best\""), "content term 'best' should remain: {q}");
+        assert!(q.contains("\"invest\""), "content term 'invest' should remain: {q}");
+    }
+
+    #[test]
+    fn natural_all_stopwords_fallback() {
+        // All stop words → don't produce empty query; use OR of originals
+        let q = build_query_natural("what is the");
+        assert!(!q.is_empty(), "all-stopword query must not be empty: {q}");
+        assert!(q.contains("OR"), "all-stopword fallback should use OR: {q}");
+    }
+
+    #[test]
+    fn natural_negation_preserved() {
+        // Negated terms survive regardless of stop word list
+        let q = build_query_natural("what is the best way -spam to do something useful");
+        assert!(q.contains("NOT \"spam\""), "negation must be preserved: {q}");
+        assert!(q.contains("OR"), "long query should use OR: {q}");
+    }
+
+    #[test]
+    fn natural_short_with_stopwords_uses_or() {
+        // 4+ terms even with stop words → switch to OR
+        let q = build_query_natural("what is diabetes symptoms treatment");
+        assert!(q.contains("OR"), "mixed query with 5 terms should use OR: {q}");
+    }
+
+    // ── strip_stopwords tests ────────────────────────────────────────────────
+
+    #[test]
+    fn strip_removes_stop_words() {
+        assert_eq!(strip_stopwords("what is the best way"), "best way");
+    }
+
+    #[test]
+    fn strip_preserves_content_words() {
+        assert_eq!(strip_stopwords("rust memory safety"), "rust memory safety");
+    }
+
+    #[test]
+    fn strip_all_stopwords_returns_original() {
+        // Must not return empty string
+        assert_eq!(strip_stopwords("what is the"), "what is the");
     }
 }

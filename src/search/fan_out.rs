@@ -22,7 +22,7 @@ pub fn bm25(dbs: &[CollectionDb], req: &SearchRequest) -> Result<Vec<SearchResul
         .iter()
         .map(|db| {
             let preprocessed_query = db.preprocess_query(req.query);
-            let fts_query = fts::build_query(&preprocessed_query);
+            let fts_query = fts::build_query_natural(&preprocessed_query);
             if fts_query.is_empty() {
                 return Ok(vec![]);
             }
