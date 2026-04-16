@@ -356,60 +356,90 @@ pub fn start_server(timeout_secs: u64) -> Result<()> {
     let (tx, rx) = std::sync::mpsc::sync_channel::<Tier2>(1);
     let tier2_path_bg = tier2_path.clone();
     std::thread::spawn(move || {
-        // Try combined model first (IR_COMBINED_MODEL, or deprecated IR_QWEN_MODEL).
-        // On load failure, fall through to dedicated expander + reranker.
-        let combined = crate::llm::combined::Combined::try_load_default()
-            .map_err(|e| eprintln!("  note: combined model unavailable ({e}), falling back to dedicated models"))
-            .ok()
-            .flatten()
-            .map(std::sync::Arc::new);
+        type ExpBox = Box<dyn crate::llm::expander::QueryExpander>;
+        type ScoBox = Box<dyn crate::llm::scoring::Scorer>;
+        type Pair = (Option<ExpBox>, Option<ScoBox>);
 
-        let (expander, scorer) = if let Some(c) = combined {
-            let name = c.name().to_string();
-            // Warn if dedicated models are also set — combined and dedicated are mutually exclusive.
-            let has_dedicated_expander = std::env::var_os(crate::llm::env::EXPANDER_MODEL[0]).is_some();
-            let has_dedicated_reranker = std::env::var_os(crate::llm::env::RERANKER_MODEL[0]).is_some();
-            if has_dedicated_expander || has_dedicated_reranker {
-                eprintln!("  warn: IR_COMBINED_MODEL and dedicated model env vars are both set — \
-                           using combined mode; unset IR_COMBINED_MODEL to use dedicated models");
-            }
-            eprintln!("  tier-2: combined mode ({name})");
-            (
-                Some(Box::new(c.clone()) as Box<dyn crate::llm::expander::QueryExpander>),
-                Some(Box::new(c) as Box<dyn crate::llm::scoring::Scorer>),
-            )
-        } else {
+        // Wrap a loaded Combined into boxed trait objects for the pipeline.
+        fn from_combined(c: std::sync::Arc<crate::llm::combined::Combined>) -> Pair {
+            eprintln!("  tier-2: combined mode ({})", c.name());
+            (Some(Box::new(c.clone()) as ExpBox), Some(Box::new(c) as ScoBox))
+        }
+
+        // Load expander + reranker.
+        // Reranker without expander: expansion skipped, but reranking fused results still works.
+        // Expander without reranker: expansion is harmful without reranking (-0.53% nDCG on NFCorpus); disabled.
+        fn load_dedicated() -> Pair {
             let exp = crate::llm::expander::Expander::load_default()
                 .map_err(|e| eprintln!("  note: expander unavailable ({e})"))
                 .ok()
                 .map(|e| {
                     eprintln!("  expander ready ({})", crate::llm::models::EXPANDER);
-                    Box::new(e) as Box<dyn crate::llm::expander::QueryExpander>
+                    Box::new(e) as ExpBox
                 });
             let rer = crate::llm::reranker::Reranker::load_default()
                 .map_err(|e| eprintln!("  note: reranker unavailable ({e})"))
                 .ok()
                 .map(|r| {
                     eprintln!("  reranker ready ({})", crate::llm::models::RERANKER);
-                    Box::new(r) as Box<dyn crate::llm::scoring::Scorer>
+                    Box::new(r) as ScoBox
                 });
             match (&exp, &rer) {
                 (Some(_), Some(_)) => eprintln!("  tier-2: dedicated mode"),
-                (Some(_), None) => eprintln!("  warn: expander loaded but reranker unavailable — tier-2 disabled"),
-                (None, Some(_)) => eprintln!("  warn: reranker loaded but expander unavailable — tier-2 disabled"),
+                (Some(_), None) => eprintln!("  warn: reranker unavailable — expansion disabled (harmful without scorer)"),
+                (None, Some(_)) => eprintln!("  warn: expander unavailable — query expansion disabled; reranking active"),
                 (None, None) => {}
             }
-            // Tier-2 is all-or-nothing: expander without reranker (or vice versa) is a no-op.
-            if exp.is_some() && rer.is_some() { (exp, rer) } else { (None, None) }
+            // Expander without reranker produces worse results than no expansion at all; suppress it.
+            (if rer.is_some() { exp } else { None }, rer)
+        }
+
+        // Detect tier-2 mode from env vars before loading anything.
+        // Combined and dedicated are mutually exclusive explicit modes; no cross-mode fallback.
+        let has_combined_env = std::env::var_os(crate::llm::env::COMBINED_MODEL).is_some()
+            || std::env::var_os(crate::llm::env::QWEN_MODEL).is_some();
+        let has_dedicated_env = crate::llm::env::EXPANDER_MODEL.iter().any(|k| std::env::var_os(k).is_some())
+            || crate::llm::env::RERANKER_MODEL.iter().any(|k| std::env::var_os(k).is_some());
+
+        if has_combined_env && has_dedicated_env {
+            eprintln!("  warn: IR_COMBINED_MODEL and dedicated model env vars are both set — \
+                       using combined mode; unset IR_COMBINED_MODEL to use dedicated models");
+        }
+
+        let (expander, scorer): Pair = if has_combined_env {
+            match crate::llm::combined::Combined::try_load_default() {
+                Ok(Some(c)) => from_combined(std::sync::Arc::new(c)),
+                Ok(None) => {
+                    eprintln!("  note: IR_COMBINED_MODEL set but model file not found — tier-2 disabled");
+                    (None, None)
+                }
+                Err(e) => {
+                    eprintln!("  warn: combined model load failed ({e}) — falling back to dedicated models");
+                    load_dedicated()
+                }
+            }
+        } else if has_dedicated_env {
+            load_dedicated()
+        } else {
+            // Auto-detect: try combined (local file search, no download) first; then dedicated.
+            let auto_combined = match crate::llm::combined::Combined::try_load_default() {
+                Ok(c) => c.map(std::sync::Arc::new),
+                Err(e) => {
+                    eprintln!("  note: combined model auto-detect failed ({e})");
+                    None
+                }
+            };
+            if let Some(c) = auto_combined { from_combined(c) } else { load_dedicated() }
         };
 
         // Send models to main thread before writing signal file.
-        if expander.is_some() && scorer.is_some() {
+        // Scorer alone is sufficient — reranker improves fused results even without expansion.
+        if scorer.is_some() {
             let _ = tx.send(Tier2 { expander, scorer });
             let _ = std::fs::write(&tier2_path_bg, "");
             eprintln!("  tier-2 ready");
         } else {
-            eprintln!("  tier-2 skipped (no models available)");
+            eprintln!("  tier-2 skipped (no scorer available)");
         }
     });
 
