@@ -366,6 +366,13 @@ pub fn start_server(timeout_secs: u64) -> Result<()> {
 
         let (expander, scorer) = if let Some(c) = combined {
             let name = c.name().to_string();
+            // Warn if dedicated models are also set — combined and dedicated are mutually exclusive.
+            let has_dedicated_expander = std::env::var_os(crate::llm::env::EXPANDER_MODEL[0]).is_some();
+            let has_dedicated_reranker = std::env::var_os(crate::llm::env::RERANKER_MODEL[0]).is_some();
+            if has_dedicated_expander || has_dedicated_reranker {
+                eprintln!("  warn: IR_COMBINED_MODEL and dedicated model env vars are both set — \
+                           using combined mode; unset IR_COMBINED_MODEL to use dedicated models");
+            }
             eprintln!("  tier-2: combined mode ({name})");
             (
                 Some(Box::new(c.clone()) as Box<dyn crate::llm::expander::QueryExpander>),
