@@ -10,16 +10,10 @@ repository = "https://github.com/vlwkaos/ir"
 default = ["llama-metal", "llama-openmp"]
 llama-metal = ["llama-cpp-2/metal"]
 llama-openmp = ["llama-cpp-2/openmp"]
-bench = []
 
 [[bin]]
 name = "ir"
 path = "src/main.rs"
-
-[[bin]]
-name = "eval"
-path = "src/bin/eval.rs"
-required-features = ["bench"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
