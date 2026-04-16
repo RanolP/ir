@@ -324,20 +324,20 @@ Preprocessors tokenize text before BM25 indexing. Without one, agglutinated word
 **Korean (lindera, Mode::Decompose):**
 
 ```bash
-ir preprocessor install ko          # downloads lindera-tokenize, registers as "ko"
+ir preprocessor install ko          # downloads official lindera CLI + ko-dic, registers as "ko"
                                     # shows collection picker to bind immediately
 ir collection add wiki ~/wiki       # add collection (if not yet added)
 ir preprocessor bind ko wiki        # wire "ko" to collection and re-index
 ir search "서울 지하철" -c wiki
 ```
 
-`ir preprocessor install ko` downloads a pre-built binary from the GitHub release — embedded ko-dic dictionary, no system deps, no Rust toolchain required. Supported platforms: **macOS** (universal binary, Intel + Apple Silicon) and **Linux** (x86\_64, aarch64). The install step shows an interactive picker so you can bind to collections right away.
+`ir preprocessor install ko` downloads the official lindera CLI binary and ko-dic dictionary from lindera's GitHub releases. Supported platforms: **macOS** (arm64, x86\_64) and **Linux** (x86\_64, aarch64). No system deps, no Rust toolchain required. The install step shows an interactive picker so you can bind to collections right away.
 
 **Other languages:**
 
 ```bash
 ir preprocessor install ja    # Japanese (Lindera + ipadic)
-ir preprocessor install zh    # Chinese (bigram tokenizer)
+ir preprocessor install zh    # Chinese (Lindera + jieba)
 ```
 
 **Manage:**

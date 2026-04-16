@@ -51,6 +51,7 @@ impl PreprocessHandle {
             }
             Err(e) => {
                 eprintln!("warning: failed to spawn preprocessor '{cmd_str}': {e}");
+                eprintln!("hint: run `ir preprocessor install <lang>` to reinstall from official lindera releases");
                 None
             }
         }

@@ -12,6 +12,7 @@ mod preprocess;
 mod search;
 mod types;
 
+use std::path::{Path, PathBuf};
 use clap::Parser;
 use cli::{Cli, CollectionCmd, Command, DaemonCmd, PreprocessorCmd, output};
 use get::{DocContent, MultiGetResult};
@@ -584,6 +585,7 @@ fn handle_preprocessor(cmd: PreprocessorCmd) -> Result<()> {
                 println!("registered:");
                 for (alias, cmd) in &entries {
                     println!("  {:<10} {}", alias, cmd);
+                    warn_stale_preprocessor(alias, cmd);
                 }
             }
             let uninstalled: Vec<_> = known
@@ -666,15 +668,13 @@ fn handle_preprocessor(cmd: PreprocessorCmd) -> Result<()> {
     Ok(())
 }
 
-enum PreprocessorKind {
-    Binary { binary_name: &'static str },
-    #[allow(dead_code)] // reserved for future script-based preprocessors
-    Script { repo_subdir: &'static str, script_name: &'static str },
-}
 struct KnownPreprocessor {
     alias: &'static str,
     description: &'static str,
-    kind: PreprocessorKind,
+    // ^ lindera release asset prefix (e.g. "ko-dic" → lindera-ko-dic-{ver}.zip)
+    dict_name: &'static str,
+    // ^ compact JSON passed as --token-filter arg (no spaces); None = raw wakati
+    token_filter: Option<&'static str>,
 }
 
 fn known_preprocessors() -> &'static [KnownPreprocessor] {
@@ -682,17 +682,20 @@ fn known_preprocessors() -> &'static [KnownPreprocessor] {
         KnownPreprocessor {
             alias: "ko",
             description: "Korean morphological analysis (Lindera + ko-dic)",
-            kind: PreprocessorKind::Binary { binary_name: "lindera-tokenize" },
+            dict_name: "ko-dic",
+            token_filter: Some(r#"{"kind":"korean_stop_tags","tags":["JKS","JKC","JKG","JKO","JKB","JKV","JKQ","JX","JC","EP","EF","EC","ETN","ETM","XPN","XSN","XSV","XSA","SF","SP","SS","SE","SO","SW","SWK"]}"#),
         },
         KnownPreprocessor {
             alias: "ja",
             description: "Japanese morphological analysis (Lindera + ipadic)",
-            kind: PreprocessorKind::Binary { binary_name: "lindera-tokenize-ja" },
+            dict_name: "ipadic",
+            token_filter: Some(r#"{"kind":"japanese_stop_tags","tags":["助詞","助動詞","記号","接続詞","感動詞","フィラー"]}"#),
         },
         KnownPreprocessor {
             alias: "zh",
-            description: "Chinese bigram tokenization",
-            kind: PreprocessorKind::Binary { binary_name: "bigram-tokenize-zh" },
+            description: "Chinese word segmentation (Lindera + jieba)",
+            dict_name: "jieba",
+            token_filter: None,
         },
     ]
 }
@@ -724,10 +727,28 @@ fn pick_collections_for_bind(config: &Config, alias: &str) -> Result<Vec<String>
     Ok(selections.into_iter().map(|i| config.collections[i].name.clone()).collect())
 }
 
-/// Download/install a bundled preprocessor and register it.
+/// Warn if a registered preprocessor command looks stale (old bundled binary or missing path).
+/// TODO(remove ≥0.13.0): migration warning for users upgrading from ≤0.9.x
+fn warn_stale_preprocessor(alias: &str, cmd: &str) {
+    // ^ old bundled binary names shipped in preprocessors/ before v0.10.0
+    const OLD_BUNDLED: &[&str] = &["lindera-tokenize", "lindera-tokenize-ja", "bigram-tokenize-zh"];
+    let program = cmd.split_whitespace().next().unwrap_or("");
+    let binary_name = std::path::Path::new(program)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(program);
+    if OLD_BUNDLED.contains(&binary_name) {
+        eprintln!("warning: '{alias}' uses an old bundled binary that no longer ships with ir");
+        eprintln!("  run: ir preprocessor install {alias}");
+    } else if !program.is_empty() && std::path::Path::new(program).is_absolute() && !std::path::Path::new(program).exists() {
+        eprintln!("warning: '{alias}' binary not found: {program}");
+        eprintln!("  run: ir preprocessor install {alias}");
+    }
+}
+
+/// Download official lindera CLI binary + language dictionary, register command.
 fn install_preprocessor(config: &mut Config, lang: &str) -> Result<()> {
     let known = known_preprocessors();
-
     let available: Vec<&str> = known.iter().map(|e| e.alias).collect();
     let entry = known
         .iter()
@@ -736,84 +757,32 @@ fn install_preprocessor(config: &mut Config, lang: &str) -> Result<()> {
             format!("unknown lang '{lang}'. Available: {}", available.join(", "))
         ))?;
 
-    let install_dir = config::ir_dir().join("preprocessors").join(entry.alias);
-    std::fs::create_dir_all(&install_dir)?;
+    let triple = lindera_platform_triple()?;
+    println!("fetching latest lindera release info…");
+    let tag = fetch_lindera_tag()?;
+    let version = tag.trim_start_matches('v'); // "v3.0.5" → "3.0.5"
 
-    let cmd_str = match &entry.kind {
-        PreprocessorKind::Binary { binary_name } => {
-            let bin_path = install_dir.join(binary_name);
-            let arch = if cfg!(target_os = "macos") {
-                "darwin-universal"
-            } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
-                "linux-x86_64"
-            } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
-                "linux-aarch64"
-            } else {
-                return Err(error::Error::Other(
-                    "preprocessor install is only supported on macOS and Linux (x86_64/aarch64)".into()
-                ));
-            };
-            let tarball = format!("{binary_name}-{arch}.tar.gz");
-            let url = format!(
-                "https://github.com/vlwkaos/ir/releases/latest/download/{tarball}"
-            );
-            let tar_path = install_dir.join(&tarball);
-            let status = std::process::Command::new("curl")
-                .args(["-fsSL", &url, "-o", &tar_path.to_string_lossy()])
-                .status()
-                .map_err(|e| error::Error::Other(format!("curl: {e}")))?;
-            if !status.success() {
-                return Err(error::Error::Other(format!(
-                    "download failed: {url}"
-                )));
-            }
-            let tar_status = std::process::Command::new("tar")
-                .args(["-xzf", &tar_path.to_string_lossy(), "-C", &install_dir.to_string_lossy()])
-                .status()
-                .map_err(|e| error::Error::Other(format!("tar: {e}")))?;
-            if !tar_status.success() {
-                std::fs::remove_file(&tar_path).ok();
-                return Err(error::Error::Other(format!(
-                    "failed to extract {tarball}: tar exited with {}", tar_status
-                )));
-            }
-            std::fs::remove_file(&tar_path).ok();
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&bin_path, std::fs::Permissions::from_mode(0o755))
-                    .map_err(error::Error::Io)?;
-            }
-            bin_path.to_string_lossy().into_owned()
-        }
-        PreprocessorKind::Script { repo_subdir, script_name } => {
-            let script_path = install_dir.join(script_name);
-            let url = format!(
-                "https://raw.githubusercontent.com/vlwkaos/ir/main/preprocessors/{repo_subdir}/{script_name}"
-            );
-            let status = std::process::Command::new("curl")
-                .args(["-fsSL", &url, "-o", &script_path.to_string_lossy()])
-                .status()
-                .map_err(|e| error::Error::Other(format!("curl: {e}")))?;
-            if !status.success() {
-                return Err(error::Error::Other(format!(
-                    "download failed. Install manually to {}", script_path.display()
-                )));
-            }
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))
-                    .map_err(error::Error::Io)?;
-            }
-            script_path.to_string_lossy().into_owned()
-        }
-    };
+    let preprocessors_dir = config::ir_dir().join("preprocessors");
+    std::fs::create_dir_all(&preprocessors_dir)?;
+
+    let bin_path = install_lindera_binary(&preprocessors_dir, &tag, triple)?;
+    let dict_path = install_lindera_dict(&preprocessors_dir, entry.dict_name, &tag, version)?;
+
+    let mut cmd_str = format!(
+        "{} tokenize --dict {} -o wakati -m decompose",
+        bin_path.display(),
+        dict_path.display(),
+    );
+    if let Some(filter) = entry.token_filter {
+        cmd_str.push_str(" --token-filter ");
+        cmd_str.push_str(filter);
+    }
 
     let alias = entry.alias;
     config.add_preprocessor(alias, &cmd_str)?;
     config.save()?;
-    println!("installed '{alias}' preprocessor → {cmd_str}");
+    println!("installed '{alias}' preprocessor (lindera {tag})");
+    println!("  → {cmd_str}");
 
     if !config.collections.is_empty() {
         println!();
@@ -823,12 +792,128 @@ fn install_preprocessor(config: &mut Config, lang: &str) -> Result<()> {
                 .find(|c| c.name == name).unwrap();
             let pp = col.preprocessor.get_or_insert_with(Vec::new);
             if !pp.contains(&alias.to_string()) { pp.push(alias.to_string()); }
-            config.save()?;
             println!("bound '{alias}' to '{name}', re-indexing…");
-            handle_update(Some(name), false)?;
+            if let Err(e) = handle_update(Some(name.clone()), false) {
+                eprintln!("warning: re-index failed for '{name}': {e}");
+            }
         }
+        config.save()?;
     }
 
+    Ok(())
+}
+
+fn lindera_platform_triple() -> Result<&'static str> {
+    if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        Ok("aarch64-apple-darwin")
+    } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+        Ok("x86_64-apple-darwin")
+    } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        Ok("x86_64-unknown-linux-gnu")
+    } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+        Ok("aarch64-unknown-linux-gnu")
+    } else {
+        Err(error::Error::Other(
+            "preprocessor install is only supported on macOS (arm64/x86_64) and Linux (x86_64/aarch64)".into()
+        ))
+    }
+}
+
+/// Returns the latest lindera release tag (e.g. "v3.0.5") via GitHub API.
+fn fetch_lindera_tag() -> Result<String> {
+    let output = std::process::Command::new("curl")
+        .args(["-fsSL", "-H", "Accept: application/vnd.github.v3+json",
+               "https://api.github.com/repos/lindera/lindera/releases/latest"])
+        .output()
+        .map_err(|e| error::Error::Other(format!("curl: {e}")))?;
+    if !output.status.success() {
+        return Err(error::Error::Other(
+            "failed to fetch lindera release info (GitHub API rate limit or network error)".into()
+        ));
+    }
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|e| error::Error::Other(format!("parse release JSON: {e}")))?;
+    json["tag_name"]
+        .as_str()
+        .map(|s| s.to_string())
+        .ok_or_else(|| error::Error::Other(
+            "unexpected GitHub API response (missing tag_name)".into()
+        ))
+}
+
+/// Install the shared lindera CLI binary into preprocessors_dir/lindera/. Skips if present.
+fn install_lindera_binary(preprocessors_dir: &Path, tag: &str, triple: &str) -> Result<PathBuf> {
+    let bin_dir = preprocessors_dir.join("lindera");
+    let bin_path = bin_dir.join("lindera");
+    if bin_path.exists() {
+        return Ok(bin_path);
+    }
+    std::fs::create_dir_all(&bin_dir)?;
+    let filename = format!("lindera-{triple}-{tag}.zip");
+    let url = format!("https://github.com/lindera/lindera/releases/download/{tag}/{filename}");
+    println!("downloading lindera binary…");
+    let zip_path = bin_dir.join(&filename);
+    download_file(&url, &zip_path)?;
+    extract_zip_flat(&zip_path, &bin_dir)?;
+    std::fs::remove_file(&zip_path).ok();
+    if !bin_path.exists() {
+        return Err(error::Error::Other(format!(
+            "lindera binary not found after extraction (expected: {})",
+            bin_path.display()
+        )));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin_path, std::fs::Permissions::from_mode(0o755))
+            .map_err(error::Error::Io)?;
+    }
+    Ok(bin_path)
+}
+
+/// Download and extract a lindera language dictionary into preprocessors_dir/{dict_name}/.
+fn install_lindera_dict(
+    preprocessors_dir: &Path,
+    dict_name: &str,
+    tag: &str,
+    version: &str,
+) -> Result<PathBuf> {
+    let dict_dir = preprocessors_dir.join(dict_name);
+    std::fs::create_dir_all(&dict_dir)?;
+    let filename = format!("lindera-{dict_name}-{version}.zip");
+    let url = format!("https://github.com/lindera/lindera/releases/download/{tag}/{filename}");
+    println!("downloading {dict_name} dictionary…");
+    let zip_path = dict_dir.join(&filename);
+    download_file(&url, &zip_path)?;
+    extract_zip_flat(&zip_path, &dict_dir)?;
+    std::fs::remove_file(&zip_path).ok();
+    Ok(dict_dir)
+}
+
+fn download_file(url: &str, dest: &Path) -> Result<()> {
+    let status = std::process::Command::new("curl")
+        .args(["-fsSL", url, "-o", &dest.to_string_lossy()])
+        .status()
+        .map_err(|e| error::Error::Other(format!("curl: {e}")))?;
+    if !status.success() {
+        return Err(error::Error::Other(format!("download failed: {url}")));
+    }
+    Ok(())
+}
+
+fn extract_zip_flat(zip_path: &Path, dest_dir: &Path) -> Result<()> {
+    let status = std::process::Command::new("unzip")
+        .args(["-o", "-j",
+               &zip_path.to_string_lossy(),
+               "-d", &dest_dir.to_string_lossy()])
+        .status()
+        .map_err(|e| error::Error::Other(format!("unzip: {e}")))?;
+    if !status.success() {
+        return Err(error::Error::Other(format!(
+            "failed to extract {} (is `unzip` installed?)",
+            zip_path.display()
+        )));
+    }
     Ok(())
 }
 

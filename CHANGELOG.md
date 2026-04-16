@@ -1,3 +1,9 @@
+## [Unreleased]
+
+### Breaking
+
+- `ir preprocessor install ko/ja/zh` now downloads the official lindera CLI binary and per-language dictionaries from lindera's GitHub releases instead of our own bundled binaries. Chinese (`zh`) switches from a custom bigram tokenizer to lindera + jieba (word segmentation). Existing registrations pointing to old bundled binaries are stale — reinstall with `ir preprocessor install <lang>` then re-index with `ir update <collection> --force`.
+
 ## [0.10.0] - 2026-04-17
 
 ### Features

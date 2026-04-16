@@ -1,6 +1,0 @@
-#!/bin/sh
-# Japanese morphological tokenizer using MeCab.
-# Install: brew install mecab mecab-ipadic  (macOS)
-#          apt-get install mecab libmecab-dev mecab-ipadic-utf8  (Linux)
-# Protocol: reads lines from stdin, writes one tokenized line per input line to stdout.
-exec mecab -Owakati

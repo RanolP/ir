@@ -3,22 +3,24 @@
 ## Crate
 
 Package name on crates.io is `ir-search` (name `ir` was taken).
-Binary names remain `ir` and `eval`. See @Cargo.toml.
+Binary name is `ir`. See @Cargo.toml.
 
 ## Commands
 
 ```bash
-cargo build                        # dev build (ir + eval binaries)
+cargo build                        # dev build
 cargo build --release --bin ir     # release build
 cargo test                         # unit tests (fast, no models needed)
 cargo test -- --ignored            # includes LLM tests (require model files)
 ```
 
-Benchmark runner (requires BEIR dataset):
+Benchmark runner (drives the real `ir` binary; requires BEIR dataset):
 ```bash
-scripts/bench.sh --data test-data/fiqa baseline "B:IR_COMBINED_MODEL=~/local-models/Qwen3.5-0.8B-Q8_0.gguf"
+scripts/bench.sh fiqa              # bench current HEAD on FiQA
+scripts/bench.sh fiqa v0.9.0       # compare HEAD vs v0.9.0
+scripts/bench.sh miracl-ko         # Korean MIRACL benchmark
 ```
-Logs go to `logs/` (gitignored).
+Results cached at `logs/results/{dataset}/{git7}.json` (gitignored).
 
 ## Environment Variables
 
@@ -72,7 +74,6 @@ Idle timeout: 3600s (configurable via `ir daemon start --timeout`).
 
 ## Known Gotchas
 
-- **Crate name mismatch**: package is `ir-search`, but all internal `use` statements in `src/bin/eval.rs` reference `ir_search::` (snake_case). Don't change these back to `ir::`.
 - **LLM tests are `#[ignore]`**: `cargo test` skips them. Run `cargo test -- --ignored` only when model files are present.
 - **sqlite-vec must be registered before any connection opens**: `ensure_sqlite_vec()` uses `sqlite3_auto_extension` (process-global). Called once via `OnceLock` in `db/mod.rs`.
 - **`LlamaBackend` is a singleton**: `OnceLock<LlamaBackend>` in `src/llm/mod.rs`. Loading a second model in the same process does NOT call `init()` again — this is intentional.
@@ -104,5 +105,6 @@ Recurring audit axes (auto-maintained by /good-to-go):
 - src/search/filter.rs must have unit tests for eval_clause + match_op — these are pure functions with no DB dependency; easy to test, and zero coverage is a gap [resolved v0.10.0: 9 tests added]
 - FilterOp::Ne on multi-valued fields uses any-match semantics (same as all ops): `meta.tags!=rust` passes if ANY tag != "rust"; document this in README filter table, not just code comments [resolved v0.10.0: documented in both READMEs and tested]
 - items_after_test_module: in Rust files, keep non-test items (impl fns, helper fns) BEFORE any #[cfg(test)] mod block — clippy::items_after_test_module will fail the build
-- build_query_or in db/fts.rs is dead code (suppressed); it should be wired to eval.rs for BEIR evaluation (queries are full sentences — OR semantics avoid stop-word over-matching)
+- build_query_natural in db/fts.rs is used for all production BM25 queries; uses OR + stop word stripping for natural-language queries, AND for short keyword queries
 - cargo clippy --all-targets -- -D warnings must pass before release; check llm/ files for needless_borrow when updating llama.cpp bindings
+- warn_stale_preprocessor() in src/main.rs is a migration shim for ≤0.9.x users — remove at ≥0.13.0 (added v0.10.0)
