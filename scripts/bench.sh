@@ -1,105 +1,267 @@
 #!/usr/bin/env bash
-# Run eval sequentially across named configs, log each run, print summary.
+# Run IR benchmark against a BEIR dataset, optionally comparing two git revisions.
 #
 # Usage:
-#   scripts/bench.sh --data test-data/fiqa [--mode all] [--eval-args "..."] \
-#       baseline \
-#       "B:IR_COMBINED_MODEL=~/local-models/Qwen3.5-0.8B-Q8_0.gguf" \
-#       "C:IR_COMBINED_MODEL=~/local-models/Qwen3.5-2B-Q4_K_M.gguf"
+#   scripts/bench.sh <dataset> [baseline-ref] [--mode bm25|vector|hybrid|all]
 #
-# Each run arg is either:
-#   name                        — no extra env (baseline)
-#   "name:KEY=VAL KEY2=VAL2"    — env vars to prepend
+# Examples:
+#   scripts/bench.sh fiqa
+#   scripts/bench.sh fiqa v0.9.0
+#   scripts/bench.sh miracl-ko
+#   scripts/bench.sh fiqa v0.9.0 --mode bm25
 #
-# Logs written to logs/bench-<dataset>-<name>-<timestamp>.log
+# Dataset names and their auto-detected settings:
+#   fiqa, nfcorpus, scifact, arguana  — English BEIR datasets
+#   miracl-ko                          — Korean MIRACL full corpus (download-miracl-ko.sh)
+#   ko-miracl                          — Korean MIRACL dev split (download-ko-miracl.py)
+#
+# Results cached at logs/results/<dataset>/<git7>.json — reused on re-run.
+# Comparison table printed when two versions are evaluated.
 
 set -euo pipefail
 
-DATA=""
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+cd "$REPO_ROOT"
+
+# ── Parse args ───────────────────────────────────────────────────────────────
+
+DATASET=""
+BASELINE_REF=""
 MODE="all"
-EVAL_ARGS=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --data)      DATA="$2";       shift 2 ;;
-        --mode)      MODE="$2";       shift 2 ;;
-        --eval-args) EVAL_ARGS="$2";  shift 2 ;;
+        --mode) MODE="$2"; shift 2 ;;
         --) shift; break ;;
-        -*) echo "unknown flag: $1" >&2; exit 1 ;;
-        *)  break ;;
+        -*)  echo "unknown flag: $1" >&2; exit 1 ;;
+        *)
+            if [[ -z "$DATASET" ]]; then
+                DATASET="$1"
+            elif [[ -z "$BASELINE_REF" ]]; then
+                BASELINE_REF="$1"
+            else
+                echo "unexpected argument: $1" >&2; exit 1
+            fi
+            shift
+            ;;
     esac
 done
 
-if [[ -z "$DATA" ]]; then
-    echo "usage: $0 --data <dataset-path> [--mode all] [run-specs...]" >&2
+if [[ -z "$DATASET" ]]; then
+    echo "usage: $0 <dataset> [baseline-ref] [--mode bm25|vector|hybrid|all]" >&2
     exit 1
 fi
 
-DATASET=$(basename "$DATA")
-TIMESTAMP=$(date +%Y%m%d-%H%M%S)
-LOG_DIR="logs"
+# ── Dataset config ────────────────────────────────────────────────────────────
+
+case "$DATASET" in
+    fiqa)
+        DATA_PATH="test-data/fiqa"
+        PREPROCESSOR=""
+        DOWNLOAD_CMD="scripts/download-beir.sh fiqa"
+        EMBED_FLAG="--embed"
+        ;;
+    nfcorpus)
+        DATA_PATH="test-data/nfcorpus"
+        PREPROCESSOR=""
+        DOWNLOAD_CMD="scripts/download-beir.sh nfcorpus"
+        EMBED_FLAG="--embed"
+        ;;
+    scifact)
+        DATA_PATH="test-data/scifact"
+        PREPROCESSOR=""
+        DOWNLOAD_CMD="scripts/download-beir.sh scifact"
+        EMBED_FLAG="--embed"
+        ;;
+    arguana)
+        DATA_PATH="test-data/arguana"
+        PREPROCESSOR=""
+        DOWNLOAD_CMD="scripts/download-beir.sh arguana"
+        EMBED_FLAG="--embed"
+        ;;
+    miracl-ko)
+        DATA_PATH="test-data/miracl-ko"
+        PREPROCESSOR="ko"
+        DOWNLOAD_CMD="scripts/download-miracl-ko.sh"
+        EMBED_FLAG="--embed"
+        ;;
+    ko-miracl)
+        DATA_PATH="test-data/ko-miracl"
+        PREPROCESSOR="ko"
+        DOWNLOAD_CMD="uv run scripts/download-ko-miracl.py"
+        EMBED_FLAG="--embed"
+        ;;
+    *)
+        echo "unknown dataset '$DATASET'. See script header for supported datasets." >&2
+        exit 1
+        ;;
+esac
+
+# BM25-only mode: skip embedding
+if [[ "$MODE" == "bm25" ]]; then
+    EMBED_FLAG=""
+fi
+
+# ── Download dataset if missing ───────────────────────────────────────────────
+
+if [[ ! -f "$DATA_PATH/corpus.jsonl" ]]; then
+    echo "==> Dataset '$DATASET' not found. Downloading..."
+    eval "$DOWNLOAD_CMD"
+fi
+
+# ── Build ir binary ───────────────────────────────────────────────────────────
+
+echo "==> Building ir (HEAD)..."
+cargo build --release --bin ir 2>&1
+HEAD_BIN="$REPO_ROOT/target/release/ir"
+HEAD_HASH=$(git rev-parse --short=7 HEAD)
+echo "    HEAD: $HEAD_HASH"
+
+# ── Build baseline if requested ───────────────────────────────────────────────
+
+BASELINE_BIN=""
+BASELINE_HASH=""
+
+if [[ -n "$BASELINE_REF" ]]; then
+    BASELINE_HASH=$(git rev-parse --short=7 "$BASELINE_REF" 2>/dev/null) || {
+        echo "ERROR: git ref '$BASELINE_REF' not found" >&2; exit 1
+    }
+
+    if [[ "$BASELINE_HASH" == "$HEAD_HASH" ]]; then
+        echo "==> Baseline $BASELINE_REF ($BASELINE_HASH) matches HEAD — reusing binary"
+        BASELINE_BIN="$HEAD_BIN"
+    else
+        WORKTREE="/tmp/ir-bench-$BASELINE_HASH"
+        if [[ ! -d "$WORKTREE" ]]; then
+            echo "==> Creating worktree for $BASELINE_REF ($BASELINE_HASH)..."
+            git worktree add --quiet "$WORKTREE" "$BASELINE_REF"
+        fi
+        echo "==> Building ir ($BASELINE_REF)..."
+        cargo build --release --bin ir --manifest-path "$WORKTREE/Cargo.toml" 2>&1
+        BASELINE_BIN="$WORKTREE/target/release/ir"
+        echo "    baseline: $BASELINE_HASH"
+    fi
+fi
+
+# ── Run one version ───────────────────────────────────────────────────────────
+
+LOG_DIR="$REPO_ROOT/logs/results/$DATASET"
 mkdir -p "$LOG_DIR"
 
-# Results stored as lines: "name<TAB>ndcg<TAB>recall" in a temp file.
-RESULTS_FILE=$(mktemp)
-trap 'rm -f "$RESULTS_FILE"' EXIT
+run_version() {
+    local label="$1"
+    local git7="$2"
+    local ir_bin="$3"
+    local collection="eval-${DATASET}-${git7}"
+    local result_file="$LOG_DIR/${git7}.json"
 
-echo "==> building eval..."
-cargo build --release --bin eval --features bench 2>&1
-echo ""
-
-for spec in "$@"; do
-    if [[ "$spec" == *:* ]]; then
-        name="${spec%%:*}"
-        env_part="${spec#*:}"
-    else
-        name="$spec"
-        env_part=""
+    if [[ -f "$result_file" ]]; then
+        echo "==> [$label $git7] cached ($result_file)"
+        return 0
     fi
 
-    log="$LOG_DIR/bench-${DATASET}-${name}-${TIMESTAMP}.log"
-    json_out="$LOG_DIR/bench-${DATASET}-${name}-${TIMESTAMP}.json"
-    echo "==> [$name] starting  (log: $log)"
+    echo "==> [$label $git7] preparing collection..."
+    prep_args=(
+        prepare
+        --ir-bin "$ir_bin"
+        --data "$DATA_PATH"
+        --collection "$collection"
+    )
+    [[ -n "$PREPROCESSOR" ]] && prep_args+=(--preprocessor "$PREPROCESSOR")
+    [[ -n "$EMBED_FLAG" ]] && prep_args+=($EMBED_FLAG)
+    python3 scripts/beir-eval.py "${prep_args[@]}"
 
-    cmd="cargo run --release --features bench --bin eval -- --data $DATA --mode $MODE --emit-json $json_out $EVAL_ARGS"
-    if [[ -n "$env_part" ]]; then
-        cmd="$env_part $cmd"
+    echo "==> [$label $git7] running queries (mode=$MODE)..."
+    python3 scripts/beir-eval.py run \
+        --ir-bin "$ir_bin" \
+        --data "$DATA_PATH" \
+        --collection "$collection" \
+        --mode "$MODE" \
+        --at-k "10,20,100" \
+        --output "$result_file"
+
+    echo "==> [$label $git7] done -> $result_file"
+}
+
+run_version "HEAD" "$HEAD_HASH" "$HEAD_BIN"
+[[ -n "$BASELINE_REF" ]] && run_version "base" "$BASELINE_HASH" "$BASELINE_BIN"
+
+# ── Print comparison table ────────────────────────────────────────────────────
+
+print_table_row() {
+    local label="$1"
+    local git7="$2"
+    local result_file="$LOG_DIR/${git7}.json"
+
+    if [[ ! -f "$result_file" ]]; then
+        printf "  %-22s  %-7s  %8s  %8s  %8s  %8s  %8s  %9s  %8s\n" \
+               "$label" "$git7" "MISSING" "-" "-" "-" "-" "-" "-"
+        return
     fi
 
-    set +e
-    eval "$cmd" 2>&1 | tee "$log"
-    status="${PIPESTATUS[0]}"
-    set -e
-
-    if [[ "$status" -eq 0 ]] && [[ -f "$json_out" ]]; then
-        read -r ndcg recall < <(python3 - "$json_out" <<'EOF'
+    # Pick best mode: hybrid > vector > bm25
+    local best_mode
+    best_mode=$(python3 - "$result_file" <<'EOF'
 import json, sys
-with open(sys.argv[1]) as f: d = json.load(f)
-for r in d.get("results", []):
-    if r["mode"] in ("hybrid-rerank", "hybrid"):
-        m = r["metrics"]
-        print(m.get("ndcg_10", "?"), m.get("recall_10", "?"))
-        break
-else:
-    print("? ?")
+d = json.load(open(sys.argv[1]))
+for mode in ("hybrid", "vector", "bm25"):
+    if any(r["mode"] == mode for r in d["results"]):
+        print(mode); break
 EOF
 )
-        printf '%s\t%s\t%s\n' "$name" "${ndcg:-?}" "${recall:-?}" >> "$RESULTS_FILE"
-        echo ""
-        echo "==> [$name] done  nDCG@10=${ndcg:-?}  Recall@10=${recall:-?}"
-    else
-        printf '%s\tFAILED\t-\n' "$name" >> "$RESULTS_FILE"
-        echo "==> [$name] FAILED (exit $status, see $log)"
-    fi
-    echo ""
-done
 
-echo "══════════════════════════════════════════════════════"
-echo "  Benchmark summary — $DATASET  ($TIMESTAMP)"
-echo "══════════════════════════════════════════════════════"
-printf "  %-20s  %10s  %12s\n" "run" "nDCG@10" "Recall@10"
-printf "  %-20s  %10s  %12s\n" "--------------------" "----------" "------------"
-while IFS=$'\t' read -r name ndcg recall; do
-    printf "  %-20s  %10s  %12s\n" "$name" "$ndcg" "$recall"
-done < "$RESULTS_FILE"
-echo "══════════════════════════════════════════════════════"
+    python3 - "$result_file" "$best_mode" "$label" "$git7" <<'EOF'
+import json, sys
+data  = json.load(open(sys.argv[1]))
+bmode = sys.argv[2]
+label = sys.argv[3]
+git7  = sys.argv[4]
+
+def get(results, mode, key, default="?"):
+    for r in results:
+        if r["mode"] == mode:
+            return r["metrics"].get(key, r["timing"].get(key, default))
+    return default
+
+rs = data["results"]
+n10  = get(rs, bmode, "ndcg_10")
+n20  = get(rs, bmode, "ndcg_20")
+r10  = get(rs, bmode, "recall_10")
+r20  = get(rs, bmode, "recall_20")
+r100 = get(rs, bmode, "recall_100")
+r1k  = get(rs, "bm25", "recall_1000")
+med  = get(rs, bmode, "median_ms")
+
+fmt = lambda v: f"{v:.4f}" if isinstance(v, float) else str(v)
+print(f"  {label:<22}  {git7:<7}  {fmt(n10):>8}  {fmt(n20):>8}  {fmt(r10):>8}  {fmt(r20):>8}  {fmt(r100):>8}  {fmt(r1k):>9}  {fmt(med):>8}")
+EOF
+}
+
+echo ""
+echo "══════════════════════════════════════════════════════════════════════════════════════"
+echo "  Benchmark — $DATASET  (mode=$MODE)"
+echo "══════════════════════════════════════════════════════════════════════════════════════"
+printf "  %-22s  %-7s  %8s  %8s  %8s  %8s  %8s  %9s  %8s\n" \
+       "run" "git" "nDCG@10" "nDCG@20" "R@10" "R@20" "R@100" "R@1000" "med ms"
+printf "  %-22s  %-7s  %8s  %8s  %8s  %8s  %8s  %9s  %8s\n" \
+       "----------------------" "-------" "--------" "--------" "--------" "--------" "--------" "---------" "--------"
+
+print_table_row "HEAD" "$HEAD_HASH"
+[[ -n "$BASELINE_REF" ]] && print_table_row "$BASELINE_REF" "$BASELINE_HASH"
+
+echo "══════════════════════════════════════════════════════════════════════════════════════"
+
+# ── Cleanup worktree prompt ───────────────────────────────────────────────────
+
+if [[ -n "$BASELINE_REF" && -n "$BASELINE_HASH" && "$BASELINE_HASH" != "$HEAD_HASH" ]]; then
+    WORKTREE="/tmp/ir-bench-$BASELINE_HASH"
+    if [[ -d "$WORKTREE" ]]; then
+        echo ""
+        read -rp "Remove worktree $WORKTREE? [y/N] " ans
+        if [[ "$ans" =~ ^[Yy] ]]; then
+            git worktree remove --force "$WORKTREE"
+            echo "Removed."
+        fi
+    fi
+fi
