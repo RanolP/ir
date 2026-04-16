@@ -386,14 +386,18 @@ pub fn start_server(timeout_secs: u64) -> Result<()> {
                     eprintln!("  reranker ready ({})", crate::llm::models::RERANKER);
                     Box::new(r) as Box<dyn crate::llm::scoring::Scorer>
                 });
-            if exp.is_some() || rer.is_some() {
-                eprintln!("  tier-2: dedicated mode");
+            match (&exp, &rer) {
+                (Some(_), Some(_)) => eprintln!("  tier-2: dedicated mode"),
+                (Some(_), None) => eprintln!("  warn: expander loaded but reranker unavailable — tier-2 disabled"),
+                (None, Some(_)) => eprintln!("  warn: reranker loaded but expander unavailable — tier-2 disabled"),
+                (None, None) => {}
             }
-            (exp, rer)
+            // Tier-2 is all-or-nothing: expander without reranker (or vice versa) is a no-op.
+            if exp.is_some() && rer.is_some() { (exp, rer) } else { (None, None) }
         };
 
         // Send models to main thread before writing signal file.
-        if expander.is_some() || scorer.is_some() {
+        if expander.is_some() && scorer.is_some() {
             let _ = tx.send(Tier2 { expander, scorer });
             let _ = std::fs::write(&tier2_path_bg, "");
             eprintln!("  tier-2 ready");
