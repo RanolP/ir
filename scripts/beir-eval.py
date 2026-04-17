@@ -5,12 +5,15 @@ beir-eval.py — Drive the ir binary against a BEIR dataset and compute metrics.
 Subcommands:
   prepare   Convert BEIR corpus -> ir collection (index + embed)
   run       Query collection, compute nDCG/Recall, output JSON
+  sample    Sample a large corpus to a target size for threshold research
 """
 
 import argparse
 import json
 import math
 import os
+import random
+import shutil
 import subprocess
 import sys
 import time
@@ -111,10 +114,10 @@ def percentile(values: list, p: float) -> float:
 
 # ── ir CLI helpers ──────────────────────────────────────────────────────────
 
-def run_ir(ir_bin: str, *args, check=True, capture_output=True, timeout=120) -> subprocess.CompletedProcess:
+def run_ir(ir_bin: str, *args, check=True, capture_output=True, timeout=120, env=None) -> subprocess.CompletedProcess:
     cmd = [ir_bin] + list(args)
     return subprocess.run(cmd, capture_output=capture_output, text=True,
-                          check=check, timeout=timeout)
+                          check=check, timeout=timeout, env=env)
 
 
 def collection_exists(ir_bin: str, name: str) -> bool:
@@ -125,21 +128,37 @@ def collection_exists(ir_bin: str, name: str) -> bool:
         return False
 
 
-def search_one(ir_bin: str, collection: str, mode: str, query: str, limit: int) -> tuple:
-    """Returns (ranked_doc_ids, elapsed_ms). ranked_doc_ids are extracted from path field."""
+def search_one(ir_bin: str, collection: str, mode: str, query: str, limit: int,
+               env: dict | None = None) -> tuple:
+    """Returns (ranked_doc_ids, elapsed_ms, signals). ranked_doc_ids from path field."""
     start = time.monotonic()
     try:
         result = run_ir(ir_bin, "search", "-c", collection,
                         "--mode", mode, "-n", str(limit),
-                        "--json", "-q", query, timeout=60)
+                        "--json", "-q", query, timeout=60, env=env)
         elapsed_ms = (time.monotonic() - start) * 1000
         hits = json.loads(result.stdout) if result.stdout.strip() else []
-        # path field is "{doc_id}.txt" — strip the extension
         doc_ids = [h["path"].removesuffix(".txt") for h in hits]
-        return doc_ids, elapsed_ms
+        signals = _parse_signals(result.stderr)
+        return doc_ids, elapsed_ms, signals
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, json.JSONDecodeError):
         elapsed_ms = (time.monotonic() - start) * 1000
-        return [], elapsed_ms
+        return [], elapsed_ms, {}
+
+
+def _parse_signals(stderr: str) -> dict:
+    """Parse SIGNAL_BM25 and SIGNAL_FUSED lines from ir stderr."""
+    signals = {}
+    for line in (stderr or "").splitlines():
+        if line.startswith("SIGNAL_BM25\t"):
+            _, top, gap = line.split("\t")
+            signals["bm25_top"] = float(top)
+            signals["bm25_gap"] = float(gap)
+        elif line.startswith("SIGNAL_FUSED\t"):
+            _, top, gap = line.split("\t")
+            signals["fused_top"] = float(top)
+            signals["fused_gap"] = float(gap)
+    return signals
 
 
 # ── Subcommand: prepare ─────────────────────────────────────────────────────
@@ -225,6 +244,12 @@ def cmd_run(args):
     ir_bin = args.ir_bin
     collection = args.collection
 
+    # Signal mode: run bm25+vector+hybrid with IR_BENCH_SIGNALS+IR_DISABLE_SHORTCUTS,
+    # write per-query JSONL to signals_output dir.
+    if args.signals:
+        _run_signals(args, queries, qrels, at_ks, fetch_k, ir_bin, collection)
+        return
+
     all_results = []
 
     for mode in modes:
@@ -239,7 +264,7 @@ def cmd_run(args):
             if not relevant:
                 continue
 
-            ranked, elapsed_ms = search_one(ir_bin, collection, mode, q["text"], effective_k)
+            ranked, elapsed_ms, _ = search_one(ir_bin, collection, mode, q["text"], effective_k)
             ranked_all.append((q["id"], ranked, relevant))
 
             if i >= WARMUP:
@@ -300,6 +325,149 @@ def cmd_run(args):
         print(json.dumps(output, indent=2))
 
 
+def _run_signals(args, queries, qrels, at_ks, fetch_k, ir_bin, collection):
+    """Run bm25+vector+hybrid with signal capture; write per-query JSONL."""
+    out_dir = Path(args.signals_output)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Stop any running daemon so it restarts with IR_BENCH_SIGNALS in its env.
+    # A daemon started without IR_BENCH_SIGNALS won't emit SIGNAL_FUSED.
+    try:
+        subprocess.run([ir_bin, "daemon", "stop"], capture_output=True, timeout=10)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
+        pass
+
+    # Build subprocess env with signal instrumentation
+    signal_env = os.environ.copy()
+    signal_env["IR_BENCH_SIGNALS"] = "1"
+    signal_env["IR_DISABLE_SHORTCUTS"] = "1"
+
+    modes_to_run = ["bm25", "vector", "hybrid"]
+    files = {m: open(out_dir / f"{m}.jsonl", "w") for m in modes_to_run}
+
+    try:
+        total = len(queries)
+        for i, q in enumerate(queries):
+            relevant = qrels.get(q["id"], {})
+            if not relevant:
+                continue
+
+            for mode in modes_to_run:
+                effective_k = max(fetch_k, 1000) if mode == "bm25" else fetch_k
+                ranked, elapsed_ms, signals = search_one(
+                    ir_bin, collection, mode, q["text"], effective_k, env=signal_env
+                )
+                rec = {
+                    "query_id": q["id"],
+                    "query_text": q["text"],
+                    "ranked": ranked,
+                    "elapsed_ms": round(elapsed_ms, 1),
+                }
+                # Attach signals to the mode that produces them
+                rec.update(signals)
+                # Per-k metrics
+                for k in at_ks:
+                    rec[f"ndcg{k}"] = round(ndcg_at_k(ranked, relevant, k), 6)
+                    rec[f"recall{k}"] = round(recall_at_k(ranked, relevant, k), 6)
+                if mode == "bm25":
+                    rec["recall1000"] = round(recall_at_k(ranked, relevant, 1000), 6)
+                files[mode].write(json.dumps(rec) + "\n")
+
+            if (i + 1) % 20 == 0:
+                print(f"  {i + 1}/{total} queries", end="\r", flush=True)
+
+        print(f"  {total}/{total} queries done   ")
+        for mode in modes_to_run:
+            print(f"  {mode} -> {out_dir}/{mode}.jsonl")
+    finally:
+        for f in files.values():
+            f.close()
+
+
+# ── Subcommand: sample ──────────────────────────────────────────────────────
+
+def cmd_sample(args):
+    data_dir = Path(args.data)
+    out_dir = Path(args.output)
+
+    if out_dir.exists() and any(out_dir.iterdir()):
+        print(f"ERROR: output directory {out_dir} already exists and is non-empty", file=sys.stderr)
+        sys.exit(1)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    corpus_path = data_dir / "corpus.jsonl"
+    qrels_dir = data_dir / "qrels"
+    queries_path = data_dir / "queries.jsonl"
+
+    if not corpus_path.exists():
+        print(f"ERROR: {corpus_path} not found", file=sys.stderr)
+        sys.exit(1)
+
+    # Load qrels to find mandatory doc IDs
+    print("Loading qrels to identify mandatory docs...")
+    all_qrels = load_qrels(qrels_dir / "test.tsv")
+    mandatory_ids = set()
+    for doc_map in all_qrels.values():
+        mandatory_ids.update(doc_map.keys())
+    print(f"  {len(mandatory_ids)} mandatory docs (referenced in qrels)")
+
+    # Stream corpus, separate mandatory from remainder
+    print("Streaming corpus...")
+    mandatory_docs = {}
+    remainder_ids = []
+    with open(corpus_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            doc = json.loads(line)
+            doc_id = doc["_id"]
+            if doc_id in mandatory_ids:
+                mandatory_docs[doc_id] = doc
+            else:
+                remainder_ids.append(doc_id)
+
+    corpus_size = len(mandatory_docs) + len(remainder_ids)
+    print(f"  corpus total: {corpus_size:,}  mandatory: {len(mandatory_docs):,}  remainder: {len(remainder_ids):,}")
+
+    target = args.size
+    if len(mandatory_docs) >= target:
+        print(f"WARNING: mandatory docs ({len(mandatory_docs)}) >= target size ({target}). Using mandatory only.")
+        sample_remainder = []
+    else:
+        need = target - len(mandatory_docs)
+        rng = random.Random(args.seed)
+        sample_remainder = rng.sample(remainder_ids, min(need, len(remainder_ids)))
+        print(f"  sampling {len(sample_remainder)} remainder docs (seed={args.seed})")
+
+    # Write sampled corpus.jsonl — need a second pass for the sampled remainder
+    sampled_ids = set(mandatory_docs.keys()) | set(sample_remainder)
+    print(f"Writing sampled corpus ({len(sampled_ids):,} docs) -> {out_dir}/corpus.jsonl")
+    out_corpus = out_dir / "corpus.jsonl"
+    written = 0
+    with open(corpus_path) as f_in, open(out_corpus, "w") as f_out:
+        for line in f_in:
+            line = line.strip()
+            if not line:
+                continue
+            doc = json.loads(line)
+            if doc["_id"] in sampled_ids:
+                f_out.write(json.dumps(doc) + "\n")
+                written += 1
+
+    print(f"  {written} docs written")
+
+    # Copy queries.jsonl and qrels/
+    print(f"Copying queries and qrels...")
+    shutil.copy2(queries_path, out_dir / "queries.jsonl")
+    out_qrels = out_dir / "qrels"
+    out_qrels.mkdir(exist_ok=True)
+    for qrels_file in qrels_dir.iterdir():
+        shutil.copy2(qrels_file, out_qrels / qrels_file.name)
+
+    print(f"Done. Sampled dataset at {out_dir}/")
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
@@ -325,13 +493,30 @@ def main():
     run_p.add_argument("--at-k", default="10,20,100", help="Comma-separated k values (default: 10,20,100)")
     run_p.add_argument("--max-queries", type=int, help="Limit number of queries")
     run_p.add_argument("--output", "-o", help="Write JSON results to file")
+    run_p.add_argument("--signals", action="store_true",
+                       help="Capture per-query signal data (bm25_top/gap, fused_top/gap). "
+                            "Runs bm25+vector+hybrid with IR_BENCH_SIGNALS+IR_DISABLE_SHORTCUTS. "
+                            "Requires --signals-output.")
+    run_p.add_argument("--signals-output", metavar="DIR",
+                       help="Directory for per-query signal JSONL files (required with --signals)")
+
+    # sample
+    samp = sub.add_parser("sample", help="Sample a large corpus to a target size")
+    samp.add_argument("--data", required=True, help="Source BEIR dataset directory")
+    samp.add_argument("--size", type=int, required=True, help="Target corpus size (number of docs)")
+    samp.add_argument("--seed", type=int, default=42, help="Random seed (default: 42)")
+    samp.add_argument("--output", required=True, help="Output directory for sampled dataset")
 
     args = p.parse_args()
 
     if args.cmd == "prepare":
         cmd_prepare(args)
     elif args.cmd == "run":
+        if args.signals and not args.signals_output:
+            p.error("--signals requires --signals-output DIR")
         cmd_run(args)
+    elif args.cmd == "sample":
+        cmd_sample(args)
 
 
 if __name__ == "__main__":
