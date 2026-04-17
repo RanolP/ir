@@ -92,10 +92,17 @@ impl HybridSearch {
             return Ok(SearchOutput { results: vec![], log: log.log });
         }
 
-        // Log fused score distribution for threshold calibration.
+        // Log fused score distribution and coverage ratio for threshold calibration.
         if log.verbose {
             let scores: Vec<String> = fused.iter().take(5).map(|r| format!("{:.3}", r.score)).collect();
             log.log.push(format!("[fused] top-5 scores: [{}]", scores.join(", ")));
+            let doc_count: usize = dbs.iter().map(|db| db.active_doc_count()).sum();
+            let fetch_n = req.limit * 3; // ^ matches score_fusion_two_list no-filter path
+            let coverage = if doc_count > 0 { (fetch_n * 2) as f64 / doc_count as f64 } else { 1.0 };
+            log.log.push(format!(
+                "[coverage] fusion_candidates={} corpus={} coverage={:.3} (threshold TBD)",
+                fetch_n * 2, doc_count, coverage
+            ));
         }
 
         // Tier-1 filter: apply to fused list before strong-signal shortcut.
@@ -107,9 +114,19 @@ impl HybridSearch {
             return Ok(SearchOutput { results: vec![], log: log.log });
         }
 
+        // Research instrumentation: emit fused signal via log (routed back to client stderr).
+        // Activated by IR_BENCH_SIGNALS=1; no-op in normal use.
+        // Uses log.info (not eprintln) because daemon stderr goes to a log file.
+        if std::env::var("IR_BENCH_SIGNALS").is_ok() {
+            let top = fused[0].score;
+            let gap = if fused.len() >= 2 { top - fused[1].score } else { top };
+            log.info(format!("SIGNAL_FUSED\t{top:.6}\t{gap:.6}"));
+        }
+        let disable_shortcuts = std::env::var("IR_DISABLE_SHORTCUTS").is_ok();
+
         // 2. Shortcut: fused results show clear winner AND post-filter count meets limit.
         //    If filter reduced count below limit, escalate to get more candidates from expansion.
-        if is_strong_signal(&fused) && (req.filter.is_empty() || fused.len() >= req.limit) {
+        if !disable_shortcuts && is_strong_signal(&fused) && (req.filter.is_empty() || fused.len() >= req.limit) {
             let top = fused[0].score;
             let gap = fused.get(1).map(|r| top - r.score).unwrap_or(top);
             log.info(format!(

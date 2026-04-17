@@ -345,12 +345,24 @@ pub(crate) fn search_core(
     }
     bm25_results.truncate(limit);
 
+    // Research instrumentation: emit BM25 signal data for threshold calibration.
+    // Activated by IR_BENCH_SIGNALS=1; no-op in normal use.
+    if std::env::var("IR_BENCH_SIGNALS").is_ok() {
+        let top = bm25_results.first().map(|r| r.score).unwrap_or(0.0);
+        let gap = if bm25_results.len() >= 2 { top - bm25_results[1].score } else { top };
+        eprintln!("SIGNAL_BM25\t{top:.6}\t{gap:.6}");
+    }
+    let disable_shortcuts = std::env::var("IR_DISABLE_SHORTCUTS").is_ok();
+
     match search_mode {
         SearchMode::Bm25 => return Ok(bm25_results),
         SearchMode::Vector => {}
         SearchMode::Hybrid => {
             // Only shortcut if post-filter count meets limit (else escalate for more candidates)
-            if search::hybrid::is_bm25_strong_signal(&bm25_results) && (filter.is_empty() || bm25_results.len() >= limit) {
+            if !disable_shortcuts
+                && search::hybrid::is_bm25_strong_signal(&bm25_results)
+                && (filter.is_empty() || bm25_results.len() >= limit)
+            {
                 if !daemon::is_running() {
                     llm::download::prepare_model_envs()?;
                     let _ = daemon::start_in_background();
@@ -378,9 +390,13 @@ pub(crate) fn search_core(
         filter: filter.clauses,
     };
 
+    // SIGNAL_ lines always re-emitted to stderr (picked up by beir-eval --signals).
+    // Other log lines gated on verbosity as usual.
     let log_lines = |lines: &[String]| {
-        if verbosity.show_logs() {
-            for line in lines { eprintln!("{line}"); }
+        for line in lines {
+            if line.starts_with("SIGNAL_") || verbosity.show_logs() {
+                eprintln!("{line}");
+            }
         }
     };
 
@@ -408,7 +424,7 @@ pub(crate) fn search_core(
 
     let tier1_log = tier1.log;
     let tier1_results = to_search_results(tier1.results);
-    if search::hybrid::is_strong_signal(&tier1_results) {
+    if !disable_shortcuts && search::hybrid::is_strong_signal(&tier1_results) {
         if verbosity.show_progress() { eprintln!(); }
         log_lines(&tier1_log);
         return Ok(tier1_results);
@@ -683,13 +699,13 @@ fn known_preprocessors() -> &'static [KnownPreprocessor] {
             alias: "ko",
             description: "Korean morphological analysis (Lindera + ko-dic)",
             dict_name: "ko-dic",
-            token_filter: Some(r#"{"kind":"korean_stop_tags","tags":["JKS","JKC","JKG","JKO","JKB","JKV","JKQ","JX","JC","EP","EF","EC","ETN","ETM","XPN","XSN","XSV","XSA","SF","SP","SS","SE","SO","SW","SWK"]}"#),
+            token_filter: Some(r#"korean_stop_tags:{"tags":["JKS","JKC","JKG","JKO","JKB","JKV","JKQ","JX","JC","EP","EF","EC","ETN","ETM","XPN","XSN","XSV","XSA","SF","SP","SS","SE","SO","SW","SWK"]}"#),
         },
         KnownPreprocessor {
             alias: "ja",
             description: "Japanese morphological analysis (Lindera + ipadic)",
             dict_name: "ipadic",
-            token_filter: Some(r#"{"kind":"japanese_stop_tags","tags":["助詞","助動詞","記号","接続詞","感動詞","フィラー"]}"#),
+            token_filter: Some(r#"japanese_stop_tags:{"tags":["接続詞","助詞","助動詞","記号","フィラー","非言語音","その他,間投"]}"#),
         },
         KnownPreprocessor {
             alias: "zh",
@@ -819,25 +835,33 @@ fn lindera_platform_triple() -> Result<&'static str> {
     }
 }
 
-/// Returns the latest lindera release tag (e.g. "v3.0.5") via GitHub API.
+/// Returns the latest lindera release tag (e.g. "v3.0.5").
+/// Follows the releases/latest redirect — no API key, no rate limit.
 fn fetch_lindera_tag() -> Result<String> {
+    // GitHub redirects /releases/latest → /releases/tag/vX.Y.Z
     let output = std::process::Command::new("curl")
-        .args(["-fsSL", "-H", "Accept: application/vnd.github.v3+json",
-               "https://api.github.com/repos/lindera/lindera/releases/latest"])
+        .args(["-fsSLI", "https://github.com/lindera/lindera/releases/latest"])
         .output()
         .map_err(|e| error::Error::Other(format!("curl: {e}")))?;
     if !output.status.success() {
         return Err(error::Error::Other(
-            "failed to fetch lindera release info (GitHub API rate limit or network error)".into()
+            "failed to fetch lindera release info (network error)".into()
         ));
     }
-    let json: serde_json::Value = serde_json::from_slice(&output.stdout)
-        .map_err(|e| error::Error::Other(format!("parse release JSON: {e}")))?;
-    json["tag_name"]
-        .as_str()
+    let headers = String::from_utf8_lossy(&output.stdout);
+    let location = headers.lines()
+        .find_map(|line| {
+            line.to_ascii_lowercase().starts_with("location:")
+                .then(|| line["location:".len()..].trim().to_string())
+        })
+        .ok_or_else(|| error::Error::Other(
+            "no redirect from github.com/lindera/lindera/releases/latest".into()
+        ))?;
+    location.rsplit('/').next()
+        .filter(|tag| tag.starts_with('v'))
         .map(|s| s.to_string())
         .ok_or_else(|| error::Error::Other(
-            "unexpected GitHub API response (missing tag_name)".into()
+            format!("unexpected redirect URL: {location}")
         ))
 }
 
@@ -872,6 +896,7 @@ fn install_lindera_binary(preprocessors_dir: &Path, tag: &str, triple: &str) -> 
 }
 
 /// Download and extract a lindera language dictionary into preprocessors_dir/{dict_name}/.
+/// Skips if dict_dir already contains files.
 fn install_lindera_dict(
     preprocessors_dir: &Path,
     dict_name: &str,
@@ -879,6 +904,9 @@ fn install_lindera_dict(
     version: &str,
 ) -> Result<PathBuf> {
     let dict_dir = preprocessors_dir.join(dict_name);
+    if dict_dir.is_dir() && std::fs::read_dir(&dict_dir)?.next().is_some() {
+        return Ok(dict_dir);
+    }
     std::fs::create_dir_all(&dict_dir)?;
     let filename = format!("lindera-{dict_name}-{version}.zip");
     let url = format!("https://github.com/lindera/lindera/releases/download/{tag}/{filename}");
