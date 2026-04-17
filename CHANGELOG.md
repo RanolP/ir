@@ -1,5 +1,7 @@
 ## [Unreleased]
 
+## [0.11.0] - 2026-04-17
+
 ### Bug Fixes
 
 - BM25 now uses OR semantics for natural-language queries (>3 terms): stop words are
@@ -7,10 +9,25 @@
   AND semantics. Fixes near-zero recall on question-format queries (e.g. `ir search --mode bm25
   "what are the symptoms of diabetes"` previously returned almost nothing due to AND forcing
   all stop words to match).
+- Preprocessor subprocess: `process_line` now skips empty/whitespace-only lines instead of
+  sending them to the subprocess. Fixes a deadlock when indexing markdown with blank lines
+  using official lindera CLI (which emits no output for empty input when `--token-filter` is active).
 
 ### Breaking
 
-- `ir preprocessor install ko/ja/zh` now downloads the official lindera CLI binary and per-language dictionaries from lindera's GitHub releases instead of our own bundled binaries. Chinese (`zh`) switches from a custom bigram tokenizer to lindera + jieba (word segmentation). Existing registrations pointing to old bundled binaries are stale — reinstall with `ir preprocessor install <lang>` then re-index with `ir update <collection> --force`.
+- **`ir preprocessor install ko/ja/zh` now uses official lindera releases.** Previously `ir`
+  bundled its own preprocessor binaries in GitHub release artifacts (unreliable — artifacts
+  were occasionally missing). Starting v0.11.0, `ir preprocessor install` downloads the
+  official lindera CLI binary and per-language dictionary directly from lindera's GitHub
+  releases. Chinese (`zh`) switches from a custom bigram tokenizer to lindera + jieba.
+
+  **Migration required if you used a preprocessor before v0.11.0:**
+  ```bash
+  ir preprocessor install ko   # (or ja / zh)
+  ir update <collection> --force
+  ```
+  Existing config entries pointing to old bundled binaries are stale. Search silently degrades
+  (BM25 without tokenization) until reinstalled.
 
 ## [0.10.0] - 2026-04-17
 
