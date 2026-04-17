@@ -1,10 +1,17 @@
-## [Unreleased]
+## [0.10.0] - 2026-04-17
 
 ### Features
 
 - `-f/--filter "FIELD OP VALUE"` on `ir search`: general structured filter supporting built-in fields (`path`, `modified_at`, `created_at`) and YAML frontmatter fields (`meta.<name>`). Operators: `=`, `!=`, `>`, `>=`, `<`, `<=`, `~` (contains), `!~` (not-contains). Multiple `-f` flags are ANDed. Date values are normalized to UTC RFC3339. Applied at all three search pipeline tiers so each exit point returns correctly filtered results.
 - MCP `search` tool gains a structured `filter` array (`[{field, op, value}]`) with full JSON schema — LLM clients see typed enum choices for operators.
 - Frontmatter metadata indexed into a new `document_metadata` table at `ir update` time; supports all scalar values, tag arrays (one row per element), and nested keys.
+
+### Bug Fixes
+
+- Daemon tier-2: reranker without expander now correctly reranks tier-1 fused results (reranking is useful without expansion; expansion alone is harmful, -0.53% nDCG on NFCorpus).
+- Daemon tier-2: `IR_COMBINED_MODEL` load failure now falls back to dedicated models with an explicit warning instead of silently disabling tier-2.
+- Daemon tier-2: conflict between `IR_COMBINED_MODEL` and dedicated model env vars now warns before loading (combined wins).
+- Daemon tier-2: `QMD_EXPANDER_MODEL` / `QMD_RERANKER_MODEL` legacy aliases now correctly trigger dedicated mode instead of falling through to auto-detect.
 
 ### Breaking
 
