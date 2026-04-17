@@ -4,7 +4,7 @@
 // 1. Reads UTF-8 lines from stdin (one line per invocation of process_line)
 // 2. Writes exactly one UTF-8 line to stdout per input line
 // 3. Flushes stdout after each line
-// 4. Handles empty lines (write empty line back)
+// 4. Handles empty lines gracefully (ir skips them — not all tools echo empty lines)
 // 5. Stays alive between lines (no exit-per-line)
 //
 // Register: ir preprocessor add <alias> <command>
@@ -58,6 +58,9 @@ impl PreprocessHandle {
     }
 
     pub fn process_line(&mut self, line: &str) -> Result<String> {
+        if line.trim().is_empty() {
+            return Ok(String::new());
+        }
         self.stdin.write_all(line.as_bytes())?;
         self.stdin.write_all(b"\n")?;
         self.stdin.flush()?;

@@ -103,6 +103,12 @@ impl CollectionDb {
         &self.conn
     }
 
+    pub fn active_doc_count(&self) -> usize {
+        self.conn
+            .query_row("SELECT COUNT(*) FROM documents WHERE active = 1", [], |r| r.get::<_, usize>(0))
+            .unwrap_or(0)
+    }
+
     /// Preprocess a query using the collection's configured preprocessor chain.
     /// Lazily spawns the chain on first call and reuses it for subsequent calls.
     /// Falls back to the raw query on spawn failure or I/O error.
