@@ -1,4 +1,5 @@
 /target
+preprocessors/**/target/
 /test-data/
 /logs/
 
