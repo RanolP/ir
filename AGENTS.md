@@ -35,6 +35,8 @@ Results cached at `logs/results/{dataset}/{git7}.json` (gitignored).
 | `IR_LLAMA_LOGS` | unset | Set to `1` to enable llama.cpp verbose logging |
 | `IR_MODEL_DIRS` | `~/local-models/` | Colon-separated extra model search dirs |
 | `XDG_CONFIG_HOME` | `~/.config` | Overrides config/data dir base |
+| `IR_BENCH_SIGNALS` | unset | Research: emit `SIGNAL_FUSED\ttop\tgap` to pipeline log for threshold tuning |
+| `IR_DISABLE_SHORTCUTS` | unset | Research: disable BM25 + fused strong-signal shortcuts for A/B benchmarking |
 
 Model search order: `IR_*_MODEL` env → `IR_MODEL_DIRS` → `~/local-models/` → `~/.cache/ir/models/` → `~/.cache/qmd/models/`
 
@@ -108,3 +110,4 @@ Recurring audit axes (auto-maintained by /good-to-go):
 - build_query_natural in db/fts.rs is used for all production BM25 queries; uses OR + stop word stripping for natural-language queries, AND for short keyword queries
 - cargo clippy --all-targets -- -D warnings must pass before release; check llm/ files for needless_borrow when updating llama.cpp bindings
 - warn_stale_preprocessor() in src/main.rs is a migration shim for ≤0.9.x users — remove at ≥0.13.0 (added v0.10.0)
+- IR_BENCH_SIGNALS and IR_DISABLE_SHORTCUTS are research-only env vars — must NOT appear in README or CHANGELOG; document only in CLAUDE.md env table
