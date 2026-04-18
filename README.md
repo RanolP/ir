@@ -348,7 +348,7 @@ ir preprocessor remove ko     # unregister (keeps binary)
 ir preprocessor remove ko -d  # unregister and delete binary
 ```
 
-The protocol is stdin/stdout line-by-line: one UTF-8 line in, one tokenized line out, process stays alive between lines. Any executable following this protocol can be registered.
+The protocol is stdin/stdout line-by-line: one UTF-8 line in, zero or one tokenized line out (zero if all tokens are filtered), process stays alive between lines. The subprocess must pass ASCII-only single-word lines through unchanged — `ir` uses an internal sentinel token to detect when a line produces no output. Any executable following this protocol can be registered.
 
 Lindera throughput: ~5,600 Korean docs/s · 1.8 MB/s on M-series Mac. Near-zero cold start (Rust binary, embedded dictionary).
 

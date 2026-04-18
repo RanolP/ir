@@ -1,5 +1,13 @@
 ## [Unreleased]
 
+### Bug Fixes
+
+- Preprocessor pipe deadlock on large Korean collections (issue #13): `process_line` now uses
+  a sentinel-based protocol to handle lines where the official lindera CLI produces no output
+  (e.g. punctuation-only lines where all tokens are filtered by `--token-filter`). Previously,
+  `read_line()` would block forever waiting for output that never arrived, deadlocking both
+  processes. Manifested as a hang at ~60k docs when indexing MIRACL-Ko or other large corpora.
+
 ## [0.11.0] - 2026-04-17
 
 ### Bug Fixes
