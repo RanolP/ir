@@ -1,11 +1,15 @@
 // Preprocessor Plugin Protocol
 //
 // Any executable that:
-// 1. Reads UTF-8 lines from stdin (one line per invocation of process_line)
-// 2. Writes exactly one UTF-8 line to stdout per input line
-// 3. Flushes stdout after each line
-// 4. Handles empty lines gracefully (ir skips them — not all tools echo empty lines)
+// 1. Reads UTF-8 lines from stdin
+// 2. Writes 0 or 1 UTF-8 lines to stdout per input line (0 if all tokens filtered)
+// 3. Flushes stdout after each line (or after producing no output for a line)
+// 4. Passes ASCII-only single-word lines through unchanged (required for sentinel protocol)
 // 5. Stays alive between lines (no exit-per-line)
+//
+// ir uses a sentinel-based protocol to handle case (2): after each content line,
+// ir also sends SENTINEL (ASCII-only). The subprocess echoes SENTINEL unchanged.
+// ir reads until it sees SENTINEL, so a dropped content line doesn't deadlock.
 //
 // Register: ir preprocessor add <alias> <command>
 // Bind:     ir collection add <name> <path> --preprocessor <alias>
@@ -21,6 +25,9 @@
 use crate::error::Result;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+
+// ^ ASCII-only, passes through all lindera language filters unchanged (POS = SL/foreign word)
+const SENTINEL: &str = "IRSENTINEL";
 
 pub struct PreprocessHandle {
     child: Child,
@@ -61,12 +68,28 @@ impl PreprocessHandle {
         if line.trim().is_empty() {
             return Ok(String::new());
         }
+        // Flush content + sentinel together; sentinel unblocks read_line() even when
+        // the content line produced no output (see protocol spec at top of file).
         self.stdin.write_all(line.as_bytes())?;
         self.stdin.write_all(b"\n")?;
+        self.stdin.write_all(SENTINEL.as_bytes())?;
+        self.stdin.write_all(b"\n")?;
         self.stdin.flush()?;
-        let mut out = String::new();
-        self.stdout.read_line(&mut out)?;
-        Ok(out.trim_end_matches('\n').to_string())
+        let mut parts = Vec::new();
+        let mut buf = String::new();
+        loop {
+            buf.clear();
+            let n = self.stdout.read_line(&mut buf)?;
+            if n == 0 {
+                break; // subprocess exited unexpectedly; treat as end of output
+            }
+            let s = buf.trim_end_matches('\n');
+            if s == SENTINEL {
+                break;
+            }
+            parts.push(s.to_string());
+        }
+        Ok(parts.join(" "))
     }
 
     /// Process multi-line text: split on '\n', process each line, rejoin.
@@ -225,5 +248,44 @@ mod tests {
         assert!(chain.is_active());
         let out = chain.process_text("hello\nworld").unwrap();
         assert_eq!(out, "hello\nworld");
+    }
+
+    // Writes a Python filter script that drops '.' lines and flushes after each output.
+    // grep/sed/tr/sort all block-buffer in pipe mode on macOS — use Python with flush=True
+    // (same reason cat is used for other protocol tests — see CLAUDE.md).
+    #[cfg(unix)]
+    fn write_dot_filter_script(suffix: &str) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        const SCRIPT: &[u8] = b"#!/usr/bin/env python3\nimport sys\nfor line in sys.stdin:\n    s=line.rstrip('\\n')\n    if s != '.':\n        print(s, flush=True)\n";
+        let path = format!("{}/ir-test-{}-{}.py", std::env::temp_dir().display(), suffix, std::process::id());
+        std::fs::write(&path, SCRIPT).unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sentinel_handles_dropped_line() {
+        let path = write_dot_filter_script("filter");
+        let mut handle = PreprocessHandle::spawn(&path).unwrap();
+        // Punctuation-only line → filter drops it → sentinel must unblock read_line()
+        let out = handle.process_line(".").unwrap();
+        assert_eq!(out, "", "filtered line should return empty string, not deadlock");
+        let out = handle.process_line("hello").unwrap();
+        assert_eq!(out, "hello");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sentinel_handles_mixed_document() {
+        let path = write_dot_filter_script("filter2");
+        let mut handle = PreprocessHandle::spawn(&path).unwrap();
+        let text = "first line\n.\nsecond line\n.\nthird line";
+        let out = handle.process_text(text).unwrap();
+        assert_eq!(out, "first line\n\nsecond line\n\nthird line");
+        std::fs::remove_file(&path).ok();
     }
 }
