@@ -1,10 +1,12 @@
 ## [Unreleased]
 
+## [0.11.2] - 2026-04-18
+
 ### Bug Fixes
 
 - Preprocessor install: pin lindera download to v3.0.5 instead of resolving `/releases/latest`
   at install time. Prevents silent breakage if lindera ships a major version with changed CLI
-  flags or tokenizer output format.
+  flags or tokenizer output format. ([`2cdbd78`](https://github.com/vlwkaos/ir/commit/2cdbd78))
 
 ## [0.11.1] - 2026-04-18
 
