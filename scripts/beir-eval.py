@@ -151,9 +151,11 @@ def _parse_signals(stderr: str) -> dict:
     signals = {}
     for line in (stderr or "").splitlines():
         if line.startswith("SIGNAL_BM25\t"):
-            _, top, gap = line.split("\t")
-            signals["bm25_top"] = float(top)
-            signals["bm25_gap"] = float(gap)
+            parts = line.split("\t")
+            signals["bm25_top"] = float(parts[1])
+            signals["bm25_gap"] = float(parts[2])
+            if len(parts) > 3 and parts[3]:
+                signals["bm25_scores"] = [float(s) for s in parts[3].split(",") if s]
         elif line.startswith("SIGNAL_FUSED\t"):
             _, top, gap = line.split("\t")
             signals["fused_top"] = float(top)
@@ -208,12 +210,12 @@ def cmd_prepare(args):
 
     # Index (no-op if unchanged)
     print(f"Indexing...")
-    run_ir(ir_bin, "update", collection, capture_output=False, timeout=3600)
+    run_ir(ir_bin, "update", collection, capture_output=False, timeout=86400)  # 24h for large corpora
 
     # Embed if requested
     if args.embed:
         print(f"Embedding...")
-        run_ir(ir_bin, "embed", collection, capture_output=False, timeout=7200)
+        run_ir(ir_bin, "embed", collection, capture_output=False, timeout=86400)  # 24h for large corpora
 
     print("Done.")
 
@@ -343,7 +345,21 @@ def _run_signals(args, queries, qrels, at_ks, fetch_k, ir_bin, collection):
     signal_env["IR_DISABLE_SHORTCUTS"] = "1"
 
     modes_to_run = ["bm25", "vector", "hybrid"]
-    files = {m: open(out_dir / f"{m}.jsonl", "w") for m in modes_to_run}
+
+    # Resume: load already-completed query IDs per mode
+    done: dict[str, set] = {}
+    for mode in modes_to_run:
+        path = out_dir / f"{mode}.jsonl"
+        if path.exists():
+            done[mode] = {json.loads(l)["query_id"] for l in path.open() if l.strip()}
+        else:
+            done[mode] = set()
+
+    n_done = min(len(done[m]) for m in modes_to_run)
+    if n_done:
+        print(f"  resuming from query {n_done} (already completed)")
+
+    files = {m: open(out_dir / f"{m}.jsonl", "a") for m in modes_to_run}
 
     try:
         total = len(queries)
@@ -353,6 +369,8 @@ def _run_signals(args, queries, qrels, at_ks, fetch_k, ir_bin, collection):
                 continue
 
             for mode in modes_to_run:
+                if q["id"] in done[mode]:
+                    continue
                 effective_k = max(fetch_k, 1000) if mode == "bm25" else fetch_k
                 ranked, elapsed_ms, signals = search_one(
                     ir_bin, collection, mode, q["text"], effective_k, env=signal_env
@@ -363,15 +381,14 @@ def _run_signals(args, queries, qrels, at_ks, fetch_k, ir_bin, collection):
                     "ranked": ranked,
                     "elapsed_ms": round(elapsed_ms, 1),
                 }
-                # Attach signals to the mode that produces them
                 rec.update(signals)
-                # Per-k metrics
                 for k in at_ks:
                     rec[f"ndcg{k}"] = round(ndcg_at_k(ranked, relevant, k), 6)
                     rec[f"recall{k}"] = round(recall_at_k(ranked, relevant, k), 6)
                 if mode == "bm25":
                     rec["recall1000"] = round(recall_at_k(ranked, relevant, 1000), 6)
                 files[mode].write(json.dumps(rec) + "\n")
+                files[mode].flush()
 
             if (i + 1) % 20 == 0:
                 print(f"  {i + 1}/{total} queries", end="\r", flush=True)
@@ -379,6 +396,7 @@ def _run_signals(args, queries, qrels, at_ks, fetch_k, ir_bin, collection):
         print(f"  {total}/{total} queries done   ")
         for mode in modes_to_run:
             print(f"  {mode} -> {out_dir}/{mode}.jsonl")
+        (out_dir / ".done").touch()
     finally:
         for f in files.values():
             f.close()

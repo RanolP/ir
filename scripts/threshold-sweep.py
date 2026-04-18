@@ -13,10 +13,33 @@ plus coverage gating analysis across corpus sizes.
 """
 
 import argparse
+import csv
 import json
 import math
 import sys
 from pathlib import Path
+
+
+def load_qrels(signals_dir: Path) -> dict:
+    """Load qrels from test-data/{dataset}/qrels/test.tsv adjacent to signals dir.
+    signals_dir is e.g. logs/signals/fiqa or logs/signals/miracl-ko-s1000-p1.
+    Strips sample suffix to find the base dataset qrels.
+    """
+    # Strip sample suffix: miracl-ko-s1000-p1 -> miracl-ko, fiqa -> fiqa
+    import re
+    base = re.sub(r"-s\d+-p\d+$", "", signals_dir.name)
+    # Resolve relative to repo root (signals_dir may be relative)
+    repo_root = Path(__file__).parent.parent
+    qrels_path = repo_root / "test-data" / base / "qrels" / "test.tsv"
+    if not qrels_path.exists():
+        print(f"  WARNING: qrels not found at {qrels_path}", file=sys.stderr)
+        return {}
+    qrels: dict = {}
+    with open(qrels_path) as f:
+        for row in csv.DictReader(f, delimiter="\t"):
+            qid, did, score = row["query-id"], row["corpus-id"], int(row["score"])
+            qrels.setdefault(qid, {})[did] = score
+    return qrels
 
 
 # ── Load per-query data ──────────────────────────────────────────────────────
@@ -50,27 +73,32 @@ def load_signals_dir(signals_dir: Path) -> dict | None:
     if len(query_ids) < len(bm25_rows) * 0.9:
         print(f"  WARNING: {signals_dir}: only {len(query_ids)}/{len(bm25_rows)} queries complete")
 
+    qrels = load_qrels(signals_dir)
+
     queries = []
     for qid in sorted(query_ids):
         b = bm25_rows[qid]
         v = vec_rows[qid]
         h = hyb_rows[qid]
+        rel = qrels.get(qid, {})
+        fused_ndcg = offline_fused_ndcg(
+            b.get("ranked", []), v.get("ranked", []), rel if rel else None
+        )
         queries.append({
             "query_id": qid,
-            # BM25 signals (from bm25 run)
             "bm25_top": b.get("bm25_top", 0.0),
             "bm25_gap": b.get("bm25_gap", 0.0),
-            # Fused signals (from hybrid run, captured after fusion before shortcuts)
             "fused_top": h.get("fused_top", 0.0),
             "fused_gap": h.get("fused_gap", 0.0),
-            # Per-mode nDCG@10 (primary metric)
             "ndcg10_bm25": b.get("ndcg10", 0.0),
             "ndcg10_vector": v.get("ndcg10", 0.0),
             "ndcg10_hybrid": h.get("ndcg10", 0.0),
-            # Ranked lists for offline fusion
-            "ranked_bm25": b.get("ranked", []),
-            "ranked_vector": v.get("ranked", []),
+            "ndcg10_fused": fused_ndcg,  # offline fusion of bm25+vector ranked lists
         })
+
+    missing_qrels = sum(1 for q in queries if not qrels.get(q["query_id"]))
+    if missing_qrels:
+        print(f"  WARNING: {missing_qrels} queries have no qrels (ndcg10_fused=0 for those)")
 
     return {
         "queries": queries,
@@ -149,47 +177,34 @@ def sweep_bm25(queries: list) -> list:
 # ── Tier-1 fused sweep ───────────────────────────────────────────────────────
 
 FUSED_PRODUCTS = [0.02, 0.03, 0.04, 0.05, 0.06, 0.08, 0.10, 0.15]
-FUSED_FLOORS   = [0.25, 0.30, 0.35, 0.40, 0.45, 0.50]
+# Floor dimension removed — empirically irrelevant: all fused_top scores exceed any
+# reasonable floor threshold, so product alone drives the fire/harm tradeoff.
 
 
 def sweep_fused(queries: list) -> list:
-    """Grid search over (product, floor) for tier-1 fused shortcut.
-    Harm = using fused-only results instead of full hybrid pipeline.
+    """Sweep product threshold for tier-1 fused shortcut.
+    Harm = full pipeline nDCG - offline fused nDCG > epsilon.
     """
     n = len(queries)
     results = []
-    for floor in FUSED_FLOORS:
-        for product in FUSED_PRODUCTS:
-            fires = [
-                q for q in queries
-                if q["fused_top"] >= floor and q["fused_top"] * q["fused_gap"] >= product
-            ]
-            # For fired queries, compare fused nDCG vs full hybrid nDCG
-            # ndcg10_hybrid is the full pipeline (shortcuts disabled); fused is what fires
-            harmed = [
-                q for q in fires
-                if q["ndcg10_hybrid"] - offline_fused_ndcg(
-                    q["ranked_bm25"], q["ranked_vector"], {"__dummy__": 1}, 10
-                ) > HARM_EPSILON
-                # ^ Approximation: we use offline fusion proxy. For proper analysis,
-                #   compare q["ndcg10_hybrid"] vs ndcg10_fused derived from beir-eval --mode vector+bm25.
-                #   Here we use the fused_top/gap signal as proxy: high fused signal → low harm.
-            ]
-            # Simpler harm estimate: fraction of fired queries where hybrid >> fused signal
-            # Use fused_top as proxy: higher top score → fused result is already good
-            harmed_simple = [
-                q for q in fires
-                if q["ndcg10_hybrid"] - q["ndcg10_bm25"] > HARM_EPSILON
-                   and q["fused_top"] < 0.70  # fused isn't clearly dominant
-            ]
-            results.append({
-                "floor": floor,
-                "product": product,
-                "fire_n": len(fires),
-                "fire_rate": len(fires) / n if n else 0,
-                "harm_n": len(harmed_simple),
-                "harm_rate": len(harmed_simple) / len(fires) if fires else 0,
-            })
+    for product in FUSED_PRODUCTS:
+        fires = [
+            q for q in queries
+            if q["fused_top"] * q["fused_gap"] >= product
+        ]
+        harmed = [
+            q for q in fires
+            if q["ndcg10_hybrid"] - q["ndcg10_fused"] > HARM_EPSILON
+        ]
+        losses = [q["ndcg10_hybrid"] - q["ndcg10_fused"] for q in fires]
+        results.append({
+            "product": product,
+            "fire_n": len(fires),
+            "fire_rate": len(fires) / n if n else 0,
+            "harm_n": len(harmed),
+            "harm_rate": len(harmed) / len(fires) if fires else 0,
+            "mean_loss": sum(losses) / len(losses) if losses else 0,
+        })
     return results
 
 
@@ -212,19 +227,20 @@ def print_bm25_table(sweep: list, label: str, n: int, current=(0.75, 0.10)):
     print()
 
 
-def print_fused_table(sweep: list, label: str, n: int, current=(0.06, 0.40)):
+def print_fused_table(sweep: list, label: str, n: int, current=0.06):
     print(f"\nTier-1 Fused Threshold Sweep — {label} ({n} queries)")
-    print("=" * 72)
-    print(f"  {'floor':>5}  {'product':>7}  {'fire%':>6}  {'harm%':>6}  {'note'}")
-    print(f"  {'-'*5}  {'-'*7}  {'-'*6}  {'-'*6}  {'-'*20}")
-    for r in sorted(sweep, key=lambda x: (x["floor"], x["product"])):
+    print("=" * 65)
+    print(f"  {'product':>7}  {'fire%':>6}  {'harm%':>6}  {'avg_loss':>9}  note")
+    print(f"  {'-'*7}  {'-'*6}  {'-'*6}  {'-'*9}  {'-'*20}")
+    for r in sorted(sweep, key=lambda x: x["product"]):
         note = ""
-        if (r["product"], r["floor"]) == current:
+        if r["product"] == current:
             note = "<-- CURRENT"
         if r["harm_rate"] < 0.05 and r["fire_rate"] > 0.10:
             note += " CANDIDATE" if not note else " *"
-        print(f"  {r['floor']:>5.2f}  {r['product']:>7.3f}  "
-              f"{r['fire_rate']*100:>5.1f}%  {r['harm_rate']*100:>5.1f}%  {note}")
+        print(f"  {r['product']:>7.3f}  "
+              f"{r['fire_rate']*100:>5.1f}%  {r['harm_rate']*100:>5.1f}%  "
+              f"{r.get('mean_loss', 0):>9.4f}  {note}")
     print()
 
 

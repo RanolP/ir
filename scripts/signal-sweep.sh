@@ -54,8 +54,9 @@ run_signals_for() {
     local preprocessor="${4:-}"
     local out_dir="$REPO_ROOT/logs/signals/$label"
 
-    if [[ -f "$out_dir/hybrid.jsonl" ]]; then
-        echo "  [skip] $label (already collected)"
+    # Skip only if a completion marker exists (written after all queries finish)
+    if [[ -f "$out_dir/.done" ]]; then
+        echo "  [skip] $label (complete)"
         return 0
     fi
 
@@ -119,6 +120,13 @@ run_fiqa() {
         bash scripts/download-beir.sh fiqa
     fi
     run_signals_for "fiqa" "$data_dir" "eval-fiqa-signals" ""
+
+    if [[ -n "$SIZES" ]]; then
+        IFS=',' read -ra SIZE_LIST <<< "$SIZES"
+        for size in "${SIZE_LIST[@]}"; do
+            run_sampled "$data_dir" "fiqa" "" "$size"
+        done
+    fi
 }
 
 # ── MIRACL-Ko ─────────────────────────────────────────────────────────────────

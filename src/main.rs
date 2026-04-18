@@ -353,7 +353,13 @@ pub(crate) fn search_core(
     if std::env::var("IR_BENCH_SIGNALS").is_ok() {
         let top = bm25_results.first().map(|r| r.score).unwrap_or(0.0);
         let gap = if bm25_results.len() >= 2 { top - bm25_results[1].score } else { top };
-        eprintln!("SIGNAL_BM25\t{top:.6}\t{gap:.6}");
+        // Emit top-10 scores for relative dominance and percentile analysis
+        let scores: Vec<String> = bm25_results.iter().take(10).map(|r| format!("{:.6}", r.score)).collect();
+        if scores.is_empty() {
+            eprintln!("SIGNAL_BM25\t{top:.6}\t{gap:.6}");
+        } else {
+            eprintln!("SIGNAL_BM25\t{top:.6}\t{gap:.6}\t{}", scores.join(","));
+        }
     }
     let disable_shortcuts = std::env::var("IR_DISABLE_SHORTCUTS").is_ok();
 
