@@ -1,12 +1,15 @@
 ## [Unreleased]
 
+## [0.11.1] - 2026-04-18
+
 ### Bug Fixes
 
-- Preprocessor pipe deadlock on large Korean collections (issue #13): `process_line` now uses
+- Preprocessor pipe deadlock on large Korean collections ([#13](https://github.com/vlwkaos/ir/issues/13)): `process_line` now uses
   a sentinel-based protocol to handle lines where the official lindera CLI produces no output
   (e.g. punctuation-only lines where all tokens are filtered by `--token-filter`). Previously,
   `read_line()` would block forever waiting for output that never arrived, deadlocking both
-  processes. Manifested as a hang at ~60k docs when indexing MIRACL-Ko or other large corpora.
+  processes at 0% CPU. Manifested as a hang at ~60k docs when indexing MIRACL-Ko or other large
+  Korean corpora. ([`2084e4e`](https://github.com/vlwkaos/ir/commit/2084e4e0b62fcace710834150eeba8cf7d338a59))
 
 ## [0.11.0] - 2026-04-17
 
