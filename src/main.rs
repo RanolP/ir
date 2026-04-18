@@ -774,15 +774,14 @@ fn install_preprocessor(config: &mut Config, lang: &str) -> Result<()> {
         ))?;
 
     let triple = lindera_platform_triple()?;
-    println!("fetching latest lindera release info…");
-    let tag = fetch_lindera_tag()?;
-    let version = tag.trim_start_matches('v'); // "v3.0.5" → "3.0.5"
+    let tag = LINDERA_VERSION;
+    let version = tag.trim_start_matches('v');
 
     let preprocessors_dir = config::ir_dir().join("preprocessors");
     std::fs::create_dir_all(&preprocessors_dir)?;
 
-    let bin_path = install_lindera_binary(&preprocessors_dir, &tag, triple)?;
-    let dict_path = install_lindera_dict(&preprocessors_dir, entry.dict_name, &tag, version)?;
+    let bin_path = install_lindera_binary(&preprocessors_dir, tag, triple)?;
+    let dict_path = install_lindera_dict(&preprocessors_dir, entry.dict_name, tag, version)?;
 
     let mut cmd_str = format!(
         "{} tokenize --dict {} -o wakati -m decompose",
@@ -835,39 +834,19 @@ fn lindera_platform_triple() -> Result<&'static str> {
     }
 }
 
-/// Returns the latest lindera release tag (e.g. "v3.0.5").
-/// Follows the releases/latest redirect — no API key, no rate limit.
-fn fetch_lindera_tag() -> Result<String> {
-    // GitHub redirects /releases/latest → /releases/tag/vX.Y.Z
-    let output = std::process::Command::new("curl")
-        .args(["-fsSLI", "https://github.com/lindera/lindera/releases/latest"])
-        .output()
-        .map_err(|e| error::Error::Other(format!("curl: {e}")))?;
-    if !output.status.success() {
-        return Err(error::Error::Other(
-            "failed to fetch lindera release info (network error)".into()
-        ));
-    }
-    let headers = String::from_utf8_lossy(&output.stdout);
-    let location = headers.lines()
-        .find_map(|line| {
-            line.to_ascii_lowercase().starts_with("location:")
-                .then(|| line["location:".len()..].trim().to_string())
-        })
-        .ok_or_else(|| error::Error::Other(
-            "no redirect from github.com/lindera/lindera/releases/latest".into()
-        ))?;
-    location.rsplit('/').next()
-        .filter(|tag| tag.starts_with('v'))
-        .map(|s| s.to_string())
-        .ok_or_else(|| error::Error::Other(
-            format!("unexpected redirect URL: {location}")
-        ))
-}
+/// Pinned lindera release. Update intentionally after vetting CLI flag compatibility.
+/// Do NOT use /releases/latest — a major version bump could silently break the
+/// tokenizer output format or --token-filter argument syntax.
+const LINDERA_VERSION: &str = "v3.0.5";
+const _: () = assert!(
+    matches!(LINDERA_VERSION.as_bytes(), [b'v', b'0'..=b'9', ..]),
+    "LINDERA_VERSION must start with 'v' followed by a digit"
+);
 
-/// Install the shared lindera CLI binary into preprocessors_dir/lindera/. Skips if present.
+/// Install the shared lindera CLI binary into preprocessors_dir/lindera-{tag}/. Skips if present.
+/// ^ versioned dir ensures a LINDERA_VERSION bump triggers a fresh download
 fn install_lindera_binary(preprocessors_dir: &Path, tag: &str, triple: &str) -> Result<PathBuf> {
-    let bin_dir = preprocessors_dir.join("lindera");
+    let bin_dir = preprocessors_dir.join(format!("lindera-{tag}"));
     let bin_path = bin_dir.join("lindera");
     if bin_path.exists() {
         return Ok(bin_path);
