@@ -28,6 +28,9 @@ fn main() {
 }
 
 fn run() -> Result<()> {
+    // ^ Set IR_DIR so preprocessor commands stored as "$IR_DIR/..." expand correctly at runtime.
+    // Must happen before any config load.
+    unsafe { std::env::set_var("IR_DIR", config::ir_dir()) };
     let cli = Cli::parse();
     match cli.command {
         Command::Collection { cmd } => handle_collection(cmd),
@@ -190,10 +193,10 @@ fn handle_collection(cmd: CollectionCmd) -> Result<()> {
                     )));
                 }
             }
-            let resolved = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone().into());
+            let store_path = config::portable_path(&path)?;
             config.add_collection(Collection {
                 name: name.clone(),
-                path: resolved.to_string_lossy().into_owned(),
+                path: store_path,
                 globs: glob,
                 excludes: exclude,
                 description,
@@ -375,7 +378,12 @@ pub(crate) fn search_core(
     if !daemon::is_running() {
         llm::download::prepare_model_envs()?;
         if let Err(e) = daemon::start_in_background() {
-            if verbosity.show_progress() { eprintln!("note: could not start daemon ({e})"); }
+            if verbosity.show_progress() {
+                eprintln!("note: could not start daemon ({e})");
+                if bm25_results.is_empty() {
+                    eprintln!("note: BM25 also found nothing — run `ir embed <collection>` to enable vector search");
+                }
+            }
             return Ok(bm25_results);
         }
     }
@@ -401,8 +409,15 @@ pub(crate) fn search_core(
     };
 
     if verbosity.show_progress() { eprint!("searching..."); }
-    if !daemon::wait_ready(3_000) {
-        if verbosity.show_progress() { eprintln!(); }
+    // When BM25 found nothing, the daemon is the only source of results — wait longer.
+    let wait_ms = if bm25_results.is_empty() { 10_000 } else { 3_000 };
+    if !daemon::wait_ready(wait_ms) {
+        if verbosity.show_progress() {
+            eprintln!();
+            if bm25_results.is_empty() {
+                eprintln!("note: BM25 found no results and daemon not ready — try `ir embed <collection>` or check model paths");
+            }
+        }
         return Ok(bm25_results);
     }
 
@@ -411,7 +426,12 @@ pub(crate) fn search_core(
     let tier1 = match daemon::query(&req) {
         Ok(r) => r,
         Err(e) => {
-            if verbosity.show_progress() { eprintln!("\nnote: daemon query error: {e}"); }
+            if verbosity.show_progress() {
+                eprintln!("\nnote: daemon query error: {e}");
+                if bm25_results.is_empty() {
+                    eprintln!("note: BM25 also found nothing — check collection embeddings");
+                }
+            }
             return Ok(bm25_results);
         }
     };
@@ -783,10 +803,15 @@ fn install_preprocessor(config: &mut Config, lang: &str) -> Result<()> {
     let bin_path = install_lindera_binary(&preprocessors_dir, tag, triple)?;
     let dict_path = install_lindera_dict(&preprocessors_dir, entry.dict_name, tag, version)?;
 
+    // Store paths as $IR_DIR/preprocessors/... so config.yml is portable across machines.
+    let bin_rel = bin_path.strip_prefix(&preprocessors_dir)
+        .expect("install_lindera_binary returns path under preprocessors_dir");
+    let dict_rel = dict_path.strip_prefix(&preprocessors_dir)
+        .expect("install_lindera_dict returns path under preprocessors_dir");
     let mut cmd_str = format!(
-        "{} tokenize --dict {} -o wakati -m decompose",
-        bin_path.display(),
-        dict_path.display(),
+        "$IR_DIR/preprocessors/{} tokenize --dict $IR_DIR/preprocessors/{} -o wakati -m decompose",
+        bin_rel.display(),
+        dict_rel.display(),
     );
     if let Some(filter) = entry.token_filter {
         cmd_str.push_str(" --token-filter ");

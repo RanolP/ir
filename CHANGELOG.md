@@ -1,5 +1,35 @@
 ## [Unreleased]
 
+## [0.12.0] - 2026-04-20
+
+### New Features
+
+- `IR_CONFIG_DIR` env var: override the config/data directory with `~` and `$VAR` expansion.
+  Safe to use in MCP configs (`.mcp.json`) synced across machines with different usernames.
+  Precedence: `IR_CONFIG_DIR` > `XDG_CONFIG_HOME/ir` > `~/.config/ir`.
+
+### Deprecations
+
+- `XDG_CONFIG_HOME` is deprecated as the config dir override for ir. It still works but
+  prints a warning. Use `IR_CONFIG_DIR` instead.
+
+### Improvements
+
+- All path env vars (`IR_*_MODEL`, `IR_MODEL_DIRS`, `IR_CONFIG_DIR`) now support `~` and
+  `$VAR`/`${VAR}` expansion. Previously, `~` in these vars was treated literally and silently
+  failed to resolve.
+- Collection paths in `config.yml` now support `~` and `$VAR` notation. Portable paths are
+  preserved on write; expansion happens at load time.
+- Preprocessor commands installed via `ir preprocessor install` are now stored as
+  `$IR_DIR/preprocessors/...` instead of absolute paths, making them portable across machines.
+  Existing absolute-path commands continue to work. Re-run `ir preprocessor install <lang>`
+  to migrate to the portable format.
+- When BM25 returns no results (semantic query with no keyword overlap), the daemon wait
+  timeout is extended from 3s to 10s — the daemon is the only source of results in this
+  case, so a slow cold start no longer silently returns nothing. Diagnostic hints are printed
+  at all daemon fallback sites (start failure, timeout, query error) to guide follow-up
+  (`ir embed <collection>`, model path check).
+
 ## [0.11.2] - 2026-04-18
 
 ### Bug Fixes

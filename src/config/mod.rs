@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Once;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
@@ -27,7 +28,13 @@ impl Config {
             return Ok(Self::default());
         }
         let content = fs::read_to_string(&path)?;
-        Ok(serde_yaml::from_str(&content)?)
+        let mut config: Self = serde_yaml::from_str(&content)?;
+        for col in &mut config.collections {
+            if col.path.contains('~') || col.path.contains('$') {
+                col.path = expand_path(&col.path).to_string_lossy().into_owned();
+            }
+        }
+        Ok(config)
     }
 
     pub fn save(&self) -> Result<()> {
@@ -64,14 +71,13 @@ impl Config {
     }
 
     pub fn set_collection_path(&mut self, name: &str, new_path: &str) -> Result<()> {
-        let resolved = std::fs::canonicalize(new_path)
-            .map_err(|e| Error::Other(format!("invalid path {new_path:?}: {e}")))?;
+        let store_path = portable_path(new_path)?;
         let col = self
             .collections
             .iter_mut()
             .find(|c| c.name == name)
             .ok_or_else(|| Error::CollectionNotFound(name.to_string()))?;
-        col.path = resolved.to_string_lossy().into_owned();
+        col.path = store_path;
         Ok(())
     }
 
@@ -122,17 +128,103 @@ impl Config {
     }
 }
 
-/// Base directory for all ir state: $XDG_CONFIG_HOME/ir or ~/.config/ir.
-/// Consistent across platforms; avoids platform-specific paths like ~/Library.
+/// Base directory for all ir state.
+///
+/// Precedence: `IR_CONFIG_DIR` > `XDG_CONFIG_HOME/ir` > `~/.config/ir`.
+/// Both `IR_CONFIG_DIR` and `XDG_CONFIG_HOME` support `~` and `$VAR` expansion.
+/// `XDG_CONFIG_HOME` is deprecated in favor of `IR_CONFIG_DIR`.
 pub fn ir_dir() -> PathBuf {
-    std::env::var("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            dirs::home_dir()
-                .unwrap_or_else(|| PathBuf::from("~"))
-                .join(".config")
-        })
+    if let Ok(val) = std::env::var("IR_CONFIG_DIR") {
+        return expand_path(&val);
+    }
+    if let Ok(val) = std::env::var("XDG_CONFIG_HOME") {
+        static WARN: Once = Once::new();
+        WARN.call_once(|| {
+            eprintln!("warning: XDG_CONFIG_HOME is deprecated for ir; use IR_CONFIG_DIR=<path> instead");
+        });
+        return expand_path(&val).join("ir");
+    }
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("/"))
+        .join(".config")
         .join("ir")
+}
+
+/// Expand `~` and `$VAR`/`${VAR}` in a path string.
+///
+/// - Leading `~` or `~/` is replaced with the user's home directory.
+/// - `$VAR` and `${VAR}` are replaced with the env var value; unknown vars expand to empty string.
+/// - No shell is invoked — safe for MCP transport where env values are JSON string literals.
+pub fn expand_path(raw: &str) -> PathBuf {
+    PathBuf::from(expand_vars(raw))
+}
+
+fn expand_vars(input: &str) -> String {
+    // Phase 1: leading ~ expansion only
+    let s = if input == "~" {
+        home_dir_str()
+    } else if let Some(rest) = input.strip_prefix("~/") {
+        format!("{}/{rest}", home_dir_str())
+    } else {
+        input.to_owned()
+    };
+
+    // Phase 2: $VAR and ${VAR} expansion
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '$' {
+            out.push(c);
+            continue;
+        }
+        if chars.peek() == Some(&'{') {
+            chars.next(); // consume '{'
+            let name: String = chars.by_ref().take_while(|&c| c != '}').collect();
+            out.push_str(&std::env::var(&name).unwrap_or_default());
+        } else {
+            let mut name = String::new();
+            while let Some(&c) = chars.peek() {
+                if c.is_ascii_alphanumeric() || c == '_' {
+                    name.push(c);
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            if name.is_empty() {
+                out.push('$');
+            } else {
+                out.push_str(&std::env::var(&name).unwrap_or_default());
+            }
+        }
+    }
+    out
+}
+
+fn home_dir_str() -> String {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("/"))
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Determine how to store a user-supplied path in config.yml.
+///
+/// Paths starting with `~` or containing `$` are stored as-is (portable across machines).
+/// Plain paths are canonicalized to absolute. Validates the expanded path exists.
+pub fn portable_path(raw: &str) -> Result<String> {
+    if raw.starts_with('~') || raw.contains('$') {
+        // Validate via expansion but store the original portable form.
+        let expanded = expand_path(raw);
+        if !expanded.exists() {
+            return Err(Error::Other(format!("path does not exist: {}", expanded.display())));
+        }
+        Ok(raw.to_owned())
+    } else {
+        let resolved = std::fs::canonicalize(raw)
+            .map_err(|e| Error::Other(format!("invalid path {raw:?}: {e}")))?;
+        Ok(resolved.to_string_lossy().into_owned())
+    }
 }
 
 pub fn config_path() -> PathBuf {
@@ -228,5 +320,148 @@ mod tests {
         cfg.add_collection(col("notes")).unwrap();
         assert!(cfg.rename_collection("notes", "a/b").is_err());
         assert!(cfg.rename_collection("notes", "ok-name").is_ok());
+    }
+
+    #[test]
+    fn expand_tilde() {
+        let home = dirs::home_dir().unwrap();
+        assert_eq!(expand_path("~"), home);
+        assert_eq!(expand_path("~/Documents"), home.join("Documents"));
+        assert_eq!(expand_path("~/a/b/c"), home.join("a/b/c"));
+    }
+
+    #[test]
+    fn expand_no_tilde_in_middle() {
+        // ~ not at start is literal
+        assert_eq!(expand_path("/a/~/b"), PathBuf::from("/a/~/b"));
+    }
+
+    #[test]
+    fn expand_env_var() {
+        unsafe { std::env::set_var("IR_TEST_EXPAND_VAR", "/custom/path") };
+        assert_eq!(expand_path("$IR_TEST_EXPAND_VAR/sub"), PathBuf::from("/custom/path/sub"));
+        unsafe { std::env::remove_var("IR_TEST_EXPAND_VAR") };
+    }
+
+    #[test]
+    fn expand_braced_var() {
+        unsafe { std::env::set_var("IR_TEST_EXPAND_BRACED", "/braced") };
+        assert_eq!(expand_path("${IR_TEST_EXPAND_BRACED}/sub"), PathBuf::from("/braced/sub"));
+        unsafe { std::env::remove_var("IR_TEST_EXPAND_BRACED") };
+    }
+
+    #[test]
+    fn expand_unknown_var_is_empty() {
+        // Unknown vars expand to empty string, leaving the slash.
+        let result = expand_path("$IR_THIS_VAR_DOES_NOT_EXIST_IR/sub");
+        assert_eq!(result, PathBuf::from("/sub"));
+    }
+
+    #[test]
+    fn expand_bare_dollar_is_literal() {
+        assert_eq!(expand_path("/a/$/b"), PathBuf::from("/a/$/b"));
+    }
+
+    #[test]
+    fn expand_absolute_unchanged() {
+        assert_eq!(expand_path("/absolute/path"), PathBuf::from("/absolute/path"));
+    }
+
+    #[test]
+    fn expand_tilde_and_var_combined() {
+        unsafe { std::env::set_var("IR_TEST_EXPAND_SUBDIR", "vault") };
+        let home = dirs::home_dir().unwrap();
+        assert_eq!(
+            expand_path("~/$IR_TEST_EXPAND_SUBDIR/.config/ir"),
+            home.join("vault/.config/ir"),
+        );
+        unsafe { std::env::remove_var("IR_TEST_EXPAND_SUBDIR") };
+    }
+
+    // Mutex to serialize tests that mutate IR_CONFIG_DIR / XDG_CONFIG_HOME.
+    // Recover from poison (test panicked while holding lock) to avoid cascading failures.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[test]
+    fn ir_dir_respects_ir_config_dir() {
+        let _guard = env_lock();
+        let saved_xdg = std::env::var("XDG_CONFIG_HOME").ok();
+        unsafe {
+            std::env::remove_var("XDG_CONFIG_HOME");
+            std::env::set_var("IR_CONFIG_DIR", "/custom/ir");
+        }
+        let result = ir_dir();
+        unsafe {
+            std::env::remove_var("IR_CONFIG_DIR");
+            match saved_xdg {
+                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+        assert_eq!(result, PathBuf::from("/custom/ir"));
+    }
+
+    #[test]
+    fn ir_dir_ir_config_dir_with_tilde() {
+        let _guard = env_lock();
+        let home = dirs::home_dir().unwrap();
+        let saved_xdg = std::env::var("XDG_CONFIG_HOME").ok();
+        unsafe {
+            std::env::remove_var("XDG_CONFIG_HOME");
+            std::env::set_var("IR_CONFIG_DIR", "~/.config/ir");
+        }
+        let result = ir_dir();
+        unsafe {
+            std::env::remove_var("IR_CONFIG_DIR");
+            match saved_xdg {
+                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+        assert_eq!(result, home.join(".config/ir"));
+    }
+
+    #[test]
+    fn ir_dir_xdg_fallback() {
+        let _guard = env_lock();
+        let saved_ir = std::env::var("IR_CONFIG_DIR").ok();
+        let saved_xdg = std::env::var("XDG_CONFIG_HOME").ok();
+        unsafe {
+            std::env::remove_var("IR_CONFIG_DIR");
+            std::env::set_var("XDG_CONFIG_HOME", "/tmp/test-xdg");
+        }
+        let result = ir_dir();
+        unsafe {
+            match saved_ir {
+                Some(v) => std::env::set_var("IR_CONFIG_DIR", v),
+                None => std::env::remove_var("IR_CONFIG_DIR"),
+            }
+            match saved_xdg {
+                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+        assert_eq!(result, PathBuf::from("/tmp/test-xdg/ir"));
+    }
+
+    #[test]
+    fn portable_path_preserves_tilde() {
+        // ~ paths are stored as-is (not expanded) if the expanded path exists.
+        let home = dirs::home_dir().unwrap();
+        // Use ~/.config which almost certainly exists on any dev machine.
+        let tilde_path = "~/.config";
+        if home.join(".config").exists() {
+            let result = portable_path(tilde_path).unwrap();
+            assert_eq!(result, tilde_path, "tilde path must be stored as-is, not expanded");
+        }
+    }
+
+    #[test]
+    fn portable_path_nonexistent_returns_err() {
+        let result = portable_path("~/__ir_nonexistent_path_xyz__/sub");
+        assert!(result.is_err(), "nonexistent tilde path must return Err");
     }
 }

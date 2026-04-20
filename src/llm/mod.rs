@@ -21,6 +21,7 @@ pub use llama_cpp_2::llama_backend::LlamaBackend;
 pub use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::{LlamaBackendDeviceType, list_llama_ggml_backend_devices};
 
+use crate::config::expand_path;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
@@ -249,7 +250,7 @@ fn resolve_model_override(filename: &str) -> Option<PathBuf> {
         let Some(raw) = std::env::var_os(key) else {
             continue;
         };
-        let path = PathBuf::from(raw);
+        let path = expand_path(&raw.to_string_lossy());
         if path.is_file() {
             return Some(path);
         }
@@ -269,7 +270,7 @@ fn append_env_dirs(paths: &mut Vec<PathBuf>, key: &str) {
     };
     for dir in std::env::split_paths(&raw) {
         if !dir.as_os_str().is_empty() {
-            push_unique(paths, dir);
+            push_unique(paths, expand_path(&dir.to_string_lossy()));
         }
     }
 }

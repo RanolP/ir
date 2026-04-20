@@ -87,6 +87,14 @@ Known HF repo IDs: `ggml-org/embeddinggemma-300M-GGUF`, `ggml-org/bge-m3-Q8_0-GG
 
 Compatibility aliases: `QMD_EMBEDDING_MODEL`, `QMD_RERANKER_MODEL`, `QMD_EXPANDER_MODEL`, `QMD_MODEL_DIRS`.
 
+**Config directory:**
+
+```bash
+export IR_CONFIG_DIR="~/vault/.config/ir"   # portable across machines
+```
+
+`IR_CONFIG_DIR` sets the directory for config, collection DBs, and daemon files. Supports `~` and `$VAR` expansion, so the value is safe to use in MCP configs synced across machines. Precedence: `IR_CONFIG_DIR` → `XDG_CONFIG_HOME/ir` (deprecated) → `~/.config/ir`.
+
 **GPU:**
 
 ```bash

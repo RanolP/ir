@@ -4,6 +4,7 @@
 // HF_HUB_OFFLINE=1  — skip network, use cache only (handled by hf-hub natively)
 // IR_GPU_LAYERS=N   — override GPU layer count
 
+use crate::config::expand_path;
 use crate::error::{Error, Result};
 use crate::llm::{find_model, hf_repos, models};
 use std::io::ErrorKind;
@@ -122,7 +123,7 @@ pub fn resolve_env_hf_or_path(
             continue;
         };
         let raw = raw_os.to_string_lossy().into_owned();
-        let path = PathBuf::from(&raw_os);
+        let path = expand_path(&raw);
 
         if path.is_file() {
             return Ok(Some(path));

@@ -22,6 +22,7 @@
 // Subprocess lifetime: stays alive for batch indexing; spawned per-query for search.
 // Lindera startup: <10ms (Rust binary, embedded dictionary).
 
+use crate::config::expand_path;
 use crate::error::Result;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -41,7 +42,9 @@ impl PreprocessHandle {
     pub fn spawn(cmd_str: &str) -> Option<Self> {
         // ! paths with spaces unsupported; commands must be simple tokens (e.g. "mecab -Owakati")
         let mut parts = cmd_str.split_whitespace();
-        let program = parts.next()?;
+        let raw_program = parts.next()?;
+        let expanded = expand_path(raw_program);
+        let program = expanded.as_os_str();
         let args: Vec<&str> = parts.collect();
 
         match Command::new(program)

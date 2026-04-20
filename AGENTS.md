@@ -34,13 +34,20 @@ Results cached at `logs/results/{dataset}/{git7}.json` (gitignored).
 | `IR_FORCE_CPU_BACKEND` | unset | Set to `1` to disable Metal |
 | `IR_LLAMA_LOGS` | unset | Set to `1` to enable llama.cpp verbose logging |
 | `IR_MODEL_DIRS` | `~/local-models/` | Colon-separated extra model search dirs |
-| `XDG_CONFIG_HOME` | `~/.config` | Overrides config/data dir base |
+| `IR_CONFIG_DIR` | `~/.config/ir` | Override config/data dir. Supports `~` and `$VAR` expansion. |
+| `XDG_CONFIG_HOME` | `~/.config` | **Deprecated** — use `IR_CONFIG_DIR` instead. Still works but emits a warning. |
 | `IR_BENCH_SIGNALS` | unset | Research: emit `SIGNAL_FUSED\ttop\tgap` to pipeline log for threshold tuning |
 | `IR_DISABLE_SHORTCUTS` | unset | Research: disable BM25 + fused strong-signal shortcuts for A/B benchmarking |
+
+Config dir precedence: `IR_CONFIG_DIR` → `XDG_CONFIG_HOME/ir` (deprecated) → `~/.config/ir`
 
 Model search order: `IR_*_MODEL` env → `IR_MODEL_DIRS` → `~/local-models/` → `~/.cache/ir/models/` → `~/.cache/qmd/models/`
 
 `QMD_EMBEDDING_MODEL`, `QMD_EXPANDER_MODEL`, `QMD_RERANKER_MODEL` are also checked as fallbacks.
+
+All path env vars (`IR_CONFIG_DIR`, `IR_MODEL_DIRS`, `IR_*_MODEL`) support `~` and `$VAR`/`${VAR}` expansion.
+
+Note: `IR_DIR` is set internally at startup (= resolved `ir_dir()` value). It appears in preprocessor commands stored in `config.yml` as `$IR_DIR/preprocessors/...` so they are portable. Not user-facing.
 
 ## Data Paths
 
@@ -98,7 +105,6 @@ Requires `dangerouslyDisableSandbox: true` — gh CLI reads `~/.config/gh` (sand
 
 ## good-to-go
 
-Recurring audit axes (auto-maintained by /good-to-go):
 - README.md + README.ko.md must both be updated for any user-facing feature (CLI flags, env vars, output formats)
 - CHANGELOG.md Unreleased section must cover: new CLI flags, env var renames/deprecations, breaking behavior changes
 - Enum variants in types.rs must be wired to a CLI flag or MCP field — check with `rg 'Variant::' src/ | grep -v test`
@@ -112,3 +118,5 @@ Recurring audit axes (auto-maintained by /good-to-go):
 - warn_stale_preprocessor() in src/main.rs is a migration shim for ≤0.9.x users — remove at ≥0.13.0 (added v0.10.0)
 - IR_BENCH_SIGNALS and IR_DISABLE_SHORTCUTS are research-only env vars — must NOT appear in README or CHANGELOG; document only in CLAUDE.md env table
 - preprocess.rs sentinel protocol (IRSENTINEL): process_line() sends content line + IRSENTINEL, reads until IRSENTINEL — prevents pipe deadlock when lindera emits no stdout for all-filtered lines (e.g. punctuation-only). Custom preprocessors must pass ASCII-only single-word lines through unchanged. When any preprocessor command changes (new binary, flags, or external tool replacing custom code): run probe `printf '.\n안녕하세요\ntest\n' | <new_command> 2>/dev/null | wc -l` — must equal 3, or WARN and confirm sentinel covers the 0-output case. Test suite must include at least one test where process_line() is called with a line the subprocess drops.
+- IR_DIR is set internally at startup (= resolved ir_dir() value); appears in preprocessor commands as $IR_DIR/preprocessors/... for portability — do not expose in user-facing docs
+- All path env vars (IR_CONFIG_DIR, IR_MODEL_DIRS, IR_*_MODEL) support ~ and $VAR expansion via expand_path() in src/config/mod.rs — tests for this must use ENV_LOCK mutex to prevent parallel env var interference
