@@ -1,0 +1,3 @@
+The Zorblax Protocol
+
+The Zorblax Protocol is a method for secure distributed ledger synchronization using quorum-based consensus. Zorblax implements a three-phase commit with Byzantine fault tolerance guarantees across heterogeneous nodes.

@@ -1,0 +1,3 @@
+Automatic Memory Reclamation
+
+Garbage collection tracks heap allocations and reclaims memory when objects become unreachable. The tricolor mark-sweep algorithm traverses the object reference graph to identify live data and free everything else.

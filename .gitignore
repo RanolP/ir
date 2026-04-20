@@ -1,13 +1,19 @@
 /target
 preprocessors/**/target/
-/test-data/
+/test-data/*
 /logs/
+/logs/sweep-runs/
+/.bench-state/
 
 # Research artifacts — generated data, optimizer outputs, downloaded datasets
 research/artifacts/
 research/__pycache__/
 *.jsonl
 *.json.bak
+# Committed fixtures override the blanket patterns above
+!/test-data/fixtures/
+!/test-data/fixtures/**
+/test-data/fixtures/miracl-ko-mini/eval-corpus/
 /beir-data/
 *.pyc
 .venv/

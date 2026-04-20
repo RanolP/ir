@@ -19,6 +19,14 @@ import sys
 import time
 from pathlib import Path
 
+try:
+    from tqdm import tqdm as _tqdm
+    def tqdm(it, **kw):
+        return _tqdm(it, **kw)
+except ImportError:
+    def tqdm(it, **kw):  # type: ignore[misc]
+        return it
+
 
 # ── BEIR loading ────────────────────────────────────────────────────────────
 
@@ -176,11 +184,14 @@ def cmd_prepare(args):
     corpus_dir = data_dir / "eval-corpus"
     corpus_dir.mkdir(exist_ok=True)
 
+    # Count docs for progress bar (fast pre-pass)
+    total_docs = sum(1 for ln in open(corpus_path) if ln.strip())
+
     # Write one .txt file per doc (skip existing files)
     print(f"Materializing corpus -> {corpus_dir}/")
     written = 0
     with open(corpus_path) as f:
-        for line in f:
+        for line in tqdm(f, total=total_docs, desc="materialize", unit="doc"):
             line = line.strip()
             if not line:
                 continue
@@ -246,10 +257,10 @@ def cmd_run(args):
     ir_bin = args.ir_bin
     collection = args.collection
 
-    # Signal mode: run bm25+vector+hybrid with IR_BENCH_SIGNALS+IR_DISABLE_SHORTCUTS,
+    # Signal mode: run the requested modes with IR_BENCH_SIGNALS+IR_DISABLE_SHORTCUTS,
     # write per-query JSONL to signals_output dir.
     if args.signals:
-        _run_signals(args, queries, qrels, at_ks, fetch_k, ir_bin, collection)
+        _run_signals(args, queries, qrels, at_ks, fetch_k, ir_bin, collection, modes)
         return
 
     all_results = []
@@ -261,7 +272,8 @@ def cmd_run(args):
 
         effective_k = fetch_k_bm25 if mode == "bm25" else fetch_k
 
-        for i, q in enumerate(queries):
+        pbar = tqdm(queries, desc=f"{mode}", unit="q")
+        for i, q in enumerate(pbar):
             relevant = qrels.get(q["id"], {})
             if not relevant:
                 continue
@@ -272,10 +284,7 @@ def cmd_run(args):
             if i >= WARMUP:
                 latencies.append(elapsed_ms)
 
-            if (i + 1) % 50 == 0:
-                print(f"  {i + 1}/{len(queries)}", end="\r", flush=True)
-
-        print(f"  {len(ranked_all)}/{len(queries)} queries scored   ")
+        print(f"  {len(ranked_all)}/{len(queries)} queries scored")
 
         if not ranked_all:
             continue
@@ -327,8 +336,8 @@ def cmd_run(args):
         print(json.dumps(output, indent=2))
 
 
-def _run_signals(args, queries, qrels, at_ks, fetch_k, ir_bin, collection):
-    """Run bm25+vector+hybrid with signal capture; write per-query JSONL."""
+def _run_signals(args, queries, qrels, at_ks, fetch_k, ir_bin, collection, modes_to_run):
+    """Run the requested modes with signal capture; write per-query JSONL."""
     out_dir = Path(args.signals_output)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -343,8 +352,6 @@ def _run_signals(args, queries, qrels, at_ks, fetch_k, ir_bin, collection):
     signal_env = os.environ.copy()
     signal_env["IR_BENCH_SIGNALS"] = "1"
     signal_env["IR_DISABLE_SHORTCUTS"] = "1"
-
-    modes_to_run = ["bm25", "vector", "hybrid"]
 
     # Resume: load already-completed query IDs per mode
     done: dict[str, set] = {}
@@ -362,8 +369,8 @@ def _run_signals(args, queries, qrels, at_ks, fetch_k, ir_bin, collection):
     files = {m: open(out_dir / f"{m}.jsonl", "a") for m in modes_to_run}
 
     try:
-        total = len(queries)
-        for i, q in enumerate(queries):
+        pbar = tqdm(queries, desc="signals", unit="q")
+        for q in pbar:
             relevant = qrels.get(q["id"], {})
             if not relevant:
                 continue
@@ -390,10 +397,7 @@ def _run_signals(args, queries, qrels, at_ks, fetch_k, ir_bin, collection):
                 files[mode].write(json.dumps(rec) + "\n")
                 files[mode].flush()
 
-            if (i + 1) % 20 == 0:
-                print(f"  {i + 1}/{total} queries", end="\r", flush=True)
-
-        print(f"  {total}/{total} queries done   ")
+        print(f"  {len(queries)} queries done")
         for mode in modes_to_run:
             print(f"  {mode} -> {out_dir}/{mode}.jsonl")
         (out_dir / ".done").touch()
@@ -431,10 +435,11 @@ def cmd_sample(args):
 
     # Stream corpus, separate mandatory from remainder
     print("Streaming corpus...")
+    total_lines = sum(1 for ln in open(corpus_path) if ln.strip())
     mandatory_docs = {}
     remainder_ids = []
     with open(corpus_path) as f:
-        for line in f:
+        for line in tqdm(f, total=total_lines, desc="scan", unit="doc"):
             line = line.strip()
             if not line:
                 continue
@@ -464,7 +469,7 @@ def cmd_sample(args):
     out_corpus = out_dir / "corpus.jsonl"
     written = 0
     with open(corpus_path) as f_in, open(out_corpus, "w") as f_out:
-        for line in f_in:
+        for line in tqdm(f_in, total=total_lines, desc="write", unit="doc"):
             line = line.strip()
             if not line:
                 continue
@@ -513,7 +518,7 @@ def main():
     run_p.add_argument("--output", "-o", help="Write JSON results to file")
     run_p.add_argument("--signals", action="store_true",
                        help="Capture per-query signal data (bm25_top/gap, fused_top/gap). "
-                            "Runs bm25+vector+hybrid with IR_BENCH_SIGNALS+IR_DISABLE_SHORTCUTS. "
+                            "Runs the requested --mode values with IR_BENCH_SIGNALS+IR_DISABLE_SHORTCUTS. "
                             "Requires --signals-output.")
     run_p.add_argument("--signals-output", metavar="DIR",
                        help="Directory for per-query signal JSONL files (required with --signals)")

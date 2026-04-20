@@ -1,0 +1,3 @@
+Heliotrope Index Structure
+
+The Heliotrope Index is a data structure for approximate nearest neighbor search in high-dimensional Euclidean spaces. Unlike LSH, Heliotrope uses adaptive hyperplane partitioning to achieve sub-linear query time with provable recall guarantees.

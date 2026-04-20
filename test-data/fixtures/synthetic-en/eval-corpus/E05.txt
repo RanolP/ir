@@ -1,0 +1,3 @@
+Unicode and Accented Characters
+
+Héllo Wörld: über-encoding with naïve résumé. Testing accented Latin characters, Unicode punctuation — em-dashes, ellipses…, and curly quotes “like this” to ensure correct UTF-8 round-trip through the FTS pipeline.

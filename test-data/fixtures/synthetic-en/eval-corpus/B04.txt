@@ -1,0 +1,3 @@
+Quorum Intersection Lemma
+
+The Quorum Intersection Lemma provides safety guarantees for distributed systems with overlapping voter sets. It states that any two quorums must share at least one correct node to ensure consensus validity under crash failures.

@@ -1,0 +1,1 @@
+A document with no title field to verify that title extraction falls back to the first non-empty line of text content without crashing or producing empty index entries.

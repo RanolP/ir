@@ -1,0 +1,3 @@
+Clear Writing for Engineers
+
+Good technical writing requires clarity and precision. Authors should use short sentences, define technical terms on first use, and provide concrete examples alongside abstract definitions to help readers follow along.

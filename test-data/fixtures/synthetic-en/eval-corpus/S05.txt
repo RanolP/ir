@@ -1,0 +1,3 @@
+B-tree Index Internals
+
+B-tree indexes maintain a sorted, balanced structure enabling O(log n) lookups by key value. Composite indexes on multiple columns accelerate queries that filter on several predicates simultaneously by narrowing the search space.

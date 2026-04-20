@@ -1,0 +1,3 @@
+Paxos Decree Archive
+
+The Paxos Decree Archive stores accepted proposals with their ballot numbers and acceptor identities. Decree archives enable crash recovery by replaying uncommitted decisions from the last checkpointed state during leader election.

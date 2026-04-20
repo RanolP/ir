@@ -1,0 +1,3 @@
+Measuring Software Performance
+
+Profiling reveals computational bottlenecks in running software. By measuring execution time across code paths, engineers identify hot spots and apply targeted improvements to the sections that consume the most CPU cycles.

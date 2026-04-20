@@ -21,7 +21,7 @@ pub fn new_progress_bar(len: u64) -> ProgressBar {
     let pb = ProgressBar::new(len);
     pb.set_style(
         ProgressStyle::with_template(
-            "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg}",
+            "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {per_sec} {msg}",
         )
         .unwrap()
         .progress_chars("=>-"),
@@ -85,9 +85,11 @@ pub fn update(
 
     // 2. Scan filesystem
     let scanned_files = scanner::scan(collection)?;
-    let pb = new_progress_bar(scanned_files.len() as u64);
 
     // 3. Hash scanned files: {rel_path → (hash, content_bytes, mtime_rfc3339, birthtime_rfc3339)}
+    // Progress bar runs during hashing so operators can see activity from the first second.
+    let pb = new_progress_bar(scanned_files.len() as u64);
+    pb.set_message("hashing");
     let mut scanned: HashMap<String, (String, Vec<u8>, String, String)> =
         HashMap::with_capacity(scanned_files.len());
     for f in &scanned_files {
@@ -106,9 +108,11 @@ pub fn update(
             f.rel_path.clone(),
             (hash, content, mtime.to_rfc3339(), birthtime.to_rfc3339()),
         );
+        pb.inc(1);
     }
 
     // 4. Compute diff — pass hash-only view
+    pb.set_message("diffing");
     let hash_only: HashMap<String, String> = scanned
         .iter()
         .map(|(path, (hash, _, _, _))| (path.clone(), hash.clone()))
@@ -117,7 +121,9 @@ pub fn update(
     let (n_add, n_update, n_deactivate) =
         (d.to_add.len(), d.to_update.len(), d.to_deactivate.len());
 
+    pb.set_position(0);
     pb.set_length((n_add + n_update + n_deactivate) as u64);
+    pb.set_message("applying");
 
     // Spawn preprocessor chain once for the whole batch.
     let mut chain = if has_preprocessor {

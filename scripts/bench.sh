@@ -23,6 +23,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$REPO_ROOT"
+source "$SCRIPT_DIR/bench-env.sh"
+bench_env_init "$REPO_ROOT" "bench"
+
+_log() { echo "[$(date +%H:%M:%S)] $*"; }
 
 # ── Parse args ───────────────────────────────────────────────────────────────
 
@@ -106,17 +110,17 @@ fi
 # ── Download dataset if missing ───────────────────────────────────────────────
 
 if [[ ! -f "$DATA_PATH/corpus.jsonl" ]]; then
-    echo "==> Dataset '$DATASET' not found. Downloading..."
+    _log "Dataset '$DATASET' not found. Downloading..."
     eval "$DOWNLOAD_CMD"
 fi
 
 # ── Build ir binary ───────────────────────────────────────────────────────────
 
-echo "==> Building ir (HEAD)..."
+_log "Building ir (HEAD)..."
 cargo build --release --bin ir 2>&1
 HEAD_BIN="$REPO_ROOT/target/release/ir"
 HEAD_HASH=$(git rev-parse --short=7 HEAD)
-echo "    HEAD: $HEAD_HASH"
+_log "HEAD: $HEAD_HASH"
 
 # ── Build baseline if requested ───────────────────────────────────────────────
 
@@ -129,18 +133,19 @@ if [[ -n "$BASELINE_REF" ]]; then
     }
 
     if [[ "$BASELINE_HASH" == "$HEAD_HASH" ]]; then
-        echo "==> Baseline $BASELINE_REF ($BASELINE_HASH) matches HEAD — reusing binary"
+        _log "Baseline $BASELINE_REF ($BASELINE_HASH) matches HEAD — reusing binary"
         BASELINE_BIN="$HEAD_BIN"
     else
-        WORKTREE="/tmp/ir-bench-$BASELINE_HASH"
+        WORKTREE="$REPO_ROOT/.bench-state/worktrees/$BASELINE_HASH"
         if [[ ! -d "$WORKTREE" ]]; then
-            echo "==> Creating worktree for $BASELINE_REF ($BASELINE_HASH)..."
+            mkdir -p "$(dirname "$WORKTREE")"
+            _log "Creating worktree for $BASELINE_REF ($BASELINE_HASH)..."
             git worktree add --quiet "$WORKTREE" "$BASELINE_REF"
         fi
-        echo "==> Building ir ($BASELINE_REF)..."
+        _log "Building ir ($BASELINE_REF)..."
         cargo build --release --bin ir --manifest-path "$WORKTREE/Cargo.toml" 2>&1
         BASELINE_BIN="$WORKTREE/target/release/ir"
-        echo "    baseline: $BASELINE_HASH"
+        _log "baseline: $BASELINE_HASH"
     fi
 fi
 
@@ -157,11 +162,11 @@ run_version() {
     local result_file="$LOG_DIR/${git7}.json"
 
     if [[ -f "$result_file" ]]; then
-        echo "==> [$label $git7] cached ($result_file)"
+        _log "[$label $git7] cached ($result_file)"
         return 0
     fi
 
-    echo "==> [$label $git7] preparing collection..."
+    _log "[$label $git7] preparing collection..."
     prep_args=(
         prepare
         --ir-bin "$ir_bin"
@@ -172,7 +177,7 @@ run_version() {
     [[ -n "$EMBED_FLAG" ]] && prep_args+=($EMBED_FLAG)
     python3 scripts/beir-eval.py "${prep_args[@]}"
 
-    echo "==> [$label $git7] running queries (mode=$MODE)..."
+    _log "[$label $git7] running queries (mode=$MODE)..."
     python3 scripts/beir-eval.py run \
         --ir-bin "$ir_bin" \
         --data "$DATA_PATH" \
@@ -181,7 +186,7 @@ run_version() {
         --at-k "10,20,100" \
         --output "$result_file"
 
-    echo "==> [$label $git7] done -> $result_file"
+    _log "[$label $git7] done -> $result_file"
 }
 
 run_version "HEAD" "$HEAD_HASH" "$HEAD_BIN"

@@ -19,6 +19,39 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$REPO_ROOT"
+source "$SCRIPT_DIR/bench-env.sh"
+bench_env_init "$REPO_ROOT" "signal-sweep"
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+_log() { echo "[$(date +%H:%M:%S)] $*"; }
+
+# Run a command while printing a heartbeat every 60s.
+# On no-activity for 60s, also prints a STALL DETECTED warning to help diagnose hangs.
+# Usage: _with_pulse <cmd> [args...]
+_with_pulse() {
+    "$@" &
+    local child_pid=$!
+    local t_start=$SECONDS
+    local last_beat=$SECONDS
+    while kill -0 "$child_pid" 2>/dev/null; do
+        sleep 5
+        local now=$SECONDS
+        local since=$(( now - last_beat ))
+        if [[ $since -ge 60 ]]; then
+            local elapsed=$(( now - t_start ))
+            _log "still running (${elapsed}s elapsed): $1"
+            if [[ $elapsed -ge 120 ]]; then
+                _log "STALL DETECTED — process running for ${elapsed}s with no reported completion."
+                _log "  If this is 'ir update' with a Korean preprocessor, this is likely issue #13"
+                _log "  (single-pipe lindera deadlock). Kill with: kill $child_pid"
+                _log "  Then re-run against test-data/fixtures/miracl-ko-mini for a smaller canary."
+            fi
+            last_beat=$now
+        fi
+    done
+    wait "$child_pid"
+}
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
 
@@ -41,7 +74,7 @@ done
 
 # ── Build ir binary ───────────────────────────────────────────────────────────
 
-echo "==> Building ir (HEAD)..."
+_log "Building ir (HEAD)..."
 cargo build --release --bin ir 2>&1
 IR_BIN="$REPO_ROOT/target/release/ir"
 
@@ -56,11 +89,11 @@ run_signals_for() {
 
     # Skip only if a completion marker exists (written after all queries finish)
     if [[ -f "$out_dir/.done" ]]; then
-        echo "  [skip] $label (complete)"
+        _log "[skip] $label (complete)"
         return 0
     fi
 
-    echo "==> [$label] preparing collection..."
+    _log "[$label] preparing collection..."
     prep_args=(
         prepare
         --ir-bin "$IR_BIN"
@@ -69,9 +102,9 @@ run_signals_for() {
     )
     [[ -n "$preprocessor" ]] && prep_args+=(--preprocessor "$preprocessor")
     [[ "$BM25_ONLY" -eq 0 ]] && prep_args+=(--embed)
-    python3 scripts/beir-eval.py "${prep_args[@]}"
+    _with_pulse python3 scripts/beir-eval.py "${prep_args[@]}"
 
-    echo "==> [$label] running signal collection..."
+    _log "[$label] running signal collection..."
     sig_mode="all"
     [[ "$BM25_ONLY" -eq 1 ]] && sig_mode="bm25"
 
@@ -84,7 +117,7 @@ run_signals_for() {
         --signals \
         --signals-output "$out_dir"
 
-    echo "==> [$label] done -> $out_dir"
+    _log "[$label] done -> $out_dir"
 }
 
 run_sampled() {
@@ -99,7 +132,7 @@ run_sampled() {
         local collection="eval-${sample_label}"
 
         if [[ ! -f "$sample_dir/corpus.jsonl" ]]; then
-            echo "==> Sampling: $sample_label (size=$size seed=$seed)"
+            _log "Sampling: $sample_label (size=$size seed=$seed)"
             python3 scripts/beir-eval.py sample \
                 --data "$base_data" \
                 --size "$size" \
@@ -116,7 +149,7 @@ run_sampled() {
 run_fiqa() {
     local data_dir="$REPO_ROOT/test-data/fiqa"
     if [[ ! -f "$data_dir/corpus.jsonl" ]]; then
-        echo "==> Downloading FiQA..."
+        _log "Downloading FiQA..."
         bash scripts/download-beir.sh fiqa
     fi
     run_signals_for "fiqa" "$data_dir" "eval-fiqa-signals" ""
@@ -134,7 +167,7 @@ run_fiqa() {
 run_miracl_ko() {
     local data_dir="$REPO_ROOT/test-data/miracl-ko"
     if [[ ! -f "$data_dir/corpus.jsonl" ]]; then
-        echo "==> Downloading MIRACL-Ko (full corpus ~1.5M docs)..."
+        _log "Downloading MIRACL-Ko (full corpus ~1.5M docs)..."
         bash scripts/download-miracl-ko.sh
     fi
 
@@ -152,7 +185,7 @@ run_miracl_ko() {
 
 # ── Run datasets ─────────────────────────────────────────────────────────────
 
-echo "==> Signal sweep: dataset=$DATASET sizes='${SIZES:-all}' pools=$POOLS bm25_only=$BM25_ONLY"
+_log "Signal sweep: dataset=$DATASET sizes='${SIZES:-all}' pools=$POOLS bm25_only=$BM25_ONLY"
 
 case "$DATASET" in
     fiqa)      run_fiqa ;;
@@ -162,5 +195,5 @@ case "$DATASET" in
 esac
 
 echo ""
-echo "==> Collection complete. Run analysis:"
-echo "    python3 scripts/threshold-sweep.py logs/signals/*/"
+_log "Collection complete. Run analysis:"
+_log "    python3 scripts/threshold-sweep.py logs/signals/*/"

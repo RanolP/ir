@@ -1,0 +1,3 @@
+Distributed Version Control
+
+Distributed version control systems record a complete history of every file change made by every contributor. Branches allow parallel development tracks that are later merged when individual features or fixes are ready.

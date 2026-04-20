@@ -1,0 +1,3 @@
+Fenwick Wavelet Decomposition
+
+Fenwick wavelet decomposition enables efficient range queries on compressed data streams. The technique combines binary indexed trees with Haar wavelet basis functions for O(log n) point updates and prefix sum queries.

@@ -1,0 +1,17 @@
+{
+  "_note": "Corpus not yet generated. Run: scripts/generate-fixtures.sh to populate corpus.jsonl from miracl-ko.",
+  "calibrated": false,
+  "stability": {
+    "max_wall_clock_s": 120,
+    "must_exit_zero": true,
+    "no_stall": true
+  },
+  "speed": {
+    "min_index_docs_per_s": 10,
+    "max_query_p50_ms": 2000
+  },
+  "performance": {
+    "bm25":   {"ndcg_10": 0.02, "recall_10": 0.10, "tolerance": 0.02},
+    "hybrid": {"ndcg_10": 0.20, "recall_10": 0.40, "tolerance": 0.05}
+  }
+}

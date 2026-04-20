@@ -1,0 +1,3 @@
+Mixed Case Identifiers
+
+camelCase PascalCase snake_case SCREAMING_SNAKE_CASE kebab-case should all be tokenised and indexed without errors. The FTS tokeniser must handle transitions between lower and upper case ASCII characters gracefully.

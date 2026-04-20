@@ -1,5 +1,15 @@
 ## [Unreleased]
 
+### Dev / Benchmark Tooling
+
+- **Pre-ship regression gate** (`scripts/preship.sh`): three-axis regression check (stability, speed, performance) across test fixtures before release. Catches hang/crash/timeout (stability), throughput and latency regressions (speed), and nDCG/Recall regressions (performance). Portable: works with macOS bash 3.2, uses perl alarm fallback when GNU timeout is unavailable.
+- **Committed test fixtures** (`test-data/fixtures/synthetic-en/`): 20-doc English corpus with discriminative BM25 fingerprint terms, semantic synonym pairs, distractors, and edge cases. Calibrated expected.json with 10% buffer floors. Catches pipeline regressions in ~30s without any model download.
+- **Korean canary fixture** (`test-data/fixtures/miracl-ko-mini/expected.json`): placeholder for issue #13-class deadlock detection. Populate with `scripts/generate-fixtures.sh` after downloading miracl-ko.
+- **Fixture calibration** (`scripts/calibrate-fixtures.sh`): measures actual metrics per mode, writes calibrated baselines to expected.json with 10% buffer floors. Per-mode `_uncalibrated` flag prevents uncalibrated modes from failing the gate.
+- **Pool-size variance study** (`scripts/pool-size-study.sh`, `scripts/pool-size-aggregate.py`): sweeps miracl-ko at multiple corpus sizes × multiple seeds to find the smallest pool with stable nDCG stddev < 0.005. Writes `research/pool-size-study.md`. Current recommendation: 10000 docs; pools at or below the 503 mandatory qrel-linked docs are treated as deterministic floors, not variance evidence.
+- **Progress reporting**: timestamped `_log()` in bench.sh and signal-sweep.sh; stall detector in signal-sweep.sh (STALL DETECTED at 120s no-output with issue context); tqdm progress bars in beir-eval.py (materialize, run, signals, sample); `{per_sec}` in indexer indicatif progress bar.
+- **Indexer progress bar** now shows docs/sec and counts from the hash phase (previously only showed apply phase progress).
+
 ## [0.12.0] - 2026-04-20
 
 ### New Features
