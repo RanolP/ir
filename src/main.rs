@@ -685,7 +685,6 @@ fn handle_preprocessor(cmd: PreprocessorCmd) -> Result<()> {
                 println!("registered:");
                 for (alias, cmd) in &entries {
                     println!("  {:<10} {}", alias, cmd);
-                    warn_stale_preprocessor(alias, cmd);
                 }
             }
             let uninstalled: Vec<_> = known
@@ -827,25 +826,6 @@ fn pick_collections_for_bind(config: &Config, alias: &str) -> Result<Vec<String>
         .interact()
         .map_err(|e| error::Error::Other(format!("prompt: {e}")))?;
     Ok(selections.into_iter().map(|i| config.collections[i].name.clone()).collect())
-}
-
-/// Warn if a registered preprocessor command looks stale (old bundled binary or missing path).
-/// TODO(remove ≥0.13.0): migration warning for users upgrading from ≤0.9.x
-fn warn_stale_preprocessor(alias: &str, cmd: &str) {
-    // ^ old bundled binary names shipped in preprocessors/ before v0.10.0
-    const OLD_BUNDLED: &[&str] = &["lindera-tokenize", "lindera-tokenize-ja", "bigram-tokenize-zh"];
-    let program = cmd.split_whitespace().next().unwrap_or("");
-    let binary_name = std::path::Path::new(program)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or(program);
-    if OLD_BUNDLED.contains(&binary_name) {
-        eprintln!("warning: '{alias}' uses an old bundled binary that no longer ships with ir");
-        eprintln!("  run: ir preprocessor install {alias}");
-    } else if !program.is_empty() && std::path::Path::new(program).is_absolute() && !std::path::Path::new(program).exists() {
-        eprintln!("warning: '{alias}' binary not found: {program}");
-        eprintln!("  run: ir preprocessor install {alias}");
-    }
 }
 
 /// Download official lindera CLI binary + language dictionary, register command.

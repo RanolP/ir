@@ -1,5 +1,36 @@
 ## [Unreleased]
 
+## [0.13.0] - 2026-04-23
+
+### Breaking
+
+- **Combined-model default removal** (`src/daemon.rs`, `src/llm/combined.rs`): dedicated expander + reranker is now the only default tier-2 path. A local Qwen combined GGUF is no longer auto-activated from model search dirs; combined mode is opt-in via `IR_COMBINED_MODEL` only and is intended for explicit testing or experiments.
+
+### Features
+
+- **Per-collection routing overrides** (`config.yml`, `src/types.rs`, `src/search/hybrid.rs`): collections can now carry optional BM25/fused strong-signal threshold overrides under a `routing:` block. This gives runtime threshold tuning a stable config surface without changing the global defaults. Overrides apply only when all searched collections agree; mixed searches with conflicting values fall back to the global defaults.
+
+  ```yaml
+  collections:
+    - name: wiki-ko
+      path: ~/wiki
+      preprocessor: [ko]
+      routing:
+        fused_strong_product: 0.05
+  ```
+
+  Fields: `fused_strong_floor`, `fused_strong_product`, `bm25_strong_floor`, `bm25_strong_gap`.
+
+- **Built-in Korean bind default** (`src/main.rs`): binding the built-in `ko` preprocessor alias now also writes the current Korean fused routing default (`routing.fused_strong_product: 0.05`) for that collection when no explicit routing override exists yet.
+  - Existing `ko`-bound collections are **not** auto-migrated. Add the `routing:` block manually to `config.yml` or unbind/rebind `ko` to apply.
+  - Rationale: on the sampled Korean holdout `miracl-ko-s50000-p42`, fused `0.05` outperforms `0.06` on both quality and latency (`nDCG@10=0.9650`, `R@10=0.9813`, `med=431.5ms` vs `nDCG@10=0.9603`, `R@10=0.9766`, `med=440.4ms`).
+
+### Improvements
+
+- **Cold-search daemon warmup** (`src/main.rs`): `ir search` now kicks off daemon startup immediately, but a cold first query no longer waits for model download/load if BM25 already found usable results. The daemon continues warming in the background so follow-up queries land on the hotter path.
+- **Large-corpus embed stall fix** (`src/index/embed.rs`): `ir embed` no longer loads every pending document body into memory before starting work. Pending docs are now counted once and streamed in small batches by content hash, which makes progress visible immediately and avoids the full-corpus RAM spike that could make large MIRACL-Ko resumes look hung for an hour before the first progress update.
+- **Indexer progress bar** now shows docs/sec and counts from the hash phase (previously only showed apply phase progress).
+
 ### Dev / Benchmark Tooling
 
 - **Pre-ship regression gate** (`scripts/preship.sh`): three-axis regression check (stability, speed, performance) across test fixtures before release. Catches hang/crash/timeout (stability), throughput and latency regressions (speed), and nDCG/Recall regressions (performance). Portable: works with macOS bash 3.2, uses perl alarm fallback when GNU timeout is unavailable.
@@ -7,34 +38,19 @@
 - **Korean canary fixture** (`test-data/fixtures/miracl-ko-mini/expected.json`): placeholder for issue #13-class deadlock detection. Populate with `scripts/generate-fixtures.sh` after downloading miracl-ko.
 - **Fixture calibration** (`scripts/calibrate-fixtures.sh`): measures actual metrics per mode, writes calibrated baselines to expected.json with 10% buffer floors. Per-mode `_uncalibrated` flag prevents uncalibrated modes from failing the gate.
 - **Pool-size variance study** (`scripts/pool-size-study.sh`, `scripts/pool-size-aggregate.py`): sweeps miracl-ko at multiple corpus sizes × multiple seeds to find the smallest pool with stable nDCG stddev < 0.005. Writes `research/pool-size-study.md`. Current minimum stable pool: 10000 docs; active research default: 50000 docs because 10000 often saturates ranking metrics. Pools at or below the 503 mandatory qrel-linked docs are treated as deterministic floors, not variance evidence.
-- **Progress reporting**: timestamped `_log()` in bench.sh and signal-sweep.sh; stall detector in signal-sweep.sh (STALL DETECTED at 120s no-output with issue context); tqdm progress bars in beir-eval.py (materialize, run, signals, sample); `{per_sec}` in indexer indicatif progress bar.
-- **Indexer progress bar** now shows docs/sec and counts from the hash phase (previously only showed apply phase progress).
+- **Progress reporting**: timestamped `_log()` in bench.sh and signal-sweep.sh; stall detector in signal-sweep.sh (STALL DETECTED at 120s no-output with issue context); tqdm progress bars in beir-eval.py (materialize, run, signals, sample).
 - **Benchmark summary output** (`scripts/bench.sh`): prints one row per available mode (`bm25`, `vector`, `hybrid`) instead of collapsing a run to a single best-mode row. Makes baseline capture usable directly from the benchmark command.
 - **Benchmark resume** (`scripts/bench.sh`, `scripts/beir-eval.py run`): rerunning the same dataset after a crash now reuses a prepared collection when it is already ready for the requested mode, instead of redoing the entire prepare stage. Query scoring also resumes from per-query sidecar progress when `--output` is set, so a crash mid-run does not force the query loop to restart from zero. Cache validation distinguishes `bm25`-only results from full `all`-mode results.
 - **Benchmark pipeline pinning** (`scripts/bench.sh`, `scripts/bench-env.sh`): non-BM25 benchmark runs now force the dedicated expander + reranker path and restart the benchmark daemon before scoring. This prevents local combined-model auto-detect or stale daemon state from silently changing the benchmark pipeline. Benchmark state now also exports `IR_CONFIG_DIR`, eliminating the deprecated `XDG_CONFIG_HOME` warning during benchmark runs.
 - **Sampled benchmarks** (`scripts/bench.sh --size N --seed N`): large BEIR corpora can now be benchmarked directly on a sampled pool without hand-running `beir-eval.py sample` first. Sampled runs get distinct dataset labels, collections, and result-cache directories such as `miracl-ko-s10000-p42`, so they do not overwrite full-corpus baselines.
-- **Large-corpus embed stall fix** (`src/index/embed.rs`): `ir embed` no longer loads every pending document body into memory before starting work. Pending docs are now counted once and streamed in small batches by content hash, which makes progress visible immediately and avoids the full-corpus RAM spike that could make large MIRACL-Ko resumes look hung for an hour before the first progress update.
-- **Research harness** (`scripts/research-harness.sh`, `scripts/signal-sweep.sh --sample-only`, `scripts/threshold-validate.py`, `research/experiment.md`): the benchmark workflow is now consolidated around a maintainer entrypoint with `baseline`, `signals`, `thresholds`, and `validate-thresholds` subcommands. Korean threshold research now defaults to sampled `miracl-ko --size 50000` pools for better metric headroom, while `10000` remains the fast stable floor. The harness can skip the full-corpus sweep entirely via `--sample-only`, validates shortlisted threshold candidates on a locked holdout without patching source per candidate, and supports fine-grained fused holdout probes via `validate-thresholds --products ...`.
-- **Threshold override hooks** (`src/search/hybrid.rs`, `src/main.rs`): strong-signal and BM25 shortcut thresholds can now be overridden via env vars during research runs. This keeps the shipped defaults unchanged while the harness validates candidate thresholds against a holdout collection.
+- **Research harness** (`scripts/research-harness.sh`, `scripts/signal-sweep.sh --sample-only`, `scripts/threshold-validate.py`, `research/experiment.md`): the benchmark workflow is now consolidated around a maintainer entrypoint with `baseline`, `signals`, `thresholds`, and `validate-thresholds` subcommands. Korean threshold research now defaults to sampled `miracl-ko --size 50000` pools for better metric headroom, while `10000` remains the fast stable floor.
 - **Benchmark safety watchdog** (`scripts/bench.sh`, `scripts/bench-env.sh`): macOS benchmark runs now keep Metal enabled but watch system free memory, swapouts, and runaway `ir` CPU usage during long `prepare` / `run` phases. The wrapper aborts unsafe runs before they drag the machine into swap-heavy or CPU-fallback territory. Thresholds are tunable via `IR_BENCH_MIN_FREE_PCT`, `IR_BENCH_MAX_IR_CPU_PCT`, `IR_BENCH_CPU_STRIKES`, or can be disabled with `IR_BENCH_GUARD=0`.
-- **Combined-model default removal** (`src/daemon.rs`, `src/llm/combined.rs`, docs): dedicated expander + reranker is now the only default tier-2 path. A local Qwen combined GGUF is no longer auto-activated from model search dirs; combined mode is opt-in via `IR_COMBINED_MODEL` only and is intended for explicit testing or experiments.
-- **Cold-search daemon warmup** (`src/main.rs`): `ir search` now kicks off daemon startup immediately, but a cold first query no longer waits for model download/load if BM25 already found usable results. The daemon continues warming in the background so follow-up queries land on the hotter path.
+- **Threshold override env vars** (`src/search/hybrid.rs`): strong-signal and BM25 shortcut thresholds can be overridden via env vars during research runs. This keeps the shipped defaults unchanged while the harness validates candidate thresholds against a holdout collection.
 - **Tier-2 router dataset export** (`scripts/export-tier2-router-data.py`, `research/experiment.md`): signal sweeps can now be converted directly into smoltrain JSONL for a tiny `skip_tier2` vs `run_tier2` classifier trained on real benchmark behavior instead of hand labels.
-- **Tier-2 router smoltrain prep** (`scripts/prepare-tier2-router-smoltrain.py`, `research/experiment.md`): exported router datasets can now be turned into a self-contained `smoltrain` workspace with `train.jsonl`, `train_balanced.jsonl`, `eval.jsonl`, `taxonomy.yaml`, and `world.json`. The router export now also writes `text` alongside legacy `input` so it matches the current `smoltrain` trainer without manual rewriting, and the recommended training path oversamples the minority `run_tier2` class while keeping eval honest.
+- **Tier-2 router smoltrain prep** (`scripts/prepare-tier2-router-smoltrain.py`, `research/experiment.md`): exported router datasets can now be turned into a self-contained `smoltrain` workspace with `train.jsonl`, `train_balanced.jsonl`, `eval.jsonl`, `taxonomy.yaml`, and `world.json`.
 - **Router bundle wrapper** (`scripts/router-data.sh`): router bundle prep now has a separate entrypoint for Korean-only, FiQA-only, or mixed training data, so router research stays isolated from the working `scripts/research-harness.sh` baseline / threshold flow.
-- **Tier-1 router benchmark path** (`src/search/hybrid.rs`, `scripts/beir-eval.py`, `scripts/router-bench.py`): research runs can now force `hybrid` to return tier-1 fused results only via `IR_FORCE_TIER1_ONLY`, collect `tier1.jsonl` alongside normal signal files, and benchmark a trained router offline against a holdout without changing the shipped runtime path.
-- **Research conclusions documented** (`research/experiment.md`, READMEs, benchmark skill): current maintainer guidance now explicitly prefers stricter threshold gating before any runtime router integration. FiQA stays on the current fused threshold, Korean threshold research uses sampled `miracl-ko --size 50000`, and router work remains offline until it clearly beats simple gating on holdout.
-- **Per-collection routing overrides** (`config.yml`, `src/types.rs`, `src/search/hybrid.rs`): collections can now carry optional BM25/fused strong-signal threshold overrides under a `routing:` block. This gives runtime threshold tuning a stable config surface without changing the global defaults. Overrides only apply when all searched collections agree; mixed searches with conflicting values fall back to the global defaults.
-- **Built-in Korean bind default** (`src/main.rs`, READMEs): binding the built-in `ko` preprocessor alias now also writes the current Korean fused routing default (`routing.fused_strong_product: 0.05`) for that collection when no explicit routing override exists yet. This keeps the Korean tuning visible in config instead of hiding it as a runtime language special case.
-  - Existing `ko`-bound collections are **not** auto-migrated. They keep the current implicit default unless you add:
-    ```yaml
-    routing:
-      fused_strong_product: 0.05
-    ```
-    to the collection in `config.yml`, or unbind/rebind `ko`.
-  - Rationale: on the sampled Korean holdout `miracl-ko-s50000-p42`, fused `0.05` beat `0.06` on both quality and latency:
-    - `0.05`: `nDCG@10=0.9650`, `R@10=0.9813`, `med=431.5ms`
-    - `0.06`: `nDCG@10=0.9603`, `R@10=0.9766`, `med=440.4ms`
+- **Tier-1 router benchmark path** (`src/search/hybrid.rs`, `scripts/beir-eval.py`, `scripts/router-bench.py`): research runs can force `hybrid` to return tier-1 fused results only, collect `tier1.jsonl` alongside normal signal files, and benchmark a trained router offline against a holdout without changing the shipped runtime path.
+- **Research conclusions documented** (`research/experiment.md`, READMEs, benchmark skill): current maintainer guidance explicitly prefers stricter threshold gating before any runtime router integration. FiQA stays on the current fused threshold, Korean threshold research uses sampled `miracl-ko --size 50000`, and router work remains offline until it clearly beats simple gating on holdout.
 
 ## [0.12.0] - 2026-04-20
 
