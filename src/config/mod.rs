@@ -279,6 +279,7 @@ mod tests {
             excludes: vec![],
             description: None,
             preprocessor: None,
+            routing: None,
         }
     }
 

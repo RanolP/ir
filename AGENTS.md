@@ -121,4 +121,4 @@ Requires `dangerouslyDisableSandbox: true` — gh CLI reads `~/.config/gh` (sand
 - IR_DIR is set internally at startup (= resolved ir_dir() value); appears in preprocessor commands as $IR_DIR/preprocessors/... for portability — do not expose in user-facing docs
 - All path env vars (IR_CONFIG_DIR, IR_MODEL_DIRS, IR_*_MODEL) support ~ and $VAR expansion via expand_path() in src/config/mod.rs — tests for this must use ENV_LOCK mutex to prevent parallel env var interference
 - scripts/preship.sh must pass (exit 0 or 2) before any signal-sweep run or release; run `--bm25-only` for fast CI gate, full for pre-release
-- Default pool size for MIRACL-Ko signal sweeps: 10000 docs. Do not use pool sizes <= 503 for between-seed variance decisions; those pools collapse to the mandatory qrel-linked docs and are deterministic.
+- Default pool size for MIRACL-Ko signal sweeps: 50000 docs. Minimum stable floor from the variance study: 10000 docs. Do not use pool sizes <= 503 for between-seed variance decisions; those pools collapse to the mandatory qrel-linked docs and are deterministic.

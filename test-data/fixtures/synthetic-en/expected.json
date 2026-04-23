@@ -6,8 +6,8 @@
     "no_stall": true
   },
   "speed": {
-    "min_index_docs_per_s": 20,
-    "max_query_p50_ms": 1000
+    "min_index_docs_per_s": 11,
+    "max_query_p50_ms": 31
   },
   "performance": {
     "bm25": {

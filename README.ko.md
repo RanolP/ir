@@ -6,6 +6,7 @@
 
 - **컬렉션별 SQLite** — 각 컬렉션이 독립 파일; 공유 전역 인덱스 없음
 - **퍼시스턴트 데몬** — 모델이 쿼리 사이에 메모리에 상주; 첫 검색 시 자동 시작
+  차가운 첫 쿼리는 데몬이 뒤에서 예열되는 동안 BM25 결과를 먼저 돌려줄 수 있다.
 - **이중 LLM 캐시** — 확장기 출력과 재순위 점수 영속화; 반복 쿼리는 즉각 반환
 
 4개 BEIR 데이터셋 기준 검색 품질 측정; 재순위화로 순수 벡터 대비 최대 +14.5% nDCG@10.
@@ -17,6 +18,7 @@
 - **쿼리 확장** — 확장기 모델 존재 시 lex/vec/hyde 타입 서브쿼리 생성
 - **강신호 단축** — BM25 최고점 ≥ 0.75 AND 차이 ≥ 0.10이면 즉시 반환
 - **데몬 모드** — 쿼리 사이에 모델 상주; 첫 검색 시 자동 시작
+  cold start라도 첫 useful BM25 결과를 막지 않는다.
 - **이중 LLM 캐시** — 확장기 출력 전역 캐시; 재순위 점수 컬렉션별 캐시
 - **컬렉션별 SQLite** — 독립 WAL 저널, 격리 백업, 컬렉션 간 경합 없음
 - **내용 주소 저장** — SHA-256으로 동일 파일 중복 제거
@@ -82,16 +84,21 @@ ir search "서울 지하철" -c wiki
 | [qmd-query-expansion 1.7B](https://huggingface.co/tobil/qmd-query-expansion-1.7B) | `tobil/qmd-query-expansion-1.7B` | 쿼리 확장 전용 (선택) |
 | [BGE-M3 568M](https://huggingface.co/ggml-org/bge-m3-Q8_0-GGUF) | `ggml-org/bge-m3-Q8_0-GGUF` | 한국어 임베딩 대안 (선택) |
 
-BM25 검색은 모델 없이 동작합니다. `IR_COMBINED_MODEL`이 설정되거나 `~/local-models/`에 Qwen3.5 GGUF가 있으면 확장기와 재순위기를 대체합니다.
+BM25 검색은 모델 없이 동작합니다. 기본 tier-2 경로는 전용 확장기 + 재순위기입니다. `IR_COMBINED_MODEL`은 통합 모델 실험이나 테스트를 할 때만 명시적으로 사용합니다.
 
 **로컬 모델:**
 
 ```bash
 export IR_MODEL_DIRS="$HOME/my-models"
-export IR_COMBINED_MODEL="$HOME/local-models/Qwen3.5-2B-Q4_K_M.gguf"   # 통합
 export IR_EMBEDDING_MODEL="$HOME/my-models/embeddinggemma-300M-Q8_0.gguf"
 export IR_RERANKER_MODEL="$HOME/my-models/qwen3-reranker-0.6b-q8_0.gguf"
 export IR_EXPANDER_MODEL="$HOME/my-models/qmd-query-expansion-1.7B-q4_k_m.gguf"
+```
+
+통합 모드는 명시적으로만 사용합니다:
+
+```bash
+export IR_COMBINED_MODEL="$HOME/local-models/Qwen3.5-2B-Q4_K_M.gguf"   # 테스트 / 실험 전용
 ```
 
 탐색 순서: 환경변수 → `IR_MODEL_DIRS` → `~/local-models/` → `~/.cache/ir/models/` → `~/.cache/qmd/models/` → HF Hub 자동 다운로드.
@@ -384,6 +391,34 @@ ir search "서울 지하철" -c wiki
 ```
 
 `ir preprocessor install ko`는 lindera 공식 GitHub 릴리즈에서 lindera CLI 바이너리와 ko-dic 사전을 다운로드합니다. 지원 플랫폼: **macOS** (arm64, x86\_64) 및 **Linux** (x86\_64, aarch64). 별도 시스템 의존성이나 Rust 툴체인이 필요 없습니다. 설치 시 컬렉션 바인딩 피커가 표시됩니다.
+내장 `ko` alias를 바인딩하면 해당 컬렉션에 현재 한국어 routing 기본값도 함께 기록됩니다:
+
+```yaml
+routing:
+  fused_strong_product: 0.05
+```
+
+이 값은 bind 시점에 써 넣는 기본값이며, 숨겨진 런타임 special case가 아닙니다. 이미 `routing:`을 직접 설정한 경우에는 그 명시적 설정이 우선합니다.
+
+**컬렉션별 routing override** (`config.yml`, 선택):
+
+```yaml
+collections:
+  - name: wiki-ko
+    path: ~/wiki
+    preprocessor: [ko]
+    routing:
+      fused_strong_product: 0.05
+```
+
+특정 컬렉션에만 BM25/fused strong-signal threshold를 다르게 적용할 때 사용합니다. 지원 필드:
+
+- `fused_strong_floor`
+- `fused_strong_product`
+- `bm25_strong_floor`
+- `bm25_strong_gap`
+
+override는 검색에 포함된 모든 컬렉션이 같은 값을 명시했을 때만 적용됩니다. 서로 다른 override가 섞인 multi-collection 검색은 전역 기본 threshold로 되돌아갑니다.
 
 **다른 언어:**
 
@@ -419,6 +454,20 @@ lindera 처리 속도: M-시리즈 Mac 기준 약 5,600 문서/초 · 1.8 MB/초
 | lindera | **0.6326** | Mode::Decompose로 복합어 분해 |
 
 상세 결과 및 근거: [research/experiment.md](research/experiment.md)
+`scripts/bench.sh <dataset>`는 모드별 표(`bm25`, `vector`, `hybrid`)를 출력하고 전체 JSON 결과를 `logs/results/<dataset>/`에 캐시합니다.
+BM25가 아닌 벤치마크 실행에서는 래퍼가 tier-2를 전용 확장기 + 재순위기 경로로 고정하고 점수 계산 전에 벤치마크 데몬을 다시 시작합니다. 따라서 로컬 Qwen 통합 GGUF나 이전 데몬 상태 때문에 벤치마크 파이프라인이 조용히 바뀌지 않습니다.
+머신이 prepare/index/embed 이후 점수 계산 전에 종료되면, 같은 `scripts/bench.sh <dataset>` 명령을 다시 실행했을 때 처음부터 다시 만들지 않고 준비된 컬렉션에서 재개합니다. 점수 계산도 자동으로 재개됩니다. `scripts/beir-eval.py run --output ...`는 쿼리별 진행 상태를 `<output>.partial/`에 저장하고, 다시 실행하면 그 지점부터 이어서 계산합니다.
+대규모 코퍼스는 `--size N --seed N`으로 샘플링한 풀에서 벤치마크할 수 있습니다. MIRACL-Ko는 현재 연구 기본값으로 `scripts/bench.sh miracl-ko --size 50000`을 사용합니다. `10000` docs는 풀 크기 연구상 최소 안정 샘플이지만, 점수가 너무 높아 세밀한 순위 비교에는 포화되는 경향이 있기 때문입니다.
+유지보수용 단축 진입점은 `scripts/research-harness.sh`입니다. baseline 고정, signal 수집, threshold sweep, 그리고 shortlist threshold의 holdout 자동 검증 흐름까지 감싸며, threshold 경계 근처를 촘촘히 보려면 `validate-thresholds --products ...`로 정확한 fused 값을 직접 검증할 수 있습니다. 자세한 절차는 [research/experiment.md](research/experiment.md)에 정리되어 있습니다.
+현재 연구 방향은 다음과 같습니다.
+
+- `fiqa`는 현재 fused threshold를 유지
+- 한국어 threshold 연구는 `miracl-ko --size 50000` 기준으로 진행
+- learned router보다 먼저 stricter fused gating을 검증
+- router는 holdout에서 단순 threshold gating보다 분명히 나아지기 전까지는 오프라인 연구로만 유지
+
+Tier-2 router 연구는 이 흐름과 분리해 둡니다. 먼저 `bash scripts/signal-sweep.sh --dataset miracl-ko --size 50000 --pools 3 --tier1`로 router용 signal을 수집한 뒤, `bash scripts/router-data.sh ko`로 한국어 전용 `smoltrain` 번들을 만드세요. holdout 평가는 기본 런타임을 바꾸지 않고 `scripts/router-bench.py`로 오프라인에서 진행합니다.
+macOS에서는 `scripts/bench.sh`가 기본적으로 안전 감시기와 함께 실행됩니다. 속도를 위해 Metal은 유지하되, 시스템 여유 메모리가 너무 낮아지거나 swapout이 시작되거나 `ir`가 CPU fallback처럼 과도한 CPU를 몇 차례 연속 사용하면 벤치마크를 중단합니다. `IR_BENCH_MIN_FREE_PCT`, `IR_BENCH_MAX_IR_CPU_PCT`, `IR_BENCH_CPU_STRIKES`로 조정할 수 있고, `IR_BENCH_GUARD=0`으로 끌 수 있습니다.
 
 </details>
 

@@ -2,9 +2,10 @@
 # signal-sweep.sh — Collect per-query signal data for strong-signal threshold research.
 #
 # Usage:
-#   scripts/signal-sweep.sh [--dataset fiqa|miracl-ko|all] [--size N[,N,...]] [--pools N] [--bm25-only]
+#   scripts/signal-sweep.sh [--dataset fiqa|miracl-ko|all] [--size N[,N,...]] [--pools N] [--bm25-only] [--sample-only] [--tier1]
 #
 # Outputs to logs/signals/{dataset}[-s{size}-p{pool}]/bm25.jsonl, vector.jsonl, hybrid.jsonl
+# Router research can also opt into tier1.jsonl via --tier1.
 #
 # Examples:
 #   scripts/signal-sweep.sh --dataset fiqa
@@ -27,7 +28,7 @@ bench_env_init "$REPO_ROOT" "signal-sweep"
 _log() { echo "[$(date +%H:%M:%S)] $*"; }
 
 # Run a command while printing a heartbeat every 60s.
-# On no-activity for 60s, also prints a STALL DETECTED warning to help diagnose hangs.
+# After 120s elapsed, prints a stall warning with issue #13 context.
 # Usage: _with_pulse <cmd> [args...]
 _with_pulse() {
     "$@" &
@@ -59,6 +60,8 @@ DATASET="all"
 SIZES=""
 POOLS=3
 BM25_ONLY=0
+SAMPLE_ONLY=0
+TIER1=0
 
 # ── Parse args ────────────────────────────────────────────────────────────────
 
@@ -68,15 +71,29 @@ while [[ $# -gt 0 ]]; do
         --size)    SIZES="$2"; shift 2 ;;
         --pools)   POOLS="$2"; shift 2 ;;
         --bm25-only) BM25_ONLY=1; shift ;;
+        --sample-only) SAMPLE_ONLY=1; shift ;;
+        --tier1) TIER1=1; shift ;;
         *) echo "unknown arg: $1" >&2; exit 1 ;;
     esac
 done
+
+if [[ "$SAMPLE_ONLY" -eq 1 && -z "$SIZES" ]]; then
+    echo "--sample-only requires --size N[,N,...]" >&2
+    exit 1
+fi
 
 # ── Build ir binary ───────────────────────────────────────────────────────────
 
 _log "Building ir (HEAD)..."
 cargo build --release --bin ir 2>&1
 IR_BIN="$REPO_ROOT/target/release/ir"
+
+# Keep the signal harness on the same dedicated benchmark path as bench.sh.
+if [[ "$BM25_ONLY" -eq 0 ]]; then
+    unset IR_COMBINED_MODEL IR_QWEN_MODEL
+    export IR_EXPANDER_MODEL="${IR_EXPANDER_MODEL:-tobil/qmd-query-expansion-1.7B}"
+    export IR_RERANKER_MODEL="${IR_RERANKER_MODEL:-ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF}"
+fi
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -86,9 +103,20 @@ run_signals_for() {
     local collection="$3"
     local preprocessor="${4:-}"
     local out_dir="$REPO_ROOT/logs/signals/$label"
+    local want_modes=("bm25" "vector" "hybrid")
+    if [[ "$TIER1" -eq 1 && "$BM25_ONLY" -eq 0 ]]; then
+        want_modes=("bm25" "vector" "tier1" "hybrid")
+    fi
+    [[ "$BM25_ONLY" -eq 1 ]] && want_modes=("bm25")
 
-    # Skip only if a completion marker exists (written after all queries finish)
-    if [[ -f "$out_dir/.done" ]]; then
+    local complete=1
+    for mode in "${want_modes[@]}"; do
+        if [[ ! -f "$out_dir/.done-$mode" ]]; then
+            complete=0
+            break
+        fi
+    done
+    if [[ "$complete" -eq 1 ]]; then
         _log "[skip] $label (complete)"
         return 0
     fi
@@ -102,13 +130,17 @@ run_signals_for() {
     )
     [[ -n "$preprocessor" ]] && prep_args+=(--preprocessor "$preprocessor")
     [[ "$BM25_ONLY" -eq 0 ]] && prep_args+=(--embed)
-    _with_pulse python3 scripts/beir-eval.py "${prep_args[@]}"
+    bench_run_guarded "prepare $collection" "$IR_BIN" python3 scripts/beir-eval.py "${prep_args[@]}"
 
     _log "[$label] running signal collection..."
-    sig_mode="all"
-    [[ "$BM25_ONLY" -eq 1 ]] && sig_mode="bm25"
+    sig_mode=$(IFS=,; printf "%s" "${want_modes[*]}")
 
-    python3 scripts/beir-eval.py run \
+    if [[ "$BM25_ONLY" -eq 0 ]]; then
+        _log "[$label] restarting signal daemon (tier-2=dedicated)"
+        "$IR_BIN" daemon stop || true
+    fi
+
+    bench_run_guarded "signals $collection ($sig_mode)" "$IR_BIN" python3 scripts/beir-eval.py run \
         --ir-bin "$IR_BIN" \
         --data "$data_dir" \
         --collection "$collection" \
@@ -152,7 +184,9 @@ run_fiqa() {
         _log "Downloading FiQA..."
         bash scripts/download-beir.sh fiqa
     fi
-    run_signals_for "fiqa" "$data_dir" "eval-fiqa-signals" ""
+    if [[ "$SAMPLE_ONLY" -eq 0 ]]; then
+        run_signals_for "fiqa" "$data_dir" "eval-fiqa-signals" ""
+    fi
 
     if [[ -n "$SIZES" ]]; then
         IFS=',' read -ra SIZE_LIST <<< "$SIZES"
@@ -171,8 +205,9 @@ run_miracl_ko() {
         bash scripts/download-miracl-ko.sh
     fi
 
-    # Full corpus
-    run_signals_for "miracl-ko" "$data_dir" "eval-miracl-ko-signals" "ko"
+    if [[ "$SAMPLE_ONLY" -eq 0 ]]; then
+        run_signals_for "miracl-ko" "$data_dir" "eval-miracl-ko-signals" "ko"
+    fi
 
     # Sampled pools (if sizes specified)
     if [[ -n "$SIZES" ]]; then
@@ -185,7 +220,7 @@ run_miracl_ko() {
 
 # ── Run datasets ─────────────────────────────────────────────────────────────
 
-_log "Signal sweep: dataset=$DATASET sizes='${SIZES:-all}' pools=$POOLS bm25_only=$BM25_ONLY"
+_log "Signal sweep: dataset=$DATASET sizes='${SIZES:-all}' pools=$POOLS bm25_only=$BM25_ONLY sample_only=$SAMPLE_ONLY"
 
 case "$DATASET" in
     fiqa)      run_fiqa ;;

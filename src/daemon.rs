@@ -29,6 +29,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 struct CollectionInfo {
     db_path: PathBuf,
     preprocessor_commands: Vec<String>,
+    routing: Option<crate::types::RoutingConfig>,
 }
 
 // ── Protocol types ────────────────────────────────────────────────────────────
@@ -66,6 +67,12 @@ struct DaemonResponse {
 pub struct QueryResponse {
     pub results: Vec<DaemonResult>,
     pub log: Vec<String>,
+}
+
+fn env_flag(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .is_some_and(|raw| matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
 }
 
 #[derive(Serialize, Deserialize)]
@@ -256,6 +263,7 @@ impl DaemonState {
                     CollectionInfo {
                         db_path: collection_db_path(&c.name),
                         preprocessor_commands,
+                        routing: c.routing.clone(),
                     },
                 )
             })
@@ -370,28 +378,49 @@ pub fn start_server(timeout_secs: u64) -> Result<()> {
         // Reranker without expander: expansion skipped, but reranking fused results still works.
         // Expander without reranker: expansion is harmful without reranking (-0.53% nDCG on NFCorpus); disabled.
         fn load_dedicated() -> Pair {
-            let exp = crate::llm::expander::Expander::load_default()
-                .map_err(|e| eprintln!("  note: expander unavailable ({e})"))
-                .ok()
-                .map(|e| {
-                    eprintln!("  expander ready ({})", crate::llm::models::EXPANDER);
-                    Box::new(e) as ExpBox
-                });
-            let rer = crate::llm::reranker::Reranker::load_default()
-                .map_err(|e| eprintln!("  note: reranker unavailable ({e})"))
-                .ok()
-                .map(|r| {
-                    eprintln!("  reranker ready ({})", crate::llm::models::RERANKER);
-                    Box::new(r) as ScoBox
-                });
+            let exp = if env_flag("IR_DISABLE_EXPANDER") {
+                eprintln!("  note: expander disabled via research override");
+                None
+            } else {
+                crate::llm::expander::Expander::load_default()
+                    .map_err(|e| eprintln!("  note: expander unavailable ({e})"))
+                    .ok()
+                    .map(|e| {
+                        eprintln!("  expander ready ({})", crate::llm::models::EXPANDER);
+                        Box::new(e) as ExpBox
+                    })
+            };
+            let rer = if env_flag("IR_DISABLE_RERANKER") {
+                eprintln!("  note: reranker disabled via research override");
+                None
+            } else {
+                crate::llm::reranker::Reranker::load_default()
+                    .map_err(|e| eprintln!("  note: reranker unavailable ({e})"))
+                    .ok()
+                    .map(|r| {
+                        eprintln!("  reranker ready ({})", crate::llm::models::RERANKER);
+                        Box::new(r) as ScoBox
+                    })
+            };
+            let allow_expand_without_scorer = env_flag("IR_ALLOW_EXPANSION_WITHOUT_SCORER");
             match (&exp, &rer) {
                 (Some(_), Some(_)) => eprintln!("  tier-2: dedicated mode"),
+                (Some(_), None) if allow_expand_without_scorer => {
+                    eprintln!("  warn: reranker unavailable — expansion kept via research override")
+                }
                 (Some(_), None) => eprintln!("  warn: reranker unavailable — expansion disabled (harmful without scorer)"),
                 (None, Some(_)) => eprintln!("  warn: expander unavailable — query expansion disabled; reranking active"),
                 (None, None) => {}
             }
             // Expander without reranker produces worse results than no expansion at all; suppress it.
-            (if rer.is_some() { exp } else { None }, rer)
+            (
+                if rer.is_some() || allow_expand_without_scorer {
+                    exp
+                } else {
+                    None
+                },
+                rer,
+            )
         }
 
         // Detect tier-2 mode from env vars before loading anything.
@@ -418,18 +447,8 @@ pub fn start_server(timeout_secs: u64) -> Result<()> {
                     load_dedicated()
                 }
             }
-        } else if has_dedicated_env {
-            load_dedicated()
         } else {
-            // Auto-detect: try combined (local file search, no download) first; then dedicated.
-            let auto_combined = match crate::llm::combined::Combined::try_load_default() {
-                Ok(c) => c.map(std::sync::Arc::new),
-                Err(e) => {
-                    eprintln!("  note: combined model auto-detect failed ({e})");
-                    None
-                }
-            };
-            if let Some(c) = auto_combined { from_combined(c) } else { load_dedicated() }
+            load_dedicated()
         };
 
         // Send models to main thread before writing signal file.
@@ -558,6 +577,7 @@ fn handle_request(
                 name.as_str(),
                 &info.db_path,
                 info.preprocessor_commands.clone(),
+                info.routing.clone(),
             )
         })
         .collect::<Result<Vec<_>>>()?;

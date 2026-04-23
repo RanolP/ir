@@ -55,7 +55,7 @@ Variable:  STRONG_SIGNAL_PRODUCT ∈ [0.03, 0.05, 0.06, 0.08, 0.10]  (5 values)
            → 15 combinations
 Metric:    nDCG@10 (harm vs baseline), fire% (shortcut frequency)
 Corpora:   fiqa, miracl-ko
-Budget:    signal-sweep sampled (10000 docs for miracl-ko, see pool-size study) → shortlist → full bench top-3
+Budget:    signal-sweep sampled (50000 docs for miracl-ko by default; 10000 remains the minimum stable floor) → shortlist → full bench top-3
 ```
 
 ---
@@ -76,7 +76,7 @@ Missing: `bash scripts/download-beir.sh {dataset}` or `bash scripts/download-mir
 | `ko`, `miracl-ko` | miracl-ko | Korean; BM25 near-zero → always hits tier 1+ | per pool-size study |
 | `nfcorpus` | nfcorpus | Small, fast; good for cheap sweeps | N/A (small enough) |
 
-Pool size recommendation: see `research/pool-size-study.md`. Current MIRACL-Ko default: **10000 docs**.
+Pool size recommendation: see `research/pool-size-study.md`. Current MIRACL-Ko research default: **50000 docs**. Minimum stable floor: **10000 docs**.
 Do not use pool sizes `<= 503` for between-seed variance decisions: those samples collapse to the mandatory qrel-linked docs and are deterministic across seeds.
 
 ---
@@ -90,8 +90,15 @@ Confirm or run the baseline once. Cache it.
 ls logs/results/{dataset}/{git7}.json
 
 # If not cached:
-scripts/bench.sh {dataset}
+bash scripts/research-harness.sh baseline --dataset fiqa
+bash scripts/research-harness.sh baseline --dataset miracl-ko
 ```
+
+If a crash happens after prepare/index/embed but before scoring completes, rerun the same `scripts/bench.sh {dataset}` command. The script resumes from a ready collection when possible instead of starting from zero. Query scoring itself also resumes: `scripts/beir-eval.py run --output ...` stores per-query progress in `<output>.partial/` and continues from there on rerun.
+For non-BM25 runs, `scripts/bench.sh` pins tier-2 to the dedicated expander + reranker path and restarts the benchmark daemon before scoring. Do not manually start a daemon in combined mode and reuse it for benchmark runs.
+For large corpora, `scripts/bench.sh {dataset} --size N --seed N` samples a BEIR-style pool on first run and benchmarks that sampled corpus directly. Use `miracl-ko --size 50000` as the default Korean sampled research baseline. Keep `10000` as the fast stable regression floor unless you explicitly need the full 1.5M-doc corpus.
+On macOS, `scripts/bench.sh` also runs long phases under a safety watchdog by default. Metal stays on for speed, but the wrapper aborts the run if free memory drops too low, swapouts begin, or `ir` sustains CPU-fallback-like usage. Tune with `IR_BENCH_MIN_FREE_PCT`, `IR_BENCH_MAX_IR_CPU_PCT`, and `IR_BENCH_CPU_STRIKES`, or disable with `IR_BENCH_GUARD=0`.
+For uncommitted working-tree changes, do not trust `scripts/bench.sh` cache keys by `HEAD` hash alone. If the change is query-time only (for example shortcut thresholds or rerank policy), reuse the prepared collection but write to a fresh output file such as `working-tree.json` and compare that against the hash-keyed baseline JSON. If the change affects indexing, preprocessing, or embeddings, rebuild a fresh collection instead of reusing the old one. After the quick A/B looks good, commit and rerun to produce the official hash-keyed artifact.
 
 Baseline is a **fixed point** — do not re-run it per variant. All deltas are relative to this single run.
 
@@ -106,25 +113,52 @@ If the variant has free parameters, find candidates cheaply before the full run.
 ### Signal-based sweep (threshold tuning)
 
 ```bash
-# Cheap: collect signals (does not require rebuild)
-scripts/signal-sweep.sh --dataset {dataset} --size 10000
+# Cheap: collect sampled signals and analyze threshold matrices
+bash scripts/research-harness.sh thresholds --dataset fiqa
+bash scripts/research-harness.sh thresholds --dataset miracl-ko --size 50000 --pools 3
 
-# Analyze candidates
-python3 scripts/threshold-sweep.py logs/signals/*/
+# Then validate the shortlisted candidates on the locked holdout
+bash scripts/research-harness.sh validate-thresholds --dataset fiqa
+bash scripts/research-harness.sh validate-thresholds --dataset miracl-ko --size 50000 --pools 3
 ```
 
 Candidate criteria: harm% < 5%, maximize fire%. Note FiQA vs MIRACL-Ko divergence — divergent = corpus-dependent, requires per-corpus constants.
+
+Current maintainer read:
+
+- keep FiQA on the current fused threshold unless holdout says otherwise
+- use `miracl-ko --size 50000` as the Korean research corpus
+- prefer stricter fused gating before trying a learned router
+- keep router work offline until it clearly beats simple gating on holdout
+
+### Holdout validation factory
+
+`validate-thresholds` is the supported path for threshold tuning:
+
+1. shortlist candidates from existing threshold sweep JSON
+2. reuse the locked holdout collection when the change is query-time only
+3. run each candidate via env overrides, not source edits
+4. print a baseline-vs-candidate table on the holdout
+
+This keeps production defaults unchanged until a candidate survives real validation.
+For a fine sweep near a boundary, bypass shortlist generation and validate exact fused values:
+
+```bash
+bash scripts/research-harness.sh validate-thresholds \
+  --dataset miracl-ko --size 50000 --gate fused \
+  --products 0.0525,0.055,0.0575,0.06
+```
 
 ### Code-constant sweep (fusion weights, floor/product)
 
 Sweeping code constants requires rebuild per value — expensive. Strategy:
 
 1. Use signal data to estimate effect *before* rebuilding (`threshold-sweep.py` can simulate)
-2. Pick top-3 from simulation
-3. Build + bench only those 3
+2. Validate threshold-like changes with `validate-thresholds` first
+3. Only patch source for the winner or for non-env-tunable constants
 
 ```bash
-# Edit constant, rebuild, bench — one value at a time for top-3 only
+# Only after the validation factory has identified a winner
 # Edit src/search/hybrid.rs
 cargo build --release --bin ir
 scripts/bench.sh {dataset}
@@ -162,6 +196,18 @@ variant B (product=0.08)    | 0.409   | 0.528     | 41%   | 2.1%   | -0.003
 
 Winner: variant A — higher nDCG, lower fire%, harm within budget
 ```
+
+For a query-time-only working-tree validation, the comparison is:
+
+```bash
+# baseline artifact (existing)
+logs/results/{dataset}/{git7}.json
+
+# working-tree artifact (fresh output path, same data + same collection)
+logs/results/{dataset}/working-tree.json
+```
+
+This is valid only when the indexed collection itself is unchanged. If preprocessing, indexing, or embeddings changed, the collection must be rebuilt first.
 
 ---
 
@@ -205,6 +251,8 @@ Each phase is independent. Re-compose for new research questions:
 
 | Component | Reuse for |
 |-----------|-----------|
+| `scripts/research-harness.sh` | Maintainer entrypoint for baseline, signals, thresholds |
+| `scripts/threshold-validate.py` | Shortlist stable candidates from sweep JSON for holdout runs |
 | Pre-ship gate (Phase 0) | Every experiment — gate on this before any run |
 | `scripts/preship.sh` | Stability/speed/performance pre-ship check |
 | `test-data/fixtures/synthetic-en/` | English BM25/vector/hybrid canary |
@@ -216,7 +264,8 @@ Each phase is independent. Re-compose for new research questions:
 | Baseline lock (Phase 3) | Any A/B — always run once first |
 | Signal sweep (Phase 4) | Any threshold research — cheap, no rebuild |
 | Env-var sweep (Phase 4) | Any flag/env research — no rebuild |
-| Code-constant sweep (Phase 4) | Fusion weights, floor/product — rebuild required |
+| Holdout validation factory (Phase 4) | Threshold tuning with env overrides, no rebuild per candidate |
+| Code-constant sweep (Phase 4) | Fusion weights and other non-env-tunable constants — rebuild required |
 | Comparison table (Phase 5) | Any comparison — standard report format |
 | Regression verify (Phase 6) | Any change to `src/search/hybrid.rs` |
 | Progress runbook (Phase 7) | Any hang or metric anomaly during sweep |

@@ -61,8 +61,8 @@ impl Combined {
         &self.model_filename
     }
 
-    /// Resolve the combined model path from env vars, or search local model dirs.
-    /// Returns `Ok(None)` when no env var is set and no known model file is found locally.
+    /// Resolve the combined model path from explicit env vars only.
+    /// Returns `Ok(None)` when neither IR_COMBINED_MODEL nor IR_QWEN_MODEL is set.
     pub fn try_load_default() -> Result<Option<Self>> {
         use crate::llm::env;
 
@@ -77,12 +77,6 @@ impl Combined {
         };
 
         if env_key.is_empty() {
-            // No env var — check whether a known file exists locally (no download).
-            for filename in &[models::QWEN35_2B, models::QWEN35_0_8B] {
-                if let Some(path) = crate::llm::find_model(filename) {
-                    return Ok(Some(Self::load(&path)?));
-                }
-            }
             return Ok(None);
         }
 

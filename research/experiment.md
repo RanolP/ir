@@ -1,405 +1,374 @@
-# ir — Research & Experiments
+# ir — Research Harness
 
-Ongoing benchmark results and model experiments.
-Baseline system: EmbeddingGemma 308M + Qwen3-Reranker 0.6B + qmd-expansion 1.7B.
+Current benchmark and threshold-tuning workflow for maintainers.
 
-## Benchmark Setup
+This document replaces the older ad hoc experiment log. The source of truth is now:
 
-**Dataset**: BEIR/NFCorpus — 3,633 medical documents · 323 test queries · graded relevance.
-**Metric**: nDCG@10 (primary), Recall@10 (secondary).
+- `scripts/research-harness.sh`
+- `scripts/bench.sh`
+- `scripts/signal-sweep.sh`
+- `scripts/threshold-sweep.py`
+- `scripts/threshold-validate.py`
+- `research/pool-size-study.md`
 
-```bash
-# Download dataset (~100MB)
-curl -L https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/nfcorpus.zip \
-  -o /tmp/nfcorpus.zip && unzip /tmp/nfcorpus.zip -d test-data/
+## Purpose
 
-cargo run --release --bin eval -- --data test-data/nfcorpus --mode all
-```
+Use this harness for:
 
-## Baseline Results (NFCorpus)
+- baseline locking
+- threshold research for the tier-0 BM25 gate
+- threshold research for the tier-1 fused gate
+- branch-to-branch benchmark comparisons
 
-| Mode | nDCG@10 | Recall@10 | Notes |
-|------|---------|-----------|-------|
-| BM25 | 0.2046 | 0.0932 | no model |
-| Vector | 0.3898 | 0.1926 | EmbeddingGemma 300M |
-| **Hybrid (score-fusion α=0.80)** | **0.3954** | **0.1958** | +1.4% vs vector |
-| Hybrid + reranker | 0.4001 | — | +1.2% vs score-fusion |
+Do not use sampled MIRACL-Ko scores as full-corpus quality claims. They are for relative regression and A/B decisions only.
 
-Old pure-RRF scored 0.372 — score-fusion is +5.5% better.
+## Current Baselines
 
----
+Captured on `HEAD=4acefe9`.
 
-## Experiment: Alpha Sensitivity (α=0.80 vs α=0.95)
+### FiQA Full Corpus
 
-**Question**: Does pushing toward pure vector (α=0.95) improve results over α=0.80?
+Dataset:
+- `57,638` docs
+- `648` benchmark queries with qrels
 
-```bash
-for ds in nfcorpus scifact fiqa arguana; do
-  cargo run --release --bin eval -- --data test-data/$ds --mode hybrid \
-    --alpha 0.80 --compare-alpha 0.95
-done
-```
+| Mode | nDCG@10 | R@10 | med ms |
+|---|---:|---:|---:|
+| bm25 | 0.2447 | 0.3003 | 209.3 |
+| vector | 0.4045 | 0.4932 | 222.9 |
+| hybrid | 0.4431 | 0.5371 | 5041.6 |
 
-| Dataset | α=0.80 nDCG | α=0.95 nDCG | Δ | t | sig? |
-|---------|-------------|-------------|---|---|------|
-| NFCorpus (323q) | 0.3954 | 0.3962 | +0.0008 | +0.68 | no |
-| SciFact (300q) | 0.7873 | 0.7875 | +0.0002 | +1.00 | no |
-| FiQA (648q) | 0.4266 | 0.4335 | +0.0069 | +3.44 | **yes** |
-| ArguAna (1406q) | 0.4263 | 0.4269 | +0.0006 | +1.39 | no |
+Interpretation:
+- quality baseline is credible
+- hybrid quality gain over vector is real
+- hybrid latency is still high because unique-query benchmark runs pay tier-2 cost repeatedly
 
-**Conclusion**: 1/4 datasets significant (FiQA, t=3.44). FiQA is a financial Q&A corpus where
-dense retrieval naturally dominates; the gain is dataset-specific. Deltas on the other three are
-noise. **α=0.80 stays** — consistent midpoint, no regression risk.
+### MIRACL-Ko Sampled Pool
 
----
+Dataset:
+- `miracl-ko-s50000-p42`
+- `50,000` docs sampled from the full `1,486,752`-doc corpus
+- `213` benchmark queries
 
-## Experiment: Unified Qwen3.5 (ongoing)
+| Mode | nDCG@10 | R@10 | med ms |
+|---|---:|---:|---:|
+| bm25 | 0.7271 | 0.8130 | 102.1 |
+| vector | 0.9109 | 0.9426 | 168.8 |
+| hybrid | 0.9630 | 0.9813 | 1131.9 |
 
-**Hypothesis**: Replace both the reranker (0.6B) and expander (1.7B) with a single
-Qwen3.5 model. Use DSPy MIPROv2 to optimize prompts offline against NFCorpus/SciFact,
-then hardcode winning prompts in `src/llm/qwen.rs`.
+Interpretation:
+- credible as a sampled-pool regression baseline
+- not a full-corpus absolute score
+- use for branch comparison and threshold selection, not for public full-MIRACL claims
 
-### Model Comparison
+## Current Conclusions Before Runtime Changes
 
-| | Qwen3.5-0.8B | Qwen3.5-2B | Current combined |
-|---|---|---|---|
-| Params | 0.8B | 2B | 0.6B + 1.7B = 2.3B |
-| GGUF (local) | Q8_0 812MB | Q4_K_M 1.3GB | ~1.6GB combined |
-| Models to load | 1 | 1 | 2 |
-| Architecture | Gated DeltaNet, 262K ctx | Gated DeltaNet, 262K ctx | Qwen3 transformer |
+- `fiqa`: keep the current fused strong-signal product at `0.06`
+- `miracl-ko --size 50000`: holdout validation on `p42` currently favors stricter fused gating at `0.05` over `0.06`
+  - `0.05`: `nDCG@10=0.9650`, `R@10=0.9813`, `med=431.5ms`
+  - `0.06`: `nDCG@10=0.9603`, `R@10=0.9766`, `med=440.4ms`
+- BM25 thresholds are not the main lever on either corpus
+- router work stays offline research for now
+  - the mixed router is not good enough on FiQA
+  - the Korean-only router is more promising, but `tier1` already matched `hybrid` on the current `miracl-ko-s50000-p42` holdout
+- the next runtime change should be threshold/config driven, not router driven
+- `hybrid` already behaves as "BM25 while cold, fused once warm"
+  - cold first query can return BM25 immediately while the daemon warms
+  - later warm `hybrid` queries go through tier-1 fused retrieval before tier-2
 
-### Phase Status
+## Research Workflow
 
-| Phase | Status | Notes |
-|-------|--------|-------|
-| 1a: commit dirty tree | ✅ | 95b2ab1 |
-| 1b: llama-cpp-2 → 0.1.137 | ✅ | Gated DeltaNet support |
-| 1c: smoke tests | ✅ | both models load, generate, tokenize |
-| 1c: functional tests | ✅ | expand + score_relevance pass |
-| 2: DSPy prompt optimization | ⬜ | see below |
-| 3: Rust integration | ✅ | `src/llm/qwen.rs` wired into pipeline |
-| 4: benchmark runs | ⬜ | pending Phase 2 |
+### 1. Gate the Build
 
-### Phase 2: DSPy Optimization
-
-```bash
-pip install dspy ollama
-ollama pull qwen3.5:0.8b
-ollama pull qwen3.5:2b
-
-python research/export_eval_data.py        # exports NFCorpus/SciFact → artifacts/
-python research/dspy_optimize.py           # MIPROv2 + BootstrapFewShot; saves artifacts/
-```
-
-Outputs: `research/artifacts/{model}_expander.json`, `{model}_reranker.json`, `{model}_prompts.txt`.
-Paste winning prompts into `src/llm/qwen.rs` constants (marked `// ! DSPy-optimized prompt`).
-
-### Benchmark Runs (planned)
-
-| Run | Expander | Reranker | GGUF total | Target |
-|-----|----------|----------|------------|--------|
-| A (baseline) | qmd-1.7B | Qwen3-Reranker-0.6B | ~1.6GB | 0.4032 |
-| B | Qwen3.5-0.8B | Qwen3.5-0.8B | ~812MB | ≥ 0.4032 |
-| C | Qwen3.5-2B | Qwen3.5-2B | ~1.3GB | ≥ 0.4032 |
-| D (ablation) | Qwen3.5-2B | Qwen3-Reranker-0.6B | ~1.9GB | — |
-| E (ablation) | qmd-1.7B | Qwen3.5-2B | ~2.3GB | — |
+Always run the fast regression gate first:
 
 ```bash
-# Run B
-IR_QWEN_MODEL=~/local-models/Qwen3.5-0.8B-Q8_0.gguf \
-  cargo run --release --bin eval -- --data test-data/nfcorpus --mode all
-
-# Run C
-IR_QWEN_MODEL=~/local-models/Qwen3.5-2B-Q4_K_M.gguf \
-  cargo run --release --bin eval -- --data test-data/nfcorpus --mode all
+bash scripts/preship.sh --bm25-only
 ```
 
-### Decision Matrix
+If this fails, benchmark results are not trustworthy.
 
-| Outcome | Action |
-|---------|--------|
-| 0.8B matches baseline nDCG | Ship 0.8B — 812MB for both roles |
-| 2B matches, 0.8B doesn't | Ship 2B — still smaller than current 1.6GB |
-| Neither matches | Keep current models; DSPy prompts still applicable |
-| DSPy prompts improve fine-tuned models | Apply optimization to existing models too |
+### 2. Lock a Baseline
 
-### Results
-
-Benchmark runs B and C completed (Phase 2 / DSPy skipped — Rust integration tested directly).
-
-#### NFCorpus (3,633 docs · 323 queries)
-
-| Run | nDCG@10 | vs baseline | Notes |
-|-----|---------|-------------|-------|
-| A (baseline) | 0.4032 | — | qmd-1.7B + Qwen3-Reranker-0.6B |
-| B (0.8B) | 0.3959 | −0.0073 (−1.8%) | Qwen3.5-0.8B-Q8_0, unified |
-| C (2B) | 0.3956 | −0.0076 (−1.9%) | Qwen3.5-2B-Q4_K_M, unified |
-
-#### SciFact (5,183 docs · 300 queries)
-
-| Run | nDCG@10 | vs baseline | Notes |
-|-----|---------|-------------|-------|
-| A (baseline) | 0.7873 | — | |
-| B (0.8B) | 0.7873 | 0 | identical — dataset near ceiling |
-| C (2B) | 0.7873 | 0 | identical |
-
-**Decision: keep current trio** (qmd-1.7B + Qwen3-Reranker-0.6B). Neither Qwen3.5 size
-matches baseline on NFCorpus. SciFact is too easy to discriminate models (vector alone: 0.785).
-
-Notable: 2B shows no improvement over 0.8B despite 2× size — reranking quality is not the
-bottleneck; expansion quality or BM25 probe threshold matters more.
-
----
-
-## Korean IR Benchmark (Ko-StrategyQA)
-
-**Dataset**: Ko-StrategyQA — 9,251 Korean Wikipedia paragraphs · 592 test queries · binary relevance.
-Multi-hop yes/no questions; each query requires finding 2–3 supporting paragraphs.
-**Metric**: nDCG@10 (primary), Recall@10 (secondary).
+Recommended commands:
 
 ```bash
-scripts/bench-ko.sh bm25      # BM25 phase (no model, fast)
-scripts/bench-ko.sh vector    # embed corpus once (~9k docs)
-scripts/bench-ko.sh hybrid    # hybrid + rerank
-scripts/bench-ko.sh --reset   # wipe all eval DBs
+bash scripts/research-harness.sh baseline --dataset fiqa
+bash scripts/research-harness.sh baseline --dataset miracl-ko
 ```
 
-### Models
+Notes:
+- `baseline --dataset miracl-ko` defaults to `--size 50000`
+- non-BM25 benchmark runs pin tier-2 to the dedicated expander + reranker path
+- reruns resume from prepared collections and per-query sidecars when present
 
-| Component | Model | Korean support |
-|-----------|-------|---------------|
-| Embedding | EmbeddingGemma 308M (768d) | 100+ languages — confirmed working |
-| Reranker | Qwen3-Reranker-0.6B | 119 languages — confirmed working |
-| Expander | qmd-expander-1.7B | Qwen3 base (119 langs), English SFT — **hurts Korean** (tested on MIRACL) |
+### 3. Collect Signal Data
 
-### Preprocessors evaluated
-
-| Preprocessor | Type | Dictionary | Runtime |
-|---|---|---|---|
-| none | unicode61 (FTS5 default) | — | — |
-| kiwi | Neural POS tagger | Custom statistical | Python subprocess (~2s startup) |
-| mecab | CRF tagger | mecab-ko-dic | Python subprocess (~0.3s startup) |
-| lindera | CRF tagger | mecab-ko-dic (same) | Rust binary (~0s startup) |
-
-### Results
-
-| Mode | none | kiwi | mecab | lindera |
-|------|------|------|-------|---------|
-| bm25 | 0.0000 | 0.0053 | 0.0039 | 0.0039 |
-| vector | 0.7992 | — | — | — |
-| hybrid | 0.7992 | 0.7991 | 0.7984 | — |
-| **hybrid+rerank** | 0.8138 | **0.8148** | 0.8137 | — |
-
-Recall@10: vector=0.8674, hybrid+rerank(kiwi)=0.8756.
-
-### Analysis
-
-**BM25 is ineffective for this task.** Ko-StrategyQA multi-hop queries share almost no surface
-terms with the supporting paragraphs. Unicode61 tokenizer scores 0.0000 — Korean agglutination
-means "이스탄불의" (istanbul+possessive) and "이스탄불은" (istanbul+subject) are different FTS tokens
-and never match. Morphological tokenizers recover some signal (kiwi: 0.0053) but BM25 remains
-negligible compared to vector.
-
-**EmbeddingGemma handles Korean extremely well.** Vector nDCG@10=0.7992, Recall@10=0.8674 with
-no Korean-specific training — the model finds the correct supporting paragraph 87% of the time
-in top-10. This confirms multilingual embedding capability is sufficient for Korean retrieval.
-
-**Hybrid = vector** (0.7992 both). With α=0.80 and BM25 at 0.005, the BM25 component
-contributes nothing to score fusion. Tokenizer choice is irrelevant for this dataset.
-
-**Reranker adds +0.015 nDCG@10** (0.7992 → 0.8148). Qwen3-Reranker-0.6B correctly rescores
-Korean query-document pairs despite English-heavy SFT. The reranker is the only component that
-improves over pure vector on this task.
-
-**Decision: lindera as the single ko preprocessor.** Kiwi's +0.001 nDCG in hybrid+rerank does
-not justify its 2s Python startup per query. Mecab parity with lindera confirmed; lindera is
-the production-safe choice (Rust, embedded dictionary, zero Python dep). See MIRACL and compound
-benchmark below for the decompounding rationale.
-
----
-
-## Korean IR Benchmark (MIRACL-Korean)
-
-**Dataset**: MIRACL-Korean dev — 2,835 passages (547 relevant + 2,288 hard negatives) · 213 queries.
-Factoid Wikipedia queries with direct term overlap — opposite of Ko-StrategyQA multi-hop.
-Hard negatives sourced from BM25+DR retrieval (lexically similar but not relevant).
-**Metric**: nDCG@10 (primary), Recall@10 (secondary).
+FiQA:
 
 ```bash
-uv run scripts/download-ko-miracl.py   # one-time setup
-scripts/bench-ko-miracl.sh             # full run (BM25 parallel, model sequential)
-scripts/bench-ko-miracl.sh bm25        # BM25 only
-scripts/bench-ko-miracl.sh model       # model phases only
+bash scripts/research-harness.sh signals --dataset fiqa
 ```
 
-### Results
-
-| Mode | none | kiwi | mecab | lindera |
-|------|------|------|-------|---------|
-| bm25 | 0.0009 | **0.1325** | 0.0460 | 0.0460 |
-| **hybrid+rerank** | **0.8411** | 0.8429 | — | — |
-| hybrid+expand+rerank | 0.8375 | — | — | — |
-
-Recall@10: hybrid+rerank(none)=0.9699, hybrid+rerank(kiwi)=0.9699.
-
-### Analysis
-
-**BM25 is not fundamentally broken for Korean — Ko-StrategyQA was the outlier.** Unicode61
-scores 0.0009 on MIRACL (vs 0.0000 on Ko-StrategyQA). Factoid queries share surface terms with
-passages; multi-hop queries do not. The 0.0000 result was task-specific, not a language limit.
-
-**Kiwi is 3× better than mecab/lindera on BM25 (0.1325 vs 0.0460).** The gap is tokenization
-accuracy: kiwi's neural tagger correctly handles compound nouns and ambiguous morpheme boundaries
-that mecab-ko-dic CRF gets wrong.
-
-**Mecab and lindera are identical (0.0460 both)**, confirming they share the same underlying
-dictionary and segmentation logic.
-
-**Expander hurts Korean retrieval (0.8411 → 0.8375, −0.4% nDCG; Recall 0.9699 → 0.9633).**
-`qmd-expander-1.7B` (English SFT) generates English or mixed-language sub-queries that dilute
-the Korean vector signal. **Do not use the expander for Korean collections.**
-
-**Hybrid+rerank is near-ceiling** (0.84 nDCG, 0.97 Recall@10). Kiwi adds +0.002 nDCG vs none
-in hybrid+rerank — negligible in practice.
-
-### Recommendation
-
-- Disable expander for Korean collections.
-- Reranker is the main lever (+0.015–0.027 nDCG). Always enable.
-- **lindera is the ko preprocessor.** Kiwi's +0.002 nDCG in hybrid mode does not justify its
-  2s Python startup per query. Lindera handles compound decompounding — see below.
-
----
-
-## Korean Compound Decompounding Benchmark
-
-**Hypothesis**: lindera `Mode::Decompose` (other_penalty_length_threshold=2) indexes compound
-sub-parts, enabling BM25 to match queries whose terms only exist inside compound nouns.
-Without decompounding, BM25 returns zero hits for these queries.
-
-**Dataset**: 50 synthetic queries from ko-miracl corpus. Each query uses the sub-components
-of a compound noun that does not appear decomposed anywhere in the raw corpus.
+MIRACL-Ko sampled pools:
 
 ```bash
-uv run scripts/gen-compound-bench.py   # generates test-data/ko-compound/
-scripts/bench-compound.sh
+bash scripts/research-harness.sh signals --dataset miracl-ko --size 50000 --pools 3
 ```
 
-### Results (ko-compound, nDCG@10)
+Notes:
+- `signals --dataset miracl-ko` defaults to sampled `--size 50000 --pools 3`
+- sampled signal runs use `signal-sweep.sh --sample-only`
+- this avoids dragging the full `1.5M`-doc corpus into threshold research
 
-| preprocessor | nDCG@10 | Recall@10 | note |
-|---|---|---|---|
-| none | 0.0000 | 0.0000 | compounds indexed whole — sub-parts missing from FTS |
-| lindera | **0.6326** | **0.6400** | Mode::Decompose splits compounds, sub-parts indexed |
+### 4. Sweep the Threshold Matrix
 
-### Analysis
-
-**None scores 0.0000 exactly** — confirming the query construction is correct. Sub-components
-of selected compounds genuinely do not appear independently in the corpus (strict filter).
-
-**Lindera scores 0.63 nDCG**, not 1.0 — expected: some compounds decompose further when used
-as query terms (e.g. `협동조합` in the query decomposes to `협동 조합`, while the indexed
-document has `협동조합체가` decomposed as `협동조합 체가`). Term mismatch at query time
-causes partial recall.
-
-**This confirms the core value of lindera over unicode61 for Korean BM25**: compound nouns
-are common in Korean Wikipedia and would be completely missed without decompounding.
-
----
-
-## Japanese Preprocessor Research
-
-**Decision**: Lindera + ipadic, Mode::Decompose(Penalty::default()), filter 助詞/助動詞/記号/接続詞/感動詞/フィラー.
-
-### Dictionary: ipadic vs unidic
-
-ipadic is the correct choice. All Anserini/MIRACL baselines use Lucene kuromoji, which is ipadic-based. ipadic's coarse-grained tokenization keeps semantic units intact (e.g. 図書館 as one token); unidic over-splits (図書 + 館), which inflates the index and creates term mismatch. ipadic has not been updated since 2007, but the core vocabulary for morphological segmentation has not changed.
-
-### Mode::Decompose with default penalties
-
-`Penalty::default()` gives `kanji_penalty_length_threshold=2, other_penalty_length_threshold=7`. This matches Lucene JapaneseTokenizer Mode.SEARCH and is correct for Japanese: kanji compounds are the decomposition target, and the default kanji threshold handles them. **No Korean-style override needed** — Korean required `other_penalty_length_threshold=2` because Hangul is classified as "other" (not kanji); Japanese kanji is classified as kanji.
-
-Lucene's SEARCH mode also emits the original compound as a synonym (for IDF boosting on exact matches). Lindera's Decompose does not — only decomposed parts are emitted. Minor recall tradeoff, acceptable for FTS5 where synonym support is unavailable.
-
-### POS Tag Filtering
-
-Lucene kuromoji default stoptags filter: 助詞, 助動詞, 記号, 接続詞, フィラー (fillers: あの, えと, うん), その他-間投, 非言語音.
-Our implementation matches this plus 感動詞 (interjections, also noise in IR).
-
-フィラー added to `is_content()` — these are conversational filler words that add no retrieval signal.
-連体詞 (adnominal adjectives: この, その) deliberately kept — they carry meaning and Lucene preserves them.
-
-### Benchmarks (Anserini baselines, Lucene JapaneseAnalyzer)
-
-| Benchmark | Metric | Score |
-|-----------|--------|-------|
-| MIRACL-ja v1.0 | nDCG@10 | 0.3689 |
-| MIRACL-ja v1.0 | Recall@100 | 0.8048 |
-| Mr. TyDi Japanese | MRR@100 | 0.211 |
-| Mr. TyDi Japanese | Recall@100 | 0.645 |
-
-Japanese BM25 is substantially more effective than Korean/Chinese because Japanese has word boundaries via morphological analysis and lower agglutination than Korean.
-
----
-
-## Chinese Preprocessor Research
-
-**Decision**: Keep bigram-tokenize-zh (overlapping character bigrams, no dictionary). This matches the Anserini/Pyserini standard baseline and is well-supported by literature.
-
-### Bigram vs Word Segmentation for BM25
-
-The key question: does dictionary-based word segmentation (jieba, pkuseg, etc.) outperform character bigrams for Chinese BM25?
-
-**Evidence for bigram:**
-
-- **Anserini/Pyserini standard**: All major Chinese IR benchmark regressions (MIRACL-zh, HC4-zh) use Lucene CJKAnalyzer — a bigram tokenizer. Pipeline: StandardTokenizer → CJKWidthFilter → LowerCaseFilter → CJKBigramFilter → StopFilter. Lucene also provides SmartChineseAnalyzer (HMM word segmentation), but it is not used in benchmark regressions.
-
-- **Foo & Li (2004)** (ACM TALIP, TREC Chinese): Compared character, word, short-word, bigram across multiple retrieval models. Bigram achieved same precision as word segmentation with ~5% better recall. Recommended bigram as the best overall compromise.
-
-- **Peng et al. (2002)** (COLING): Non-monotonic relationship between segmentation accuracy and retrieval performance. Retrieval peaks at 70-77% segmentation accuracy, then *decreases* at 85-95%. Better segmentation does not guarantee better retrieval.
-
-- **Nie et al. (1997)** (SIGIR): Dictionary-free bigram is effective for Chinese retrieval, sometimes outperforming word-based approaches.
-
-### Segmentation Mismatch Problem
-
-The strongest argument for bigram: word segmentation is context-dependent. The same character sequence can segment differently depending on surrounding context. If query and document segment the same text differently, lexical match is zero for that term. Bigram is immune — the same character sequence always produces the same bigrams.
-
-This problem compounds in IR: both indexing and querying run the same segmenter independently. Any segmentation inconsistency between the two passes directly hurts recall.
-
-### Benchmarks (Anserini CJKAnalyzer baseline)
-
-| Benchmark | Metric | Score |
-|-----------|--------|-------|
-| MIRACL-zh v1.0 | nDCG@10 | 0.1801 |
-| MIRACL-zh v1.0 | Recall@100 | 0.5599 |
-| HC4-zh dev | nDCG@20 | 0.3908 |
-| HC4-zh test | nDCG@20 | 0.2526 |
-
-Low BM25 nDCG@10 on MIRACL-zh (0.18) is inherent to lexical matching on Chinese — not a tokenization failure. Vector search (Tier 1) and expansion + reranking (Tier 2) recover signal that BM25 cannot.
-
-### Our bigram-tokenize-zh vs Lucene CJKAnalyzer
-
-Our implementation matches the Lucene baseline exactly: overlapping character bigrams for CJK runs, whitespace-split + lowercase for non-CJK. Single CJK characters emitted as-is. Unicode coverage includes Extensions A–F. Zero dependencies, deterministic, immune to segmentation mismatch.
-
----
-
-## Daemon mode
-
-**Problem**: `ir search` cold-starts 3–7s per query due to model loading every invocation
-(embedder 300M + expander 1.7B + reranker 0.6B = ~2.3B params, no cross-invocation caching).
-
-**Solution**: `ir daemon start` — loads trio once with Metal, listens on Unix socket
-(`~/.config/ir/daemon.sock`). `ir search` auto-detects and routes through daemon; falls back
-to direct on connection failure.
+FiQA:
 
 ```bash
-ir daemon start      # foreground; models loaded once, Metal enabled
-ir daemon status
-ir daemon stop
-ir search "query" -c kgeditor   # auto-routes through daemon if running
+bash scripts/research-harness.sh thresholds --dataset fiqa
 ```
 
-**DB handling**: daemon opens fresh WAL read-only connections per query (not `immutable=1`),
-so live `ir index` / `ir embed` updates are visible immediately without restart.
+MIRACL-Ko sampled pools:
 
-**Model stack**: trio (nDCG@10=0.4032), Metal on by default (macOS). Override: `IR_GPU_LAYERS=0`.
+```bash
+bash scripts/research-harness.sh thresholds --dataset miracl-ko --size 50000 --pools 3
+```
+
+Output:
+
+- console tables from `scripts/threshold-sweep.py`
+- machine-readable JSON under `.bench-state/research/*.json`
+
+To re-analyze existing signals without recollecting:
+
+```bash
+bash scripts/research-harness.sh thresholds --dataset miracl-ko --size 50000 --pools 3 --analyze-only
+```
+
+### 5. Validate the Shortlist on Holdout
+
+Do not patch source just to test one candidate at a time. The supported flow is:
+
+```bash
+bash scripts/research-harness.sh validate-thresholds --dataset fiqa
+bash scripts/research-harness.sh validate-thresholds --dataset miracl-ko --size 50000 --pools 3
+```
+
+What this does:
+
+1. loads the existing threshold sweep JSON
+2. shortlists candidates that pass the harm/fire budget
+3. reuses the locked holdout collection when possible
+4. runs each candidate through env overrides
+5. prints a baseline-vs-candidate holdout table
+
+For a fine sweep near a known boundary, skip the offline shortlist and validate exact values directly:
+
+```bash
+bash scripts/research-harness.sh validate-thresholds \
+  --dataset miracl-ko --size 50000 --gate fused \
+  --products 0.0525,0.055,0.0575,0.06
+```
+
+## Thresholds Under Study
+
+Current code constants in `src/search/hybrid.rs`:
+
+| Gate | Constant | Current |
+|---|---|---:|
+| Tier-0 BM25 | `BM25_STRONG_FLOOR` | 0.75 |
+| Tier-0 BM25 | `BM25_STRONG_GAP` | 0.10 |
+| Tier-1 fused | `STRONG_SIGNAL_FLOOR` | 0.40 |
+| Tier-1 fused | `STRONG_SIGNAL_PRODUCT` | 0.06 |
+
+Current sweep grids:
+
+### Tier-0 BM25
+
+- floor: `0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90`
+- gap: `0.02, 0.04, 0.06, 0.08, 0.10, 0.12, 0.15, 0.20`
+
+### Tier-1 Fused
+
+- product: `0.02, 0.03, 0.04, 0.05, 0.06, 0.08, 0.10, 0.15`
+
+The offline analyzer currently treats fused-floor as fixed and sweeps product only.
+
+## Selection Rule
+
+Choose candidate thresholds by:
+
+1. `harm% < 5%`
+2. highest `fire%` among those candidates
+3. same directional behavior across:
+   - `fiqa`
+   - `miracl-ko-s50000-p{1..N}`
+
+Do not promote a candidate from one corpus alone unless the change is intentionally corpus-specific.
+
+## Validation Loop
+
+After selecting candidates:
+
+1. run `validate-thresholds`
+2. keep only the holdout winner
+3. patch source for that winner only
+4. rerun the official baseline so the final artifact is hash-keyed
+
+Only after that should you consider a full-corpus MIRACL-Ko run.
+
+## Optional: Offline Tier-2 Router Research
+
+This is not the current implementation path.
+
+Use it only to answer:
+
+- can a learned router beat simple stricter gating on holdout?
+- is there corpus-specific signal that fixed thresholds are missing?
+
+Signal sweeps can be exported into smoltrain JSONL for a binary `skip_tier2` vs `run_tier2` classifier:
+
+```bash
+bash scripts/signal-sweep.sh --dataset miracl-ko --size 50000 --pools 3 --tier1
+python3 scripts/export-tier2-router-data.py \
+  logs/signals/miracl-ko-s50000-p1 \
+  logs/signals/miracl-ko-s50000-p2 \
+  logs/signals/miracl-ko-s50000-p3 \
+  --output .bench-state/research/tier2-router-ko-s50000.jsonl
+```
+
+To keep router work isolated from the main benchmark harness, use the dedicated wrapper:
+
+```bash
+bash scripts/router-data.sh ko
+bash scripts/router-data.sh fiqa
+bash scripts/router-data.sh mixed
+```
+
+Current recommendation:
+
+- use `ko` first
+- do not ship the mixed router yet; its FiQA `run_tier2` recall is still too weak
+- do not wire any router into runtime until it clearly beats stricter fused gating on holdout
+
+The exporter uses only query-time features and now writes both:
+
+- `text` for current `smoltrain`
+- `input` for backward compatibility with older notes
+
+To make a self-contained `smoltrain` bundle:
+
+```bash
+python3 scripts/prepare-tier2-router-smoltrain.py \
+  --input .bench-state/research/tier2-router.jsonl \
+  --output-dir .bench-state/research/tier2-router-smoltrain
+```
+
+The wrapper above already does both export + bundle prep.
+
+Then train from that directory:
+
+```bash
+cd .bench-state/research/tier2-router-smoltrain
+PYTHONPATH=/Users/eliot/ws-ps/smoltrain python3 -m smoltrain.train \
+  --data train_balanced.jsonl --taxonomy taxonomy.yaml --epochs 10 --seed 42
+PYTHONPATH=/Users/eliot/ws-ps/smoltrain python3 -m smoltrain.eval \
+  --model models/charcnn_trained.onnx --data train.jsonl \
+  --taxonomy taxonomy.yaml --world world.json --eval-data eval.jsonl
+```
+
+The exported features are:
+
+- query text and simple language/question heuristics
+- BM25 top/gap and top-10 score shape
+- fused top/gap
+
+Labels come from held-out benchmark behavior:
+
+- `run_tier2` when hybrid materially beats tier-1 fused on that query
+- `skip_tier2` otherwise
+
+To benchmark a trained checkpoint on a holdout without changing `ir`:
+
+```bash
+IR_CONFIG_DIR=.bench-state/bench/xdg/ir TMPDIR=.bench-state/bench/tmp \
+python3 scripts/beir-eval.py run \
+  --ir-bin target/release/ir \
+  --data test-data/miracl-ko-s50000-p42 \
+  --collection eval-miracl-ko-s50000-p42-4acefe9 \
+  --mode bm25,vector,tier1,hybrid \
+  --signals \
+  --signals-output logs/signals/miracl-ko-s50000-p42
+
+/Users/eliot/ws-ps/smoltrain/.venv/bin/python scripts/router-bench.py \
+  --signals logs/signals/miracl-ko-s50000-p42 \
+  --checkpoint .bench-state/research/tier2-router-ko-s50000-smoltrain/models/charcnn_trained.pt \
+  --thresholds 0.3,0.4,0.5
+```
+
+Current read:
+
+- useful as an offline research tool
+- not yet justified as the next runtime change
+
+## Known Caveats
+
+### Sampled MIRACL-Ko Is Easier Than Full MIRACL-Ko
+
+The sampler always keeps all qrel-linked docs and fills the rest with sampled negatives.
+
+That makes:
+
+- absolute scores inflated
+- relative branch-to-branch comparisons still useful
+
+See `research/pool-size-study.md` for why `10000` docs is still the minimum stable pool, even though the active research default is now `50000` for better metric headroom.
+
+### Hybrid Benchmark Latency Is Not Interactive Latency
+
+The benchmark uses many unique queries, so caches help less than they do in repeated interactive use.
+
+High hybrid median latency means:
+
+- tier-2 expansion + rerank work dominates
+- not that daemon startup is still happening on every query
+
+### Full MIRACL-Ko Is Still Expensive
+
+`src/index/embed.rs` no longer preloads the full pending corpus into memory before starting progress, but the full `1.5M`-doc Korean corpus is still expensive enough that the default research path should remain the sampled `50k` pool.
+
+## Output Locations
+
+Baselines:
+
+- `logs/results/fiqa/<git7>.json`
+- `logs/results/miracl-ko-s50000-p42/<git7>.json`
+
+Signal collections:
+
+- `logs/signals/fiqa/`
+- `logs/signals/miracl-ko-s50000-p1/`
+- `logs/signals/miracl-ko-s50000-p2/`
+- `logs/signals/miracl-ko-s50000-p3/`
+
+Threshold analyses:
+
+- `.bench-state/research/fiqa-thresholds.json`
+- `.bench-state/research/miracl-ko-s50000-p3-thresholds.json`
+
+Validation outputs:
+
+- `.bench-state/research/fiqa-fused-candidates.json`
+- `.bench-state/research/miracl-ko-s50000-fused-candidates.json`
+- `.bench-state/research/validate/<dataset>/`
+
+## Recommended Defaults
+
+Use these unless you have a specific reason not to:
+
+- baseline English corpus: `fiqa`
+- baseline Korean corpus: `miracl-ko --size 50000`
+- threshold research Korean pool: `50000` docs
+- threshold research Korean seeds: `3`
+- regression gate: `bash scripts/preship.sh --bm25-only`

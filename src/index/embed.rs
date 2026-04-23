@@ -5,7 +5,11 @@ use crate::db::{self, CollectionDb, vectors};
 use crate::error::Result;
 use crate::index::{chunker, new_progress_bar};
 use crate::llm::embedding::Embedder;
-use rusqlite::Connection;
+use rusqlite::{Connection, params};
+
+const EMBED_BATCH_SIZE: usize = 256;
+
+type PendingDoc = (String, String, String, String);
 
 pub struct EmbedOptions {
     /// Re-embed even chunks that already have embeddings.
@@ -29,127 +33,148 @@ pub fn embed(
     cleanup_orphaned(conn)?;
 
     // Find documents whose content is not yet embedded (or force all).
-    let pending = if opts.force {
-        // Re-embed all active documents.
-        load_all_active(conn)?
-    } else {
-        load_unembedded(conn)?
-    };
+    let pending_count = count_pending(conn, opts.force)?;
 
-    if pending.is_empty() {
+    if pending_count == 0 {
         return Ok((0, 0));
     }
 
-    // Content-addressed: multiple paths can share the same hash. Dedup so we don't
-    // attempt to insert the same hash_seq twice (which would violate vectors_vec PK).
-    let mut seen = std::collections::HashSet::new();
-    let pending: Vec<_> = pending
-        .into_iter()
-        .filter(|(_, _, hash, _)| seen.insert(hash.clone()))
-        .collect();
-
-    let pb = new_progress_bar(pending.len() as u64);
+    let pb = new_progress_bar(pending_count as u64);
+    pb.println(format!("embedding {pending_count} pending documents"));
+    pb.tick();
 
     let mut total_chunks = 0usize;
+    let mut total_docs = 0usize;
+    let mut cursor: Option<String> = None;
 
-    for (path, title, hash, doc_text) in &pending {
-        pb.set_message(path.clone());
-
-        // Compute embeddings before touching the DB.
-        let chunks = chunker::chunk_document(doc_text);
-        let inputs: Vec<(String, String)> = chunks
-            .iter()
-            .map(|c| (title.clone(), c.text.clone()))
-            .collect();
-        let embeddings = embedder.embed_doc_batch(&inputs)?;
-
-        // Write atomically: a crash mid-insert would leave no partial state.
-        conn.execute_batch("BEGIN IMMEDIATE")?;
-        let write = || -> Result<()> {
-            if opts.force {
-                // Collect seqs before deleting content_vectors (sqlite-vec can't LIKE on PK).
-                let seqs: Vec<i64> = {
-                    let mut stmt =
-                        conn.prepare("SELECT seq FROM content_vectors WHERE hash = ?1")?;
-                    stmt.query_map([hash], |r| r.get(0))?
-                        .filter_map(|r| r.ok())
-                        .collect()
-                };
-                if !seqs.is_empty() {
-                    let hash_seqs: Vec<String> =
-                        seqs.iter().map(|s| format!("{hash}_{s}")).collect();
-                    let ph = hash_seqs.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-                    conn.execute(
-                        &format!("DELETE FROM vectors_vec WHERE hash_seq IN ({ph})"),
-                        rusqlite::params_from_iter(hash_seqs.iter().map(|s| s.as_str())),
-                    )?;
-                }
-                conn.execute("DELETE FROM content_vectors WHERE hash = ?1", [hash])?;
-            }
-            for (chunk, emb) in chunks.iter().zip(embeddings.iter()) {
-                let hash_seq = format!("{hash}_{}", chunk.seq);
-                vectors::insert(conn, &hash_seq, emb)?;
-                vectors::mark_embedded(
-                    conn,
-                    hash,
-                    chunk.seq as i64,
-                    chunk.pos as i64,
-                    model_name,
-                )?;
-            }
-            Ok(())
-        };
-        match write() {
-            Ok(()) => conn.execute_batch("COMMIT")?,
-            Err(e) => {
-                let _ = conn.execute_batch("ROLLBACK");
-                return Err(e);
-            }
+    loop {
+        let pending = load_pending_batch(conn, opts.force, cursor.as_deref(), EMBED_BATCH_SIZE)?;
+        if pending.is_empty() {
+            break;
         }
 
-        total_chunks += chunks.len();
-        pb.inc(1);
+        for (path, title, hash, doc_text) in &pending {
+            pb.set_message(path.clone());
+
+            // Compute embeddings before touching the DB.
+            let chunks = chunker::chunk_document(doc_text);
+            let inputs: Vec<(String, String)> = chunks
+                .iter()
+                .map(|c| (title.clone(), c.text.clone()))
+                .collect();
+            let embeddings = embedder.embed_doc_batch(&inputs)?;
+
+            // Write atomically: a crash mid-insert would leave no partial state.
+            conn.execute_batch("BEGIN IMMEDIATE")?;
+            let write = || -> Result<()> {
+                if opts.force {
+                    // Collect seqs before deleting content_vectors (sqlite-vec can't LIKE on PK).
+                    let seqs: Vec<i64> = {
+                        let mut stmt =
+                            conn.prepare("SELECT seq FROM content_vectors WHERE hash = ?1")?;
+                        stmt.query_map([hash], |r| r.get(0))?
+                            .filter_map(|r| r.ok())
+                            .collect()
+                    };
+                    if !seqs.is_empty() {
+                        let hash_seqs: Vec<String> =
+                            seqs.iter().map(|s| format!("{hash}_{s}")).collect();
+                        let ph = hash_seqs.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+                        conn.execute(
+                            &format!("DELETE FROM vectors_vec WHERE hash_seq IN ({ph})"),
+                            rusqlite::params_from_iter(hash_seqs.iter().map(|s| s.as_str())),
+                        )?;
+                    }
+                    conn.execute("DELETE FROM content_vectors WHERE hash = ?1", [hash])?;
+                }
+                for (chunk, emb) in chunks.iter().zip(embeddings.iter()) {
+                    let hash_seq = format!("{hash}_{}", chunk.seq);
+                    vectors::insert(conn, &hash_seq, emb)?;
+                    vectors::mark_embedded(
+                        conn,
+                        hash,
+                        chunk.seq as i64,
+                        chunk.pos as i64,
+                        model_name,
+                    )?;
+                }
+                Ok(())
+            };
+            match write() {
+                Ok(()) => conn.execute_batch("COMMIT")?,
+                Err(e) => {
+                    let _ = conn.execute_batch("ROLLBACK");
+                    return Err(e);
+                }
+            }
+
+            total_chunks += chunks.len();
+            total_docs += 1;
+            pb.inc(1);
+        }
+
+        cursor = pending.last().map(|(_, _, hash, _)| hash.clone());
     }
 
     pb.finish_with_message("done");
-    Ok((pending.len(), total_chunks))
+    Ok((total_docs, total_chunks))
 }
 
-/// Load active documents that have no entry in content_vectors.
-fn load_unembedded(conn: &Connection) -> Result<Vec<(String, String, String, String)>> {
-    let sql = "
-        SELECT d.path, d.title, d.hash, c.doc
+fn count_pending(conn: &Connection, force: bool) -> Result<usize> {
+    let sql = if force {
+        "
+        SELECT COUNT(DISTINCT d.hash)
+        FROM documents d
+        WHERE d.active = 1
+        "
+    } else {
+        "
+        SELECT COUNT(DISTINCT d.hash)
+        FROM documents d
+        WHERE d.active = 1
+          AND NOT EXISTS (
+              SELECT 1 FROM content_vectors cv WHERE cv.hash = d.hash
+          )
+        "
+    };
+    conn.query_row(sql, [], |row| row.get(0)).map_err(Into::into)
+}
+
+/// Load one batch of active content-addressed docs for embedding.
+fn load_pending_batch(
+    conn: &Connection,
+    force: bool,
+    after_hash: Option<&str>,
+    limit: usize,
+) -> Result<Vec<PendingDoc>> {
+    let sql = if force {
+        "
+        SELECT MIN(d.path), MIN(d.title), d.hash, c.doc
+        FROM documents d
+        JOIN content c ON c.hash = d.hash
+        WHERE d.active = 1
+          AND (?1 IS NULL OR d.hash > ?1)
+        GROUP BY d.hash, c.doc
+        ORDER BY d.hash
+        LIMIT ?2
+        "
+    } else {
+        "
+        SELECT MIN(d.path), MIN(d.title), d.hash, c.doc
         FROM documents d
         JOIN content c ON c.hash = d.hash
         WHERE d.active = 1
           AND NOT EXISTS (
               SELECT 1 FROM content_vectors cv WHERE cv.hash = d.hash
           )
-        ORDER BY d.path
-    ";
+          AND (?1 IS NULL OR d.hash > ?1)
+        GROUP BY d.hash, c.doc
+        ORDER BY d.hash
+        LIMIT ?2
+        "
+    };
     let mut stmt = conn.prepare(sql)?;
-    let rows = stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, String>(3)?,
-        ))
-    })?;
-    rows.collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(Into::into)
-}
-
-fn load_all_active(conn: &Connection) -> Result<Vec<(String, String, String, String)>> {
-    let sql = "
-        SELECT d.path, d.title, d.hash, c.doc
-        FROM documents d
-        JOIN content c ON c.hash = d.hash
-        WHERE d.active = 1
-        ORDER BY d.path
-    ";
-    let mut stmt = conn.prepare(sql)?;
-    let rows = stmt.query_map([], |row| {
+    let rows = stmt.query_map(params![after_hash, limit as i64], |row| {
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, String>(1)?,
@@ -225,7 +250,7 @@ mod tests {
     }
 
     #[test]
-    fn load_unembedded_finds_pending() {
+    fn load_pending_batch_finds_pending() {
         let conn = open_test_db();
         let hash = "abc";
         conn.execute(
@@ -240,13 +265,14 @@ mod tests {
         )
         .unwrap();
 
-        let pending = load_unembedded(&conn).unwrap();
+        let pending = load_pending_batch(&conn, false, None, 10).unwrap();
         assert_eq!(pending.len(), 1, "should find 1 unembedded doc");
         assert_eq!(pending[0].2, hash);
+        assert_eq!(count_pending(&conn, false).unwrap(), 1);
     }
 
     #[test]
-    fn load_unembedded_skips_already_embedded() {
+    fn load_pending_batch_skips_already_embedded() {
         let conn = open_test_db();
         let hash = "def";
         conn.execute(
@@ -267,8 +293,32 @@ mod tests {
         )
         .unwrap();
 
-        let pending = load_unembedded(&conn).unwrap();
+        let pending = load_pending_batch(&conn, false, None, 10).unwrap();
         assert_eq!(pending.len(), 0, "should skip already-embedded doc");
+        assert_eq!(count_pending(&conn, false).unwrap(), 0);
+    }
+
+    #[test]
+    fn load_pending_batch_dedups_shared_hashes() {
+        let conn = open_test_db();
+        let hash = "shared";
+        conn.execute(
+            "INSERT INTO content (hash, doc, created_at) VALUES (?1,'hello','2024-01-01')",
+            [hash],
+        )
+        .unwrap();
+        for path in ["a.md", "b.md"] {
+            conn.execute(
+                "INSERT INTO documents (path,title,hash,created_at,modified_at,active)
+                 VALUES (?1,'T',?2,'2024-01-01','2024-01-01',1)",
+                params![path, hash],
+            )
+            .unwrap();
+        }
+
+        let pending = load_pending_batch(&conn, false, None, 10).unwrap();
+        assert_eq!(pending.len(), 1, "shared content hash should embed once");
+        assert_eq!(count_pending(&conn, false).unwrap(), 1);
     }
 
     /// Requires embedding model — skip in CI.

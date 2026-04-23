@@ -154,6 +154,22 @@ def search_one(ir_bin: str, collection: str, mode: str, query: str, limit: int,
         return [], elapsed_ms, {}
 
 
+def _search_one_signal_mode(
+    ir_bin: str,
+    collection: str,
+    mode: str,
+    query: str,
+    limit: int,
+    signal_env: dict,
+) -> tuple:
+    env = signal_env.copy()
+    actual_mode = mode
+    if mode == "tier1":
+        actual_mode = "hybrid"
+        env["IR_FORCE_TIER1_ONLY"] = "1"
+    return search_one(ir_bin, collection, actual_mode, query, limit, env=env)
+
+
 def _parse_signals(stderr: str) -> dict:
     """Parse SIGNAL_BM25 and SIGNAL_FUSED lines from ir stderr."""
     signals = {}
@@ -236,6 +252,64 @@ def cmd_prepare(args):
 WARMUP = 5  # skip first N queries for latency stats
 
 
+def _progress_dir(output_path: str) -> Path:
+    return Path(f"{output_path}.partial")
+
+
+def _load_progress(path: Path) -> dict:
+    records = {}
+    if not path.exists():
+        return records
+    with path.open() as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            rec = json.loads(line)
+            records[rec["query_id"]] = rec
+    return records
+
+
+def _aggregate_mode(mode: str, queries: list, qrels: dict, at_ks: list, records: dict) -> tuple[dict | None, int]:
+    ranked_all = []
+    latencies = []
+
+    for idx, q in enumerate(queries):
+        relevant = qrels.get(q["id"], {})
+        if not relevant:
+            continue
+        rec = records.get(q["id"])
+        if not rec:
+            continue
+        ranked = rec["ranked"]
+        elapsed_ms = float(rec["elapsed_ms"])
+        ranked_all.append((q["id"], ranked, relevant))
+        if idx >= WARMUP:
+            latencies.append(elapsed_ms)
+
+    if not ranked_all:
+        return None, 0
+
+    n = len(ranked_all)
+    metrics = {}
+    for k in at_ks:
+        ndcg_sum = sum(ndcg_at_k(r, rel, k) for _, r, rel in ranked_all)
+        recall_sum = sum(recall_at_k(r, rel, k) for _, r, rel in ranked_all)
+        metrics[f"ndcg_{k}"] = round(ndcg_sum / n, 4)
+        metrics[f"recall_{k}"] = round(recall_sum / n, 4)
+
+    if mode == "bm25":
+        recall_1000 = sum(recall_at_k(r, rel, 1000) for _, r, rel in ranked_all) / n
+        metrics["recall_1000"] = round(recall_1000, 4)
+
+    timing = {}
+    if latencies:
+        timing["median_ms"] = round(percentile(latencies, 50), 1)
+        timing["p95_ms"] = round(percentile(latencies, 95), 1)
+
+    return {"mode": mode, "metrics": metrics, "timing": timing}, n
+
+
 def cmd_run(args):
     data_dir = Path(args.data)
     queries = load_queries(data_dir / "queries.jsonl")
@@ -264,54 +338,64 @@ def cmd_run(args):
         return
 
     all_results = []
+    progress_dir = _progress_dir(args.output) if args.output else None
+    if progress_dir is not None:
+        progress_dir.mkdir(parents=True, exist_ok=True)
+        Path(args.output).parent.mkdir(parents=True, exist_ok=True)
 
     for mode in modes:
         print(f"\n==> mode={mode} ({len(queries)} queries, k={fetch_k})")
-        ranked_all = []
-        latencies = []
-
         effective_k = fetch_k_bm25 if mode == "bm25" else fetch_k
+        mode_records = {}
+        progress_path = None
+        done_marker = None
 
-        pbar = tqdm(queries, desc=f"{mode}", unit="q")
-        for i, q in enumerate(pbar):
-            relevant = qrels.get(q["id"], {})
-            if not relevant:
-                continue
+        if progress_dir is not None:
+            progress_path = progress_dir / f"{mode}.jsonl"
+            done_marker = progress_dir / f".done-{mode}"
+            mode_records = _load_progress(progress_path)
+            if mode_records:
+                print(f"  resuming from query {len(mode_records)} (already completed)")
 
-            ranked, elapsed_ms, _ = search_one(ir_bin, collection, mode, q["text"], effective_k)
-            ranked_all.append((q["id"], ranked, relevant))
+        remaining = [q for q in queries if q["id"] not in mode_records]
+        if remaining:
+            record_file = progress_path.open("a") if progress_path is not None else None
+            try:
+                pbar = tqdm(remaining, desc=f"{mode}", unit="q")
+                for q in pbar:
+                    relevant = qrels.get(q["id"], {})
+                    if not relevant:
+                        continue
 
-            if i >= WARMUP:
-                latencies.append(elapsed_ms)
+                    ranked, elapsed_ms, _ = search_one(ir_bin, collection, mode, q["text"], effective_k)
+                    rec = {
+                        "query_id": q["id"],
+                        "ranked": ranked,
+                        "elapsed_ms": round(elapsed_ms, 1),
+                    }
+                    mode_records[q["id"]] = rec
+                    if record_file is not None:
+                        record_file.write(json.dumps(rec) + "\n")
+                        record_file.flush()
+            finally:
+                if record_file is not None:
+                    record_file.close()
+        else:
+            print("  already complete")
 
-        print(f"  {len(ranked_all)}/{len(queries)} queries scored")
+        if done_marker is not None and len(mode_records) == len(queries):
+            done_marker.touch()
 
-        if not ranked_all:
+        result, scored = _aggregate_mode(mode, queries, qrels, at_ks, mode_records)
+        print(f"  {scored}/{len(queries)} queries scored")
+
+        if result is None:
             continue
-
-        # Aggregate metrics
-        n = len(ranked_all)
-        metrics = {}
-        for k in at_ks:
-            ndcg_sum = sum(ndcg_at_k(r, rel, k) for _, r, rel in ranked_all)
-            recall_sum = sum(recall_at_k(r, rel, k) for _, r, rel in ranked_all)
-            metrics[f"ndcg_{k}"] = round(ndcg_sum / n, 4)
-            metrics[f"recall_{k}"] = round(recall_sum / n, 4)
-
-        if mode == "bm25":
-            recall_1000 = sum(recall_at_k(r, rel, 1000) for _, r, rel in ranked_all) / n
-            metrics["recall_1000"] = round(recall_1000, 4)
-
-        # Timing
-        timing = {}
-        if latencies:
-            timing["median_ms"] = round(percentile(latencies, 50), 1)
-            timing["p95_ms"] = round(percentile(latencies, 95), 1)
-
-        result = {"mode": mode, "metrics": metrics, "timing": timing}
         all_results.append(result)
 
         # Print summary line
+        metrics = result["metrics"]
+        timing = result["timing"]
         ndcg_k = at_ks[0]
         print(f"  nDCG@{ndcg_k}={metrics.get(f'ndcg_{ndcg_k}', '?'):.4f}  "
               f"R@{ndcg_k}={metrics.get(f'recall_{ndcg_k}', '?'):.4f}", end="")
@@ -379,8 +463,8 @@ def _run_signals(args, queries, qrels, at_ks, fetch_k, ir_bin, collection, modes
                 if q["id"] in done[mode]:
                     continue
                 effective_k = max(fetch_k, 1000) if mode == "bm25" else fetch_k
-                ranked, elapsed_ms, signals = search_one(
-                    ir_bin, collection, mode, q["text"], effective_k, env=signal_env
+                ranked, elapsed_ms, signals = _search_one_signal_mode(
+                    ir_bin, collection, mode, q["text"], effective_k, signal_env
                 )
                 rec = {
                     "query_id": q["id"],
@@ -400,7 +484,7 @@ def _run_signals(args, queries, qrels, at_ks, fetch_k, ir_bin, collection, modes
         print(f"  {len(queries)} queries done")
         for mode in modes_to_run:
             print(f"  {mode} -> {out_dir}/{mode}.jsonl")
-        (out_dir / ".done").touch()
+            (out_dir / f".done-{mode}").touch()
     finally:
         for f in files.values():
             f.close()
@@ -512,7 +596,7 @@ def main():
     # run
     run_p = sub.add_parser("run", help="Run queries and compute metrics")
     add_common(run_p)
-    run_p.add_argument("--mode", default="bm25", help="bm25, vector, hybrid, all (default: bm25)")
+    run_p.add_argument("--mode", default="bm25", help="bm25, vector, tier1, hybrid, all (default: bm25)")
     run_p.add_argument("--at-k", default="10,20,100", help="Comma-separated k values (default: 10,20,100)")
     run_p.add_argument("--max-queries", type=int, help="Limit number of queries")
     run_p.add_argument("--output", "-o", help="Write JSON results to file")

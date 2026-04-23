@@ -23,6 +23,16 @@ use rusqlite::Connection;
 use std::collections::HashMap;
 use std::time::Instant;
 
+fn env_override_f64(name: &str) -> Option<f64> {
+    std::env::var(name).ok().and_then(|raw| raw.parse::<f64>().ok())
+}
+
+fn env_flag(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .is_some_and(|raw| matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+}
+
 pub struct HybridRequest<'a> {
     pub query: &'a str,
     pub limit: usize,
@@ -71,18 +81,77 @@ const SCORE_FUSION_VEC_ALPHA: f64 = 0.80;
 
 /// Shortcut fires when top*gap >= product AND top >= floor.
 /// Conservative defaults — calibrate against real query distributions with -v logging.
-pub(crate) const STRONG_SIGNAL_PRODUCT: f64 = 0.06;
-pub(crate) const STRONG_SIGNAL_FLOOR: f64 = 0.40;
+pub const STRONG_SIGNAL_PRODUCT: f64 = 0.06;
+pub const STRONG_SIGNAL_FLOOR: f64 = 0.40;
 
 /// Tier-0 shortcut on raw BM25 scores (pos/(1+pos) normalization).
 /// Higher floor than fused thresholds — raw BM25 at 0.40 is a moderate match, not a strong one.
 pub const BM25_STRONG_FLOOR: f64 = 0.75;
 pub const BM25_STRONG_GAP: f64 = 0.10;
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct RoutingThresholds {
+    fused_floor: f64,
+    fused_product: f64,
+    bm25_floor: f64,
+    bm25_gap: f64,
+}
+
+pub fn bm25_strong_signal_thresholds() -> (f64, f64) {
+    (
+        env_override_f64("IR_BM25_STRONG_FLOOR_OVERRIDE").unwrap_or(BM25_STRONG_FLOOR),
+        env_override_f64("IR_BM25_STRONG_GAP_OVERRIDE").unwrap_or(BM25_STRONG_GAP),
+    )
+}
+
+fn default_routing_thresholds(all_preprocessed: bool) -> RoutingThresholds {
+    let (fused_floor, fused_product) =
+        strong_signal_thresholds_for_all_preprocessed(all_preprocessed);
+    let (bm25_floor, bm25_gap) = bm25_strong_signal_thresholds();
+    RoutingThresholds {
+        fused_floor,
+        fused_product,
+        bm25_floor,
+        bm25_gap,
+    }
+}
+
+fn agreed_override(mut values: impl Iterator<Item = Option<f64>>) -> Option<f64> {
+    let first = values.next().flatten()?;
+    if values.all(|v| v == Some(first)) {
+        Some(first)
+    } else {
+        None
+    }
+}
+
+fn routing_thresholds_from_overrides(
+    all_preprocessed: bool,
+    routings: impl Iterator<Item = Option<crate::types::RoutingConfig>>,
+) -> RoutingThresholds {
+    let routings: Vec<Option<crate::types::RoutingConfig>> = routings.collect();
+    let mut thresholds = default_routing_thresholds(all_preprocessed);
+    if let Some(v) = agreed_override(routings.iter().map(|r| r.as_ref().and_then(|r| r.fused_strong_floor))) {
+        thresholds.fused_floor = v;
+    }
+    if let Some(v) = agreed_override(routings.iter().map(|r| r.as_ref().and_then(|r| r.fused_strong_product))) {
+        thresholds.fused_product = v;
+    }
+    if let Some(v) = agreed_override(routings.iter().map(|r| r.as_ref().and_then(|r| r.bm25_strong_floor))) {
+        thresholds.bm25_floor = v;
+    }
+    if let Some(v) = agreed_override(routings.iter().map(|r| r.as_ref().and_then(|r| r.bm25_strong_gap))) {
+        thresholds.bm25_gap = v;
+    }
+    thresholds
+}
+
 impl HybridSearch {
     pub fn search(&self, dbs: &[CollectionDb], req: &HybridRequest) -> Result<SearchOutput> {
         let mut log = Logger::new(req.verbose);
         let t_total = Instant::now();
+        let allow_expand_without_scorer = env_flag("IR_ALLOW_EXPANSION_WITHOUT_SCORER");
+        let force_tier1_only = env_flag("IR_FORCE_TIER1_ONLY");
 
         // 1. Fast retrieval: BM25 + vector + score fusion (~20ms).
         let fused = score_fusion_two_list(dbs, &self.embedder, req, &mut log)?;
@@ -122,16 +191,30 @@ impl HybridSearch {
             let gap = if fused.len() >= 2 { top - fused[1].score } else { top };
             log.info(format!("SIGNAL_FUSED\t{top:.6}\t{gap:.6}"));
         }
+        if force_tier1_only {
+            log.info("Research override: returning tier-1 fused results only");
+            log.timing("total", t_total.elapsed());
+            return Ok(SearchOutput {
+                results: apply_min_score(fused, req.min_score, req.limit),
+                log: log.log,
+            });
+        }
         let disable_shortcuts = std::env::var("IR_DISABLE_SHORTCUTS").is_ok();
 
         // 2. Shortcut: fused results show clear winner AND post-filter count meets limit.
         //    If filter reduced count below limit, escalate to get more candidates from expansion.
-        if !disable_shortcuts && is_strong_signal(&fused) && (req.filter.is_empty() || fused.len() >= req.limit) {
+        let thresholds = routing_thresholds_for_dbs(dbs);
+        let strong_signal_floor = thresholds.fused_floor;
+        let strong_signal_product = thresholds.fused_product;
+        if !disable_shortcuts
+            && is_strong_signal(&fused, strong_signal_floor, strong_signal_product)
+            && (req.filter.is_empty() || fused.len() >= req.limit)
+        {
             let top = fused[0].score;
             let gap = fused.get(1).map(|r| top - r.score).unwrap_or(top);
             log.info(format!(
-                "Strong signal (score={top:.3}, gap={gap:.3}, product={:.3}) — skipping expansion+reranking",
-                top * gap
+                "Strong signal (score={top:.3}, gap={gap:.3}, product={:.3}, threshold={strong_signal_product:.3}) — skipping expansion+reranking",
+                top * gap,
             ));
             log.timing("total", t_total.elapsed());
             return Ok(SearchOutput {
@@ -142,11 +225,14 @@ impl HybridSearch {
 
         // 3. LLM enhancement: expand only when reranker is also available.
         // ! Expansion without reranking is harmful (p<0.05 on NFCorpus, -0.53% nDCG).
-        let (enhanced, expansion_ran) = if self.scorer.is_some() {
+        let (enhanced, expansion_ran) = if self.scorer.is_some() || allow_expand_without_scorer {
             if let Some(exp) = &self.expander {
                 let t0 = Instant::now();
                 let cached = self.expander_cache.as_ref()
                     .and_then(|c| c.get(exp.model_id(), req.query));
+                if self.scorer.is_none() {
+                    log.info("Expanding without reranker (research override)...");
+                }
                 let subs = if let Some(subs) = cached {
                     log.info("Expanding query (cached)...");
                     log.timing("expand", t0.elapsed());
@@ -398,29 +484,74 @@ fn vec_across(dbs: &[CollectionDb], embedding: &[f32], limit: usize) -> Result<V
 /// Strong-signal shortcut on fused BM25+vector scores.
 /// Fires when top*gap >= STRONG_SIGNAL_PRODUCT and top >= STRONG_SIGNAL_FLOOR.
 /// Higher scores tolerate smaller gaps; lower scores need proportionally larger gaps.
-pub(crate) fn is_strong_signal(results: &[SearchResult]) -> bool {
+pub(crate) fn is_strong_signal(
+    results: &[SearchResult],
+    floor_threshold: f64,
+    product_threshold: f64,
+) -> bool {
     let top = match results.first() {
-        Some(r) if r.score >= STRONG_SIGNAL_FLOOR => r.score,
+        Some(r) if r.score >= floor_threshold => r.score,
         _ => return false,
     };
     if results.len() < 2 {
         return true;
     }
     let gap = top - results[1].score;
-    top * gap >= STRONG_SIGNAL_PRODUCT
+    top * gap >= product_threshold
+}
+
+pub fn strong_signal_thresholds_for_all_preprocessed(all_preprocessed: bool) -> (f64, f64) {
+    let floor = env_override_f64("IR_STRONG_SIGNAL_FLOOR_OVERRIDE").unwrap_or(STRONG_SIGNAL_FLOOR);
+    let product = if all_preprocessed
+        && let Some(v) = env_override_f64("IR_STRONG_SIGNAL_PRODUCT_PREPROCESSED_OVERRIDE")
+    {
+        v
+    } else {
+        env_override_f64("IR_STRONG_SIGNAL_PRODUCT_OVERRIDE").unwrap_or(STRONG_SIGNAL_PRODUCT)
+    };
+    (floor, product)
+}
+
+pub fn strong_signal_thresholds_for_collections(
+    cols: &[&crate::types::Collection],
+) -> (f64, f64) {
+    let thresholds = routing_thresholds_from_overrides(
+        !cols.is_empty()
+            && cols.iter().all(|c| c.preprocessor.as_ref().is_some_and(|pp| !pp.is_empty())),
+        cols.iter().map(|c| c.routing.clone()),
+    );
+    (thresholds.fused_floor, thresholds.fused_product)
+}
+
+fn routing_thresholds_for_dbs(dbs: &[CollectionDb]) -> RoutingThresholds {
+    routing_thresholds_from_overrides(
+        !dbs.is_empty() && dbs.iter().all(|db| !db.preprocessor_commands.is_empty()),
+        dbs.iter().map(|db| db.routing.clone()),
+    )
+}
+
+pub fn bm25_strong_signal_thresholds_for_collections(
+    cols: &[&crate::types::Collection],
+) -> (f64, f64) {
+    let thresholds = routing_thresholds_from_overrides(
+        !cols.is_empty()
+            && cols.iter().all(|c| c.preprocessor.as_ref().is_some_and(|pp| !pp.is_empty())),
+        cols.iter().map(|c| c.routing.clone()),
+    );
+    (thresholds.bm25_floor, thresholds.bm25_gap)
 }
 
 /// Tier-0 shortcut on raw BM25 scores before any vector retrieval.
 /// Higher thresholds than fused shortcut — raw BM25 at 0.40 is a moderate match.
-pub fn is_bm25_strong_signal(results: &[SearchResult]) -> bool {
+pub fn is_bm25_strong_signal(results: &[SearchResult], floor_threshold: f64, gap_threshold: f64) -> bool {
     let top = match results.first() {
-        Some(r) if r.score >= BM25_STRONG_FLOOR => r.score,
+        Some(r) if r.score >= floor_threshold => r.score,
         _ => return false,
     };
     if results.len() < 2 {
         return true;
     }
-    (top - results[1].score) >= BM25_STRONG_GAP
+    (top - results[1].score) >= gap_threshold
 }
 
 fn apply_min_score(
@@ -554,6 +685,14 @@ fn fetch_content(conn: &Connection, hash: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::{Collection, RoutingConfig};
+    use std::sync::{Mutex, MutexGuard};
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn env_lock() -> MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     #[test]
     fn strong_signal_product_boundary() {
@@ -571,27 +710,124 @@ mod tests {
 
         // Below floor → not strong
         let r = vec![make(0.39), make(0.10)];
-        assert!(!is_strong_signal(&r), "score below floor should not be strong");
+        assert!(
+            !is_strong_signal(&r, STRONG_SIGNAL_FLOOR, STRONG_SIGNAL_PRODUCT),
+            "score below floor should not be strong"
+        );
 
         // At floor, product below threshold (0.40 * 0.10 = 0.04 < 0.06) → not strong
         let r = vec![make(0.40), make(0.30)];
-        assert!(!is_strong_signal(&r), "product 0.04 should not be strong");
+        assert!(
+            !is_strong_signal(&r, STRONG_SIGNAL_FLOOR, STRONG_SIGNAL_PRODUCT),
+            "product 0.04 should not be strong"
+        );
 
         // At floor, product at threshold (0.40 * 0.15 = 0.06) → strong
         let r = vec![make(0.40), make(0.25)];
-        assert!(is_strong_signal(&r), "product 0.06 should be strong");
+        assert!(
+            is_strong_signal(&r, STRONG_SIGNAL_FLOOR, STRONG_SIGNAL_PRODUCT),
+            "product 0.06 should be strong"
+        );
 
         // High score, product above threshold (0.80 * 0.08 = 0.064 >= 0.06) → strong
         let r = vec![make(0.80), make(0.72)];
-        assert!(is_strong_signal(&r), "product 0.064 should be strong");
+        assert!(
+            is_strong_signal(&r, STRONG_SIGNAL_FLOOR, STRONG_SIGNAL_PRODUCT),
+            "product 0.064 should be strong"
+        );
 
         // High score, tiny gap (0.80 * 0.04 = 0.032 < 0.06) → not strong
         let r = vec![make(0.80), make(0.76)];
-        assert!(!is_strong_signal(&r), "product 0.032 should not be strong");
+        assert!(
+            !is_strong_signal(&r, STRONG_SIGNAL_FLOOR, STRONG_SIGNAL_PRODUCT),
+            "product 0.032 should not be strong"
+        );
 
         // Single result above floor → strong
         let r = vec![make(0.50)];
-        assert!(is_strong_signal(&r), "single result above floor should be strong");
+        assert!(
+            is_strong_signal(&r, STRONG_SIGNAL_FLOOR, STRONG_SIGNAL_PRODUCT),
+            "single result above floor should be strong"
+        );
+    }
+
+    #[test]
+    fn strong_signal_product_uses_env_overrides() {
+        let _guard = env_lock();
+        unsafe {
+            std::env::remove_var("IR_STRONG_SIGNAL_PRODUCT_OVERRIDE");
+            std::env::remove_var("IR_STRONG_SIGNAL_PRODUCT_PREPROCESSED_OVERRIDE");
+            std::env::remove_var("IR_STRONG_SIGNAL_FLOOR_OVERRIDE");
+        }
+
+        assert_eq!(
+            strong_signal_thresholds_for_all_preprocessed(false),
+            (STRONG_SIGNAL_FLOOR, STRONG_SIGNAL_PRODUCT)
+        );
+        assert_eq!(
+            strong_signal_thresholds_for_all_preprocessed(true),
+            (STRONG_SIGNAL_FLOOR, STRONG_SIGNAL_PRODUCT)
+        );
+
+        unsafe { std::env::set_var("IR_STRONG_SIGNAL_PRODUCT_OVERRIDE", "0.08") };
+        assert_eq!(
+            strong_signal_thresholds_for_all_preprocessed(false),
+            (STRONG_SIGNAL_FLOOR, 0.08)
+        );
+        assert_eq!(
+            strong_signal_thresholds_for_all_preprocessed(true),
+            (STRONG_SIGNAL_FLOOR, 0.08)
+        );
+
+        unsafe { std::env::set_var("IR_STRONG_SIGNAL_PRODUCT_PREPROCESSED_OVERRIDE", "0.05") };
+        assert_eq!(
+            strong_signal_thresholds_for_all_preprocessed(true),
+            (STRONG_SIGNAL_FLOOR, 0.05)
+        );
+
+        unsafe { std::env::set_var("IR_STRONG_SIGNAL_FLOOR_OVERRIDE", "0.45") };
+        assert_eq!(
+            strong_signal_thresholds_for_all_preprocessed(true),
+            (0.45, 0.05)
+        );
+
+        unsafe {
+            std::env::remove_var("IR_STRONG_SIGNAL_PRODUCT_OVERRIDE");
+            std::env::remove_var("IR_STRONG_SIGNAL_PRODUCT_PREPROCESSED_OVERRIDE");
+            std::env::remove_var("IR_STRONG_SIGNAL_FLOOR_OVERRIDE");
+        }
+    }
+
+    #[test]
+    fn bm25_strong_signal_uses_explicit_thresholds() {
+        let make = |score: f64| SearchResult {
+            collection: "c".into(),
+            path: "p".into(),
+            title: "t".into(),
+            score,
+            snippet: None,
+            hash: "h".into(),
+            doc_id: "#h".into(),
+            content: None,
+            chunk_seq: None,
+        };
+
+        let r = vec![make(0.70), make(0.60)];
+        assert!(!is_bm25_strong_signal(&r, BM25_STRONG_FLOOR, BM25_STRONG_GAP));
+        assert!(is_bm25_strong_signal(&r, 0.70, 0.09));
+    }
+
+    #[test]
+    fn env_flag_recognizes_truthy_values() {
+        let _guard = env_lock();
+        unsafe { std::env::set_var("IR_ALLOW_EXPANSION_WITHOUT_SCORER", "1") };
+        assert!(env_flag("IR_ALLOW_EXPANSION_WITHOUT_SCORER"));
+        unsafe { std::env::set_var("IR_ALLOW_EXPANSION_WITHOUT_SCORER", "true") };
+        assert!(env_flag("IR_ALLOW_EXPANSION_WITHOUT_SCORER"));
+        unsafe { std::env::set_var("IR_ALLOW_EXPANSION_WITHOUT_SCORER", "0") };
+        assert!(!env_flag("IR_ALLOW_EXPANSION_WITHOUT_SCORER"));
+        unsafe { std::env::remove_var("IR_ALLOW_EXPANSION_WITHOUT_SCORER") };
+        assert!(!env_flag("IR_ALLOW_EXPANSION_WITHOUT_SCORER"));
     }
 
     #[test]
@@ -610,23 +846,90 @@ mod tests {
 
         // Below floor → not strong
         let r = vec![make(0.74), make(0.60)];
-        assert!(!is_bm25_strong_signal(&r), "score below BM25 floor should not be strong");
+        assert!(
+            !is_bm25_strong_signal(&r, BM25_STRONG_FLOOR, BM25_STRONG_GAP),
+            "score below BM25 floor should not be strong"
+        );
 
         // At floor, gap below threshold → not strong
         let r = vec![make(0.75), make(0.66)];
-        assert!(!is_bm25_strong_signal(&r), "gap 0.09 should not be strong");
+        assert!(
+            !is_bm25_strong_signal(&r, BM25_STRONG_FLOOR, BM25_STRONG_GAP),
+            "gap 0.09 should not be strong"
+        );
 
         // At floor, gap at threshold → strong
         let r = vec![make(0.75), make(0.64)];
-        assert!(is_bm25_strong_signal(&r), "gap 0.11 should be strong");
+        assert!(
+            is_bm25_strong_signal(&r, BM25_STRONG_FLOOR, BM25_STRONG_GAP),
+            "gap 0.11 should be strong"
+        );
 
         // High score, large gap → strong
         let r = vec![make(0.90), make(0.70)];
-        assert!(is_bm25_strong_signal(&r), "high score + large gap should be strong");
+        assert!(
+            is_bm25_strong_signal(&r, BM25_STRONG_FLOOR, BM25_STRONG_GAP),
+            "high score + large gap should be strong"
+        );
 
         // Single result above floor → strong
         let r = vec![make(0.80)];
-        assert!(is_bm25_strong_signal(&r), "single result above floor should be strong");
+        assert!(
+            is_bm25_strong_signal(&r, BM25_STRONG_FLOOR, BM25_STRONG_GAP),
+            "single result above floor should be strong"
+        );
+    }
+
+    #[test]
+    fn collection_routing_override_applies_when_all_collections_agree() {
+        let make = |name: &str| Collection {
+            name: name.into(),
+            path: "/tmp".into(),
+            globs: vec![],
+            excludes: vec![],
+            description: None,
+            preprocessor: Some(vec!["ko".into()]),
+            routing: Some(RoutingConfig {
+                fused_strong_floor: None,
+                fused_strong_product: Some(0.05),
+                bm25_strong_floor: None,
+                bm25_strong_gap: None,
+            }),
+        };
+        let a = make("a");
+        let b = make("b");
+        let cols = vec![&a, &b];
+        assert_eq!(strong_signal_thresholds_for_collections(&cols), (STRONG_SIGNAL_FLOOR, 0.05));
+    }
+
+    #[test]
+    fn collection_routing_override_falls_back_on_conflict() {
+        let a = Collection {
+            name: "a".into(),
+            path: "/tmp".into(),
+            globs: vec![],
+            excludes: vec![],
+            description: None,
+            preprocessor: Some(vec!["ko".into()]),
+            routing: Some(RoutingConfig {
+                fused_strong_floor: None,
+                fused_strong_product: Some(0.05),
+                bm25_strong_floor: None,
+                bm25_strong_gap: None,
+            }),
+        };
+        let b = Collection {
+            name: "b".into(),
+            path: "/tmp".into(),
+            globs: vec![],
+            excludes: vec![],
+            description: None,
+            preprocessor: None,
+            routing: None,
+        };
+        let cols = vec![&a, &b];
+        assert_eq!(strong_signal_thresholds_for_collections(&cols), (STRONG_SIGNAL_FLOOR, STRONG_SIGNAL_PRODUCT));
+        assert_eq!(bm25_strong_signal_thresholds_for_collections(&cols), (BM25_STRONG_FLOOR, BM25_STRONG_GAP));
     }
 
     #[test]

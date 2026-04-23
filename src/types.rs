@@ -1,5 +1,17 @@
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RoutingConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fused_strong_floor: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fused_strong_product: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bm25_strong_floor: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bm25_strong_gap: Option<f64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Collection {
     pub name: String,
@@ -14,6 +26,10 @@ pub struct Collection {
     /// Each alias must be registered in config.preprocessors.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preprocessor: Option<Vec<String>>,
+    /// Optional per-collection routing overrides for BM25/fused strong-signal shortcuts.
+    /// Applies only when all searched collections agree on the same override value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing: Option<RoutingConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

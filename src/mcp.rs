@@ -307,7 +307,12 @@ fn fill_results_content(results: &mut [SearchResult]) -> IrResult<()> {
         .map(|c| {
             let pp_aliases = c.preprocessor.as_deref().unwrap_or(&[]);
             let pp_commands = config.resolve_preprocessor_commands(pp_aliases);
-            db::CollectionDb::open_rw(&c.name, &collection_db_path(&c.name), pp_commands)
+            db::CollectionDb::open_rw(
+                &c.name,
+                &collection_db_path(&c.name),
+                pp_commands,
+                c.routing.clone(),
+            )
         })
         .collect::<crate::error::Result<Vec<_>>>()?;
     crate::fill_content(results, &dbs);

@@ -46,6 +46,7 @@ pub struct CollectionDb {
     /// Resolved preprocessor command strings for this collection (e.g. ["kiwi-tokenize", "mecab -Owakati"]).
     /// Empty if no preprocessing is configured. Used at query time to spawn a PreprocessChain.
     pub preprocessor_commands: Vec<String>,
+    pub routing: Option<crate::types::RoutingConfig>,
     conn: Connection,
     /// Lazily spawned preprocessor chain, reused across BM25 calls within one search request.
     preprocess_chain: RefCell<Option<PreprocessChain>>,
@@ -71,7 +72,13 @@ impl CollectionDb {
         let name = name.into();
         schema::init(&conn, &name, has_preprocessor)?;
 
-        Ok(Self { name, preprocessor_commands: vec![], conn, preprocess_chain: RefCell::new(None) })
+        Ok(Self {
+            name,
+            preprocessor_commands: vec![],
+            routing: None,
+            conn,
+            preprocess_chain: RefCell::new(None),
+        })
     }
 
     /// Open an existing collection DB with read-write access (no schema init).
@@ -81,6 +88,7 @@ impl CollectionDb {
         name: impl Into<String>,
         db_path: &Path,
         preprocessor_commands: Vec<String>,
+        routing: Option<crate::types::RoutingConfig>,
     ) -> Result<Self> {
         ensure_sqlite_vec();
 
@@ -94,6 +102,7 @@ impl CollectionDb {
         Ok(Self {
             name: name.into(),
             preprocessor_commands,
+            routing,
             conn,
             preprocess_chain: RefCell::new(None),
         })

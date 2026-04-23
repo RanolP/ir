@@ -6,6 +6,7 @@ Local semantic search engine for markdown knowledge bases. Rust port of [qmd](ht
 
 - **Per-collection SQLite** — each collection is an independent file; no shared global index
 - **Persistent daemon** — models stay loaded between queries; first search auto-starts it
+  Cold first queries can still return BM25 immediately while the daemon warms in the background.
 - **Dual LLM cache** — expander outputs and reranker scores are persisted; repeated queries are instant
 
 Search quality benchmarked on 4 BEIR datasets; reranking adds up to +14.5% nDCG@10 over pure vector.
@@ -17,6 +18,7 @@ Search quality benchmarked on 4 BEIR datasets; reranking adds up to +14.5% nDCG@
 - **Query expansion** — typed sub-queries (lex/vec/hyde) when expander model is present
 - **Strong-signal shortcut** — skips expansion when top BM25 score ≥ 0.75 with gap ≥ 0.10
 - **Daemon mode** — keeps models warm between queries; auto-starts on first search
+  Cold start does not have to block the first useful BM25 result.
 - **Dual LLM cache** — expander outputs cached globally; reranker scores cached per-collection
 - **Per-collection SQLite** — independent WAL journals, isolated backup, zero cross-collection contention
 - **Content-addressed storage** — identical files deduplicated by SHA-256 within a collection
@@ -67,16 +69,21 @@ Models are downloaded automatically from HuggingFace Hub on first use and cached
 | [qmd-query-expansion 1.7B](https://huggingface.co/tobil/qmd-query-expansion-1.7B) | `tobil/qmd-query-expansion-1.7B` | expansion only (optional) |
 | [BGE-M3 568M](https://huggingface.co/ggml-org/bge-m3-Q8_0-GGUF) | `ggml-org/bge-m3-Q8_0-GGUF` | Korean embedding alternative (optional) |
 
-BM25 search works without any models. When `IR_COMBINED_MODEL` is set (or a Qwen3.5 GGUF is found in `~/local-models/`), it replaces both the expander and reranker.
+BM25 search works without any models. The default tier-2 path is the dedicated expander + reranker. `IR_COMBINED_MODEL` is opt-in for explicit combined-model experiments or testing.
 
 **Local models:**
 
 ```bash
 export IR_MODEL_DIRS="$HOME/my-models"
-export IR_COMBINED_MODEL="$HOME/local-models/Qwen3.5-2B-Q4_K_M.gguf"   # unified
 export IR_EMBEDDING_MODEL="$HOME/my-models/embeddinggemma-300M-Q8_0.gguf"
 export IR_RERANKER_MODEL="$HOME/my-models/qwen3-reranker-0.6b-q8_0.gguf"
 export IR_EXPANDER_MODEL="$HOME/my-models/qmd-query-expansion-1.7B-q4_k_m.gguf"
+```
+
+Combined mode is explicit-only:
+
+```bash
+export IR_COMBINED_MODEL="$HOME/local-models/Qwen3.5-2B-Q4_K_M.gguf"   # testing / experiments only
 ```
 
 Search order: env → `IR_MODEL_DIRS` → `~/local-models/` → `~/.cache/ir/models/` → `~/.cache/qmd/models/` → HF Hub auto-download.
@@ -199,7 +206,7 @@ ir daemon stop
 ir daemon status
 ```
 
-The daemon keeps models warm in memory. Subsequent queries over the Unix socket skip model loading entirely (~30ms round-trip vs 3s cold).
+The daemon keeps models warm in memory. Subsequent queries over the Unix socket skip model loading entirely (~30ms round-trip vs 3s cold). On a cold start, `ir search` kicks off daemon startup immediately; if BM25 already found a usable answer, that first query can return the BM25 result while the daemon continues warming in the background.
 
 </details>
 
@@ -340,6 +347,34 @@ ir search "서울 지하철" -c wiki
 ```
 
 `ir preprocessor install ko` downloads the official lindera CLI binary and ko-dic dictionary from lindera's GitHub releases. Supported platforms: **macOS** (arm64, x86\_64) and **Linux** (x86\_64, aarch64). No system deps, no Rust toolchain required. The install step shows an interactive picker so you can bind to collections right away.
+Binding the built-in `ko` alias also writes the current Korean routing default for that collection:
+
+```yaml
+routing:
+  fused_strong_product: 0.05
+```
+
+This is a bind-time default, not a hidden runtime special case. If you already set a `routing:` block yourself, that explicit config wins.
+
+**Per-collection routing overrides** (`config.yml`, optional):
+
+```yaml
+collections:
+  - name: wiki-ko
+    path: ~/wiki
+    preprocessor: [ko]
+    routing:
+      fused_strong_product: 0.05
+```
+
+Use this to override BM25/fused strong-signal thresholds for a specific collection. The fields are:
+
+- `fused_strong_floor`
+- `fused_strong_product`
+- `bm25_strong_floor`
+- `bm25_strong_gap`
+
+Overrides apply only when all searched collections agree on the same value. Mixed searches with conflicting overrides fall back to the global default thresholds.
 
 **Other languages:**
 
@@ -411,6 +446,20 @@ EmbeddingGemma 300M embeddings + qmd-expander-1.7B + Qwen3-Reranker-0.6B.
 BM25 fusion provides no statistically significant lift over pure vector (paired t-test). Reranker gains are largest on conversational/argument retrieval.
 
 See [research/experiment.md](research/experiment.md) for reproduction steps.
+`scripts/bench.sh <dataset>` prints a per-mode table (`bm25`, `vector`, `hybrid`) and caches the full JSON under `logs/results/<dataset>/`.
+For non-BM25 runs, the benchmark wrapper pins tier-2 to the dedicated expander + reranker path and restarts the benchmark daemon before scoring, so a local Qwen combined GGUF or stale daemon state does not silently change the benchmark pipeline.
+If a machine crash happens after prepare/index/embed but before scoring finishes, rerunning the same `scripts/bench.sh <dataset>` command resumes from the prepared collection instead of starting from zero. Query scoring also resumes automatically: `scripts/beir-eval.py run --output ...` writes per-query sidecar progress to `<output>.partial/` and continues from that on rerun.
+Large corpora can be benchmarked on a sampled pool with `--size N --seed N`. For MIRACL-Ko, `scripts/bench.sh miracl-ko --size 50000` is the current research default because `10000` docs proved stable but too saturated for meaningful ranking comparisons. The pool-size study still establishes `10000` as the minimum stable sampled benchmark.
+Maintainer shortcut: `scripts/research-harness.sh` wraps the supported research flows for baseline locking, signal collection, threshold sweeps, and automated holdout validation of shortlisted thresholds. For fine sweeps near a threshold cliff, `validate-thresholds` also accepts explicit fused values via `--products ...`. See [research/experiment.md](research/experiment.md).
+Current research direction:
+
+- keep `fiqa` on the current fused threshold
+- use `miracl-ko --size 50000` for Korean threshold research
+- prefer stricter fused gating before trying a learned router
+- treat router work as offline-only until it clearly beats simple gating on holdout
+
+Tier-2 router research is intentionally separate from that harness. First collect router-grade signals with `bash scripts/signal-sweep.sh --dataset miracl-ko --size 50000 --pools 3 --tier1`, then use `bash scripts/router-data.sh ko` to prepare a Korean-only `smoltrain` bundle. The router benchmark itself also stays offline by default: collect holdout signals for `miracl-ko-s50000-p42`, then score the checkpoint with `scripts/router-bench.py` instead of changing the shipped runtime path.
+On macOS, `scripts/bench.sh` now runs long benchmark phases under a safety watchdog by default. Metal stays enabled for speed, but the wrapper aborts the run if free memory drops too low, swapouts begin, or `ir` sustains CPU-fallback-like usage. Tune with `IR_BENCH_MIN_FREE_PCT`, `IR_BENCH_MAX_IR_CPU_PCT`, `IR_BENCH_CPU_STRIKES`, or disable with `IR_BENCH_GUARD=0`.
 
 </details>
 

@@ -20,6 +20,27 @@ use config::{Config, collection_db_path};
 use error::Result;
 use types::{Collection, SearchMode};
 
+fn ko_default_routing() -> types::RoutingConfig {
+    types::RoutingConfig {
+        fused_strong_floor: None,
+        fused_strong_product: Some(0.05),
+        bm25_strong_floor: None,
+        bm25_strong_gap: None,
+    }
+}
+
+fn apply_bind_defaults(col: &mut Collection, alias: &str) {
+    if alias == "ko" && col.routing.is_none() {
+        col.routing = Some(ko_default_routing());
+    }
+}
+
+fn clear_bind_defaults_if_auto(col: &mut Collection, alias: &str) {
+    if alias == "ko" && col.routing.as_ref() == Some(&ko_default_routing()) {
+        col.routing = None;
+    }
+}
+
 fn main() {
     if let Err(e) = run() {
         eprintln!("error: {e}");
@@ -201,6 +222,7 @@ fn handle_collection(cmd: CollectionCmd) -> Result<()> {
                 excludes: exclude,
                 description,
                 preprocessor: if preprocessor.is_empty() { None } else { Some(preprocessor) },
+                routing: None,
             })?;
             config.save()?;
             println!("added collection '{name}'");
@@ -310,11 +332,16 @@ pub(crate) fn search_core(
     verbosity: types::Verbosity,
     filter: types::Filter,
 ) -> Result<Vec<types::SearchResult>> {
-    llm::download::prepare_model_envs()?;
-
     let config = Config::load()?;
     let collection_names = resolve_collections(&config, collection_filter)?;
     let search_mode: SearchMode = mode.parse().map_err(error::Error::Other)?;
+    let daemon_was_running = daemon::is_running();
+    let daemon_warmup_error = if daemon_was_running {
+        None
+    } else {
+        daemon::start_in_background().err().map(|e| e.to_string())
+    };
+    let daemon_warmup_started = !daemon_was_running && daemon_warmup_error.is_none();
 
     let cols: Vec<_> = collection_names.iter()
         .filter_map(|name| config.get_collection(name))
@@ -323,7 +350,12 @@ pub(crate) fn search_core(
         .map(|c| {
             let pp_aliases = c.preprocessor.as_deref().unwrap_or(&[]);
             let pp_commands = config.resolve_preprocessor_commands(pp_aliases);
-            db::CollectionDb::open_rw(&c.name, &collection_db_path(&c.name), pp_commands)
+            db::CollectionDb::open_rw(
+                &c.name,
+                &collection_db_path(&c.name),
+                pp_commands,
+                c.routing.clone(),
+            )
         })
         .collect::<Result<Vec<_>>>()?;
 
@@ -363,26 +395,35 @@ pub(crate) fn search_core(
     }
     let disable_shortcuts = std::env::var("IR_DISABLE_SHORTCUTS").is_ok();
 
+    let (bm25_strong_floor, bm25_strong_gap) =
+        search::hybrid::bm25_strong_signal_thresholds_for_collections(&cols);
+
     match search_mode {
         SearchMode::Bm25 => return Ok(bm25_results),
         SearchMode::Vector => {}
         SearchMode::Hybrid => {
             // Only shortcut if post-filter count meets limit (else escalate for more candidates)
             if !disable_shortcuts
-                && search::hybrid::is_bm25_strong_signal(&bm25_results)
+                && search::hybrid::is_bm25_strong_signal(
+                    &bm25_results,
+                    bm25_strong_floor,
+                    bm25_strong_gap,
+                )
                 && (filter.is_empty() || bm25_results.len() >= limit)
             {
-                if !daemon::is_running() {
-                    llm::download::prepare_model_envs()?;
-                    let _ = daemon::start_in_background();
-                }
                 return Ok(bm25_results);
             }
         }
     }
 
+    if daemon_warmup_started && !bm25_results.is_empty() {
+        if verbosity.show_progress() {
+            eprintln!("note: daemon warming in background — returning BM25 for this query");
+        }
+        return Ok(bm25_results);
+    }
+
     if !daemon::is_running() {
-        llm::download::prepare_model_envs()?;
         if let Err(e) = daemon::start_in_background() {
             if verbosity.show_progress() {
                 eprintln!("note: could not start daemon ({e})");
@@ -392,6 +433,10 @@ pub(crate) fn search_core(
             }
             return Ok(bm25_results);
         }
+    } else if let Some(err) = daemon_warmup_error
+        && verbosity.show_progress()
+    {
+        eprintln!("note: background daemon warmup failed ({err})");
     }
 
     let req = daemon::DaemonRequest {
@@ -403,6 +448,8 @@ pub(crate) fn search_core(
         verbose: verbosity.daemon_verbose(),
         filter: filter.clauses,
     };
+    let (strong_signal_floor, strong_signal_product) =
+        search::hybrid::strong_signal_thresholds_for_collections(&cols);
 
     // SIGNAL_ lines always re-emitted to stderr (picked up by beir-eval --signals).
     // Other log lines gated on verbosity as usual.
@@ -450,7 +497,13 @@ pub(crate) fn search_core(
 
     let tier1_log = tier1.log;
     let tier1_results = to_search_results(tier1.results);
-    if !disable_shortcuts && search::hybrid::is_strong_signal(&tier1_results) {
+    if !disable_shortcuts
+        && search::hybrid::is_strong_signal(
+            &tier1_results,
+            strong_signal_floor,
+            strong_signal_product,
+        )
+    {
         if verbosity.show_progress() { eprintln!(); }
         log_lines(&tier1_log);
         return Ok(tier1_results);
@@ -521,7 +574,12 @@ fn handle_search(
             .map(|c| {
                 let pp_aliases = c.preprocessor.as_deref().unwrap_or(&[]);
                 let pp_commands = config.resolve_preprocessor_commands(pp_aliases);
-                db::CollectionDb::open_rw(&c.name, &collection_db_path(&c.name), pp_commands)
+                db::CollectionDb::open_rw(
+                    &c.name,
+                    &collection_db_path(&c.name),
+                    pp_commands,
+                    c.routing.clone(),
+                )
             })
             .collect::<Result<Vec<_>>>()?;
         fill_content(&mut results, &dbs);
@@ -666,6 +724,7 @@ fn handle_preprocessor(cmd: PreprocessorCmd) -> Result<()> {
                     .ok_or_else(|| error::Error::Other(format!("collection '{name}' not found")))?;
                 let pp = col.preprocessor.get_or_insert_with(Vec::new);
                 if !pp.contains(&alias) { pp.push(alias.clone()); }
+                apply_bind_defaults(col, &alias);
                 config.save()?;
                 println!("bound '{alias}' to '{name}', re-indexing…");
                 if let Err(e) = handle_update(Some(name.clone()), false) {
@@ -683,6 +742,7 @@ fn handle_preprocessor(cmd: PreprocessorCmd) -> Result<()> {
             } else {
                 pp.retain(|a| a != &alias);
                 if pp.is_empty() { col.preprocessor = None; }
+                clear_bind_defaults_if_auto(col, &alias);
                 config.save()?;
                 println!("unbound '{alias}' from '{collection}', re-indexing…");
                 handle_update(Some(collection), false)?;
@@ -838,6 +898,7 @@ fn install_preprocessor(config: &mut Config, lang: &str) -> Result<()> {
                 .find(|c| c.name == name).unwrap();
             let pp = col.preprocessor.get_or_insert_with(Vec::new);
             if !pp.contains(&alias.to_string()) { pp.push(alias.to_string()); }
+            apply_bind_defaults(col, alias);
             println!("bound '{alias}' to '{name}', re-indexing…");
             if let Err(e) = handle_update(Some(name.clone()), false) {
                 eprintln!("warning: re-index failed for '{name}': {e}");
@@ -982,4 +1043,43 @@ fn handle_embed(collection: Option<String>, force: bool) -> Result<()> {
         println!("  {} documents, {} chunks embedded", docs, chunks);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_collection() -> Collection {
+        Collection {
+            name: "c".into(),
+            path: "/tmp".into(),
+            globs: vec![],
+            excludes: vec![],
+            description: None,
+            preprocessor: None,
+            routing: None,
+        }
+    }
+
+    #[test]
+    fn ko_bind_applies_default_routing() {
+        let mut col = test_collection();
+        apply_bind_defaults(&mut col, "ko");
+        assert_eq!(col.routing, Some(ko_default_routing()));
+    }
+
+    #[test]
+    fn non_ko_bind_leaves_routing_untouched() {
+        let mut col = test_collection();
+        apply_bind_defaults(&mut col, "ja");
+        assert_eq!(col.routing, None);
+    }
+
+    #[test]
+    fn ko_unbind_clears_only_auto_default() {
+        let mut col = test_collection();
+        col.routing = Some(ko_default_routing());
+        clear_bind_defaults_if_auto(&mut col, "ko");
+        assert_eq!(col.routing, None);
+    }
 }
