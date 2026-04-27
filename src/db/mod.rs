@@ -13,6 +13,7 @@ use rusqlite::ffi::{sqlite3, sqlite3_api_routines, sqlite3_auto_extension};
 use rusqlite::{Connection, OpenFlags};
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::os::raw::c_char;
 use std::path::Path;
 use std::sync::Once;
 
@@ -28,8 +29,11 @@ pub fn ensure_sqlite_vec() {
         //
         // Transmute through the actual SQLite extension init ABI rather than
         // *const () — if the signature changes, mismatched sizes fail at compile time.
-        type ExtInit =
-            unsafe extern "C" fn(*mut sqlite3, *mut *mut i8, *const sqlite3_api_routines) -> i32;
+        type ExtInit = unsafe extern "C" fn(
+            *mut sqlite3,
+            *mut *mut c_char,
+            *const sqlite3_api_routines,
+        ) -> i32;
         unsafe {
             let fn_ptr = sqlite_vec::sqlite3_vec_init as unsafe extern "C" fn();
             let init: ExtInit = std::mem::transmute(fn_ptr);
